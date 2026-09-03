@@ -1,0 +1,154 @@
+from typing import Literal
+
+from pydantic import BaseModel
+
+
+class TeamMember(BaseModel):
+    id: str
+    displayName: str
+    githubUsername: str
+    gitAliases: list[str]
+    emails: list[str]
+    currentFocus: str
+    responsibilities: str
+    ownedRepos: list[str]
+    ownedPaths: list[str]
+    expertiseTags: list[str]
+    timezone: str
+    availability: Literal["active", "focus_mode", "ooo", "overloaded", "inactive"]
+
+
+class PullRequest(BaseModel):
+    id: str
+    repository: str
+    number: int
+    title: str
+    author: str
+    ownerMemberId: str
+    sourceBranch: str
+    baseBranch: str
+    state: Literal["open", "merged", "closed", "draft"]
+    mergeable: Literal["mergeable", "conflicting", "unknown"]
+    reviewState: Literal["approved", "changes_requested", "review_required", "commented"]
+    unresolvedCommentCount: int
+    requestedReviewers: list[str]
+    checkState: Literal["passing", "failing", "pending", "not_run"]
+    linkedIssueIds: list[str]
+    changedFilesCount: int
+    ageDays: int
+    summary: str
+    searchText: str
+
+
+class RepositoryConfig(BaseModel):
+    id: str
+    owner: str
+    name: str
+    defaultBranch: str = "main"
+    enabled: bool = True
+    lastSyncedAt: str | None = None
+    lastSyncStatus: str | None = None
+
+
+class GitHubSettings(BaseModel):
+    accessMode: Literal["contributor_token", "device_login", "github_app"] = "contributor_token"
+    token: str | None = None
+    username: str | None = None
+    repositories: list[RepositoryConfig]
+    lastSyncedAt: str | None = None
+
+
+class GitHubSettingsPublic(BaseModel):
+    accessMode: Literal["contributor_token", "device_login", "github_app"]
+    hasToken: bool
+    username: str | None = None
+    repositories: list[RepositoryConfig]
+    lastSyncedAt: str | None = None
+
+
+class AgentBackend(BaseModel):
+    id: Literal["opencode", "codex", "anthropic"]
+    displayName: str
+    adapterType: str
+    endpoint: str
+    defaultModel: str
+    enabled: bool
+
+
+class AgentRun(BaseModel):
+    id: str
+    backendId: str
+    repository: str
+    pullRequestId: str
+    pullRequestNumber: int
+    action: Literal["analyze", "rebase", "fix_conflicts", "address_review", "fix_checks"]
+    status: Literal[
+        "queued",
+        "running",
+        "patch_ready",
+        "checks_running",
+        "awaiting_approval",
+        "approved",
+        "pushed",
+        "failed",
+        "cancelled",
+    ]
+    requester: str
+    summary: str
+    createdAt: str
+
+
+class AppData(BaseModel):
+    teamMembers: list[TeamMember]
+    pullRequests: list[PullRequest]
+    agentBackends: list[AgentBackend]
+    agentRuns: list[AgentRun]
+    github: GitHubSettingsPublic | None = None
+
+
+class CreateAgentRunRequest(BaseModel):
+    backendId: str
+    pullRequestId: str
+    action: Literal["analyze", "rebase", "fix_conflicts", "address_review", "fix_checks"]
+
+
+class CreateTeamMemberRequest(BaseModel):
+    displayName: str
+    githubUsername: str
+    gitAliases: list[str] = []
+    emails: list[str] = []
+    currentFocus: str = ""
+    responsibilities: str = ""
+    ownedRepos: list[str] = []
+    ownedPaths: list[str] = []
+    expertiseTags: list[str] = []
+    timezone: str = "Asia/Jerusalem"
+    availability: Literal["active", "focus_mode", "ooo", "overloaded", "inactive"] = "active"
+
+
+class UpdateTeamMemberRequest(BaseModel):
+    displayName: str | None = None
+    githubUsername: str | None = None
+    gitAliases: list[str] | None = None
+    emails: list[str] | None = None
+    currentFocus: str | None = None
+    responsibilities: str | None = None
+    ownedRepos: list[str] | None = None
+    ownedPaths: list[str] | None = None
+    expertiseTags: list[str] | None = None
+    timezone: str | None = None
+    availability: Literal["active", "focus_mode", "ooo", "overloaded", "inactive"] | None = None
+
+
+class UpdateGitHubSettingsRequest(BaseModel):
+    accessMode: Literal["contributor_token", "device_login", "github_app"] | None = None
+    token: str | None = None
+    username: str | None = None
+    repositories: list[RepositoryConfig] | None = None
+
+
+class GitHubSyncResult(BaseModel):
+    syncedAt: str
+    repositoriesScanned: int
+    pullRequestsImported: int
+    errors: list[str]

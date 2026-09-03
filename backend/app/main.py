@@ -1,0 +1,77 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+
+from .github_sync import sync_github_pull_requests
+from .models import AgentRun, AppData, CreateAgentRunRequest, CreateTeamMemberRequest, GitHubSettingsPublic, GitHubSyncResult, TeamMember, UpdateGitHubSettingsRequest, UpdateTeamMemberRequest
+from .store import store
+
+app = FastAPI(title="MergeOps API", version="0.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://127.0.0.1:5170",
+        "http://localhost:5170",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/api/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/api/app-data")
+async def get_app_data() -> AppData:
+    return store.app_data()
+
+
+@app.post("/api/agent-runs")
+async def post_agent_run(payload: CreateAgentRunRequest) -> AgentRun:
+    try:
+        return store.create_agent_run(payload.backendId, payload.pullRequestId, payload.action)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/team-members")
+async def post_team_member(payload: CreateTeamMemberRequest) -> TeamMember:
+    return store.create_team_member(payload)
+
+
+@app.patch("/api/team-members/{member_id}")
+async def patch_team_member(member_id: str, payload: UpdateTeamMemberRequest) -> TeamMember:
+    try:
+        return store.update_team_member(member_id, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.delete("/api/team-members/{member_id}", status_code=204)
+async def delete_team_member(member_id: str) -> None:
+    try:
+        store.delete_team_member(member_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.patch("/api/settings/github")
+async def patch_github_settings(payload: UpdateGitHubSettingsRequest) -> GitHubSettingsPublic:
+    return store.update_github_settings(payload)
+
+
+@app.post("/api/sync/github")
+async def post_github_sync() -> GitHubSyncResult:
+    try:
+        return sync_github_pull_requests(store)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+def run() -> None:
+    import uvicorn
+
+    uvicorn.run("app.main:app", host="127.0.0.1", port=8000, reload=True)

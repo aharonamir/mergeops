@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MergeOps</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23171b1f'/%3E%3Ctext x='32' y='38' text-anchor='middle' font-family='monospace' font-size='18' font-weight='700' fill='%23f6f7f4'%3EMO%3C/text%3E%3C/svg%3E">
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <svg class="icon-defs" aria-hidden="true">
+      <symbol id="i-search" viewBox="0 0 24 24"><path d="m21 21-4.35-4.35M10.5 18a7.5 7.5 0 1 1 0-15 7.5 7.5 0 0 1 0 15Z"/></symbol>
+      <symbol id="i-sun" viewBox="0 0 24 24"><path d="M12 4V2m0 20v-2m8-8h2M2 12h2m14.36-6.36 1.42-1.42M4.22 19.78l1.42-1.42m0-12.72L4.22 4.22m15.56 15.56-1.42-1.42M12 16a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z"/></symbol>
+      <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 14.5A8.5 8.5 0 0 1 9.5 3a7 7 0 1 0 11.5 11.5Z"/></symbol>
+      <symbol id="i-monitor" viewBox="0 0 24 24"><path d="M4 5h16v11H4zM9 21h6m-3-5v5"/></symbol>
+      <symbol id="i-git" viewBox="0 0 24 24"><path d="M7 18V6m0 0a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 12a2 2 0 1 0 0 4 2 2 0 0 0 0-4Zm10-4a2 2 0 1 0 0 4 2 2 0 0 0 0-4ZM7 8h5a5 5 0 0 1 5 5v1"/></symbol>
+      <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 9v4m0 4h.01M10.3 3.7 1.8 18.5A2 2 0 0 0 3.5 21h17a2 2 0 0 0 1.7-2.5L13.7 3.7a2 2 0 0 0-3.4 0Z"/></symbol>
+      <symbol id="i-check" viewBox="0 0 24 24"><path d="m20 6-11 11-5-5"/></symbol>
+      <symbol id="i-play" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7Z"/></symbol>
+      <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2m7-10a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm13 10v-2a4 4 0 0 0-3-3.87m-2-11.95a4 4 0 0 1 0 7.75"/></symbol>
+      <symbol id="i-settings" viewBox="0 0 24 24"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Zm8.4-3.5a7.9 7.9 0 0 0-.1-1l2-1.5-2-3.5-2.4 1a8 8 0 0 0-1.7-1L16 3.5h-4L11.6 6a8 8 0 0 0-1.7 1l-2.3-1-2 3.5 2 1.5a7.9 7.9 0 0 0 0 2l-2 1.5 2 3.5 2.3-1a8 8 0 0 0 1.7 1l.4 2.5h4l.4-2.5a8 8 0 0 0 1.7-1l2.4 1 2-3.5-2-1.5c.1-.3.1-.7.1-1Z"/></symbol>
+      <symbol id="i-send" viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4Z"/></symbol>
+      <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+    </svg>
+
+    <div class="app-shell">
+      <aside class="side-nav" aria-label="Primary">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <div>
+            <strong>MergeOps</strong>
+            <span>SDLC cockpit</span>
+          </div>
+        </div>
+        <nav class="nav-list">
+          <button class="nav-item is-active" data-view="cockpit"><svg><use href="#i-git"></use></svg><span>PR Cockpit</span></button>
+          <button class="nav-item" data-view="team"><svg><use href="#i-users"></use></svg><span>Team Workspace</span></button>
+          <button class="nav-item" data-view="agents"><svg><use href="#i-play"></use></svg><span>Agent Runs</span></button>
+          <button class="nav-item" data-view="settings"><svg><use href="#i-settings"></use></svg><span>Settings</span></button>
+        </nav>
+        <div class="side-status">
+          <span id="agentBackendLabel">opencode</span>
+          <strong id="agentBackendEndpoint">localhost:4096</strong>
+          <small id="agentBackendStatus">ready for approval-gated sessions</small>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div class="search-wrap">
+            <svg><use href="#i-search"></use></svg>
+            <input id="globalSearch" type="search" placeholder="Search PRs, issues, comments, Hebrew or English">
+          </div>
+          <div class="top-actions">
+            <select id="repoFilter" aria-label="Repository filter"></select>
+            <select id="ownerFilter" aria-label="Team member filter"></select>
+            <button id="themeToggle" class="icon-btn" type="button" aria-label="Theme: system" title="Theme: system">
+              <svg><use href="#i-monitor"></use></svg>
+            </button>
+          </div>
+        </header>
+
+        <section id="cockpit" class="view is-visible" aria-labelledby="cockpitTitle">
+          <div class="view-head">
+            <div>
+              <h1 id="cockpitTitle">Pull request intervention queue</h1>
+              <p>Cross-repo work ordered by the next action a team lead can take.</p>
+            </div>
+            <div class="saved-views" role="group" aria-label="Saved views">
+              <button class="seg is-active" data-queue="all">All</button>
+              <button class="seg" data-queue="blocked">Blocked</button>
+              <button class="seg" data-queue="review">Needs review</button>
+              <button class="seg" data-queue="ready">Ready</button>
+            </div>
+          </div>
+
+          <div class="metrics-rack" id="metricsRack"></div>
+          <div class="team-strip" id="teamStrip"></div>
+
+          <div class="table-shell">
+            <div class="table-toolbar">
+              <strong>Live PRs</strong>
+              <span id="resultCount"></span>
+            </div>
+            <div class="pr-table" role="table" aria-label="Pull requests">
+              <div class="pr-row pr-head" role="row">
+                <span>Priority</span><span>PR</span><span>Owner</span><span>Review</span><span>Checks</span><span>Age</span><span>Action</span>
+              </div>
+              <div id="prRows"></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="team" class="view" aria-labelledby="teamTitle">
+          <div class="view-head">
+            <div>
+              <h1 id="teamTitle">Team workspace</h1>
+              <p>Current focus, responsibilities, aliases, ownership, and reviewer expertise.</p>
+            </div>
+            <button class="primary-btn" id="addMemberBtn"><svg><use href="#i-users"></use></svg><span>Add member</span></button>
+          </div>
+          <div class="people-grid" id="peopleGrid"></div>
+        </section>
+
+        <section id="agents" class="view" aria-labelledby="agentsTitle">
+          <div class="view-head">
+            <div>
+              <h1 id="agentsTitle">Agent runs</h1>
+              <p id="agentRunsIntro">Agent remediation sessions, generated patches, checks, and approval state.</p>
+            </div>
+          </div>
+          <div class="runs-list" id="runsList"></div>
+        </section>
+
+        <section id="settings" class="view" aria-labelledby="settingsTitle">
+          <div class="view-head">
+            <div>
+              <h1 id="settingsTitle">Settings</h1>
+              <p>Configure people, repositories, integrations, automation policy, search, and dashboard defaults.</p>
+            </div>
+          </div>
+          <div class="settings-layout">
+            <nav class="settings-tabs" aria-label="Settings sections">
+              <button class="is-active" data-settings="teamSettings">Team</button>
+              <button data-settings="repoSettings">Repositories</button>
+              <button data-settings="integrationSettings">Integrations</button>
+              <button data-settings="policySettings">Automation Policy</button>
+              <button data-settings="searchSettings">Search</button>
+              <button data-settings="preferenceSettings">Preferences</button>
+            </nav>
+            <div class="settings-panels">
+              <form id="teamSettings" class="settings-panel is-visible"></form>
+              <form id="repoSettings" class="settings-panel"></form>
+              <form id="integrationSettings" class="settings-panel"></form>
+              <form id="policySettings" class="settings-panel"></form>
+              <form id="searchSettings" class="settings-panel"></form>
+              <form id="preferenceSettings" class="settings-panel"></form>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <aside id="drawer" class="drawer" aria-hidden="true" aria-labelledby="drawerTitle">
+      <div class="drawer-head">
+        <div>
+          <span id="drawerRepo"></span>
+          <h2 id="drawerTitle"></h2>
+        </div>
+        <button class="icon-btn" id="closeDrawer" type="button" aria-label="Close drawer"><svg><use href="#i-x"></use></svg></button>
+      </div>
+      <div id="drawerBody"></div>
+    </aside>
+    <div id="scrim" class="scrim"></div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
