@@ -637,6 +637,24 @@ h1 {
   color: var(--muted);
 }
 
+.action-meta {
+  display: block;
+  margin-top: 8px;
+  color: var(--muted);
+  font: 12px/1.35 var(--mono);
+  overflow-wrap: anywhere;
+}
+
+.action-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.empty-state {
+  color: var(--muted);
+}
+
 .settings-layout {
   display: grid;
   grid-template-columns: 220px minmax(0, 1fr);
@@ -777,6 +795,11 @@ h1 {
   gap: 10px;
   border-bottom: 1px solid var(--line);
   padding-bottom: 16px;
+}
+
+.drawer-meta {
+  color: var(--muted);
+  font-size: 13px;
 }
 
 .kv {

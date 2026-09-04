@@ -84,11 +84,35 @@ export type AgentRun = {
   createdAt: string;
 };
 
+export type ActionRecord = {
+  id: string;
+  kind: "checkout" | "agent_run";
+  repository: string;
+  pullRequestId: string;
+  pullRequestNumber: number;
+  action: string;
+  status: string;
+  summary: string;
+  workspacePath?: string | null;
+  baseCommit?: string | null;
+  createdAt: string;
+};
+
+export type CheckoutResult = {
+  pullRequestId: string;
+  status: "ready" | "failed";
+  workspacePath?: string | null;
+  baseCommit?: string | null;
+  summary: string;
+  action: ActionRecord;
+};
+
 export type AppData = {
   teamMembers: TeamMember[];
   pullRequests: PullRequest[];
   agentBackends: AgentBackend[];
   agentRuns: AgentRun[];
+  actions?: ActionRecord[];
   github?: GitHubSettings | null;
 };
 

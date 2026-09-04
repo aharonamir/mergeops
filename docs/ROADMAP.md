@@ -118,11 +118,12 @@ Exit criteria:
 Before expanding Agent Runs into a patch approval workspace, every run must
 operate in an isolated workspace. The first local implementation uses a fresh
 clone per run, detached at the captured base commit, under
-`backend/data/agent-runs/<run-id>/`. The configured checkout is used only as a
+`~/.mergeops/workspace/<run-id>/`. The configured checkout is used only as a
 source and is never passed directly to an agent.
 
 Phase 1 requirements:
 - One independent workspace per run, including concurrent runs for one repo.
+- Checkout from the GitHub PR ref when no local source checkout is configured.
 - Capture and persist the base commit used by the run.
 - Scrub the child-process environment and never provide push credentials.
 - Enforce a wall-clock timeout and terminate the child process group on timeout.

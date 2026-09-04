@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from uuid import uuid4
 
-from .adapters import AgentRunRequest, adapter_registry, utc_now
+from .adapters import AgentRunRequest, RunWorkspace, adapter_registry, utc_now
 from .fixtures import agent_backends, agent_runs, github_settings, pull_requests, team_members
-from .models import AgentRun, AppData, CreateTeamMemberRequest, GitHubSettings, GitHubSettingsPublic, PullRequest, RepositoryConfig, TeamMember, UpdateGitHubSettingsRequest, UpdateTeamMemberRequest
+from .models import ActionRecord, AgentRun, AppData, CheckoutResult, CreateTeamMemberRequest, GitHubSettings, GitHubSettingsPublic, PullRequest, RepositoryConfig, TeamMember, UpdateGitHubSettingsRequest, UpdateTeamMemberRequest
 
 
 class PersistedAppData(AppData):
@@ -44,6 +45,9 @@ class LocalJsonStore:
                 action=action,
                 backend_id=backend_id,
                 repository_local_path=repository.localPath if repository else None,
+                repository_remote_url=self._repository_remote_url(pull_request, data),
+                repository_token=data.githubPrivate.token,
+                pull_request_ref=f"refs/pull/{pull_request.number}/head" if repository is None or repository.localPath is None else None,
                 base_branch=pull_request.baseBranch,
                 source_branch=pull_request.sourceBranch,
             )
@@ -65,8 +69,90 @@ class LocalJsonStore:
             createdAt=utc_now(),
         )
         data.agentRuns.insert(0, run)
+        data.actions.insert(0, ActionRecord(
+            id=run.id,
+            kind="agent_run",
+            repository=run.repository,
+            pullRequestId=run.pullRequestId,
+            pullRequestNumber=run.pullRequestNumber,
+            action=run.action,
+            status=run.status,
+            summary=run.summary,
+            workspacePath=run.workspacePath,
+            baseCommit=run.baseCommit,
+            createdAt=run.createdAt,
+        ))
         self._save(data)
         return run
+
+    def create_checkout(self, pull_request_id: str) -> CheckoutResult:
+        data = self._load()
+        pull_request = next((item for item in data.pullRequests if item.id == pull_request_id), None)
+        if pull_request is None:
+            raise ValueError("Unknown pull request")
+        repository = self._repository_config(data, self._pull_request_repository_key(pull_request, data))
+        request = AgentRunRequest(
+            run_id=f"checkout-{uuid4().hex[:12]}",
+            pull_request_id=pull_request.id,
+            repository=pull_request.repositoryFullName or pull_request.repository,
+            pull_request_number=pull_request.number,
+            action="analyze",
+            backend_id="workspace",
+            repository_local_path=repository.localPath if repository else None,
+            repository_remote_url=self._repository_remote_url(pull_request, data),
+            repository_token=data.githubPrivate.token,
+            pull_request_ref=f"refs/pull/{pull_request.number}/head" if repository is None or repository.localPath is None else None,
+            base_branch=pull_request.baseBranch,
+            source_branch=pull_request.sourceBranch,
+        )
+        try:
+            workspace = RunWorkspace.create(request)
+        except Exception as exc:
+            raise ValueError(f"Could not create isolated checkout: {exc}") from exc
+        action = ActionRecord(
+            id=request.run_id,
+            kind="checkout",
+            repository=pull_request.repository,
+            pullRequestId=pull_request.id,
+            pullRequestNumber=pull_request.number,
+            action="checkout",
+            status="ready",
+            summary=f"Isolated checkout ready for {pull_request.repository}#{pull_request.number}. No agent was started.",
+            workspacePath=str(workspace.path),
+            baseCommit=workspace.base_commit,
+            createdAt=utc_now(),
+        )
+        data.actions.insert(0, action)
+        self._save(data)
+        return CheckoutResult(
+            pullRequestId=pull_request.id,
+            status="ready",
+            workspacePath=str(workspace.path),
+            baseCommit=workspace.base_commit,
+            summary=action.summary,
+            action=action,
+        )
+
+    def _repository_remote_url(self, pull_request: PullRequest, data: PersistedAppData) -> str | None:
+        full_name = pull_request.repositoryFullName or self._pull_request_repository_key(pull_request, data)
+        return f"https://github.com/{full_name}.git" if full_name else None
+
+    def clear_action(self, action_id: str) -> None:
+        data = self._load()
+        action = next((item for item in data.actions if item.id == action_id), None)
+        if action is None:
+            raise ValueError("Unknown action")
+        if action.workspacePath:
+            workspace = Path(action.workspacePath).resolve()
+            root = RunWorkspace.root.resolve()
+            if root not in workspace.parents:
+                raise ValueError("Action workspace is outside the MergeOps workspace root")
+            run_root = workspace.parent
+            if run_root.exists():
+                import shutil
+                shutil.rmtree(run_root)
+        data.actions = [item for item in data.actions if item.id != action_id]
+        self._save(data)
 
     def create_team_member(self, payload: CreateTeamMemberRequest) -> TeamMember:
         data = self._load()
@@ -140,6 +226,19 @@ class LocalJsonStore:
                 pullRequests=list(pull_requests),
                 agentBackends=list(agent_backends),
                 agentRuns=list(agent_runs),
+                actions=[ActionRecord(
+                    id=run.id,
+                    kind="agent_run",
+                    repository=run.repository,
+                    pullRequestId=run.pullRequestId,
+                    pullRequestNumber=run.pullRequestNumber,
+                    action=run.action,
+                    status=run.status,
+                    summary=run.summary,
+                    workspacePath=run.workspacePath,
+                    baseCommit=run.baseCommit,
+                    createdAt=run.createdAt,
+                ) for run in agent_runs],
                 github=self._public_github(private_github),
                 githubPrivate=private_github,
             )
@@ -150,6 +249,24 @@ class LocalJsonStore:
             payload = json.load(handle)
         if "githubPrivate" not in payload:
             payload["githubPrivate"] = github_settings.model_dump(mode="json")
+        if "actions" not in payload:
+            payload["actions"] = [
+                ActionRecord(
+                    id=run.id,
+                    kind="agent_run",
+                    repository=run.repository,
+                    pullRequestId=run.pullRequestId,
+                    pullRequestNumber=run.pullRequestNumber,
+                    action=run.action,
+                    status=run.status,
+                    summary=run.summary,
+                    workspacePath=run.workspacePath,
+                    baseCommit=run.baseCommit,
+                    createdAt=run.createdAt,
+                ).model_dump(mode="json")
+                for raw_run in payload.get("agentRuns", [])
+                for run in [AgentRun.model_validate(raw_run)]
+            ]
         payload["github"] = self._public_github(GitHubSettings.model_validate(payload["githubPrivate"])).model_dump(mode="json")
         data = PersistedAppData.model_validate(payload)
         normalized = [self._normalize_pull_request(pull_request, data) for pull_request in data.pullRequests]
@@ -173,6 +290,7 @@ class LocalJsonStore:
             pullRequests=data.pullRequests,
             agentBackends=data.agentBackends,
             agentRuns=data.agentRuns,
+            actions=data.actions,
             github=self._public_github(data.githubPrivate),
         )
 

@@ -27,6 +27,27 @@ class CapturingAdapter:
 
 
 class StoreRepositoryResolutionTest(unittest.TestCase):
+    def test_failed_workspace_creation_removes_partial_run_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "source"
+            source.mkdir()
+            request = AgentRunRequest(
+                run_id="run-failed",
+                pull_request_id="pr-1",
+                repository="owner/service",
+                pull_request_number=1,
+                action="analyze",
+                backend_id="opencode",
+                repository_local_path=str(source),
+            )
+            with patch.object(RunWorkspace, "root", root / "runs"):
+                with patch.object(RunWorkspace, "_git", side_effect=[str(source), RuntimeError("clone failed")]):
+                    with self.assertRaises(RuntimeError):
+                        RunWorkspace.create(request)
+
+            self.assertFalse((root / "runs" / "run-failed").exists())
+
     def test_run_workspace_is_independent_and_captures_commit(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

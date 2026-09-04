@@ -12,10 +12,11 @@ import {
   Sun,
   Users,
   X,
-  RefreshCw
+  RefreshCw,
+  FolderGit2
 } from "lucide-react";
-import { createAgentRun, createTeamMember, deleteTeamMember, loadAppData, syncGitHub, updateGitHubSettings, updateTeamMember } from "./api";
-import type { AgentBackend, AgentRun, AppData, GitHubSettings, GitHubSyncResult, PullRequest, QueueFilter, RepositoryConfig, TeamMember, ThemePreference, View } from "./types";
+import { clearAction, createAgentRun, createCheckout, createTeamMember, deleteTeamMember, loadAppData, syncGitHub, updateGitHubSettings, updateTeamMember } from "./api";
+import type { ActionRecord, AgentBackend, AgentRun, AppData, GitHubSettings, GitHubSyncResult, PullRequest, QueueFilter, RepositoryConfig, TeamMember, ThemePreference, View } from "./types";
 
 const themeIcons = {
   system: Monitor,
@@ -26,7 +27,7 @@ const themeIcons = {
 const views: Array<{ id: View; label: string; icon: typeof GitPullRequest }> = [
   { id: "cockpit", label: "PR Cockpit", icon: GitPullRequest },
   { id: "team", label: "Team Workspace", icon: Users },
-  { id: "agents", label: "Agent Runs", icon: Play },
+  { id: "agents", label: "Actions", icon: Play },
   { id: "settings", label: "Settings", icon: Settings }
 ];
 
@@ -56,6 +57,10 @@ function statusLabel(status: string) {
   }[status] ?? status;
 }
 
+function actionFromRun(run: AgentRun): ActionRecord {
+  return { id: run.id, kind: "agent_run", repository: run.repository, pullRequestId: run.pullRequestId, pullRequestNumber: run.pullRequestNumber, action: run.action, status: run.status, summary: run.summary, workspacePath: run.workspacePath, baseCommit: run.baseCommit, createdAt: run.createdAt };
+}
+
 export function App() {
   const [data, setData] = useState<AppData | null>(null);
   const [activeView, setActiveView] = useState<View>("cockpit");
@@ -68,11 +73,14 @@ export function App() {
   const [query, setQuery] = useState("");
   const [selectedPr, setSelectedPr] = useState<PullRequest | null>(null);
   const [runs, setRuns] = useState<AgentRun[]>([]);
+  const [actions, setActions] = useState<ActionRecord[]>([]);
+  const [checkoutMessage, setCheckoutMessage] = useState("");
 
   useEffect(() => {
     loadAppData().then((payload) => {
       setData(payload);
       setRuns(payload.agentRuns);
+      setActions(payload.actions ?? payload.agentRuns.map(actionFromRun));
     });
   }, []);
 
@@ -131,6 +139,18 @@ export function App() {
   async function startRun(pr: PullRequest) {
     const run = await createAgentRun({ backendId, pullRequestId: pr.id, action: pr.mergeable === "conflicting" ? "fix_conflicts" : "rebase" });
     setRuns((current) => [run, ...current]);
+    setActions((current) => [actionFromRun(run), ...current]);
+  }
+
+  async function checkoutPr(pr: PullRequest) {
+    setCheckoutMessage("Creating isolated checkout...");
+    try {
+      const result = await createCheckout(pr.id);
+      setActions((current) => [result.action, ...current]);
+      setCheckoutMessage(`${result.summary} Base ${result.baseCommit?.slice(0, 12) ?? "unknown"}.`);
+    } catch (error) {
+      setCheckoutMessage(error instanceof Error ? error.message : "Could not create isolated checkout");
+    }
   }
 
   async function saveTeamMember(memberId: string, patch: Partial<TeamMember>) {
@@ -169,7 +189,13 @@ export function App() {
     const payload = await loadAppData();
     setData(payload);
     setRuns(payload.agentRuns);
+    setActions(payload.actions ?? payload.agentRuns.map(actionFromRun));
     return result;
+  }
+
+  async function removeAction(actionId: string) {
+    await clearAction(actionId);
+    setActions((current) => current.filter((action) => action.id !== actionId));
   }
 
   return (
@@ -236,7 +262,7 @@ export function App() {
           />
         )}
         {activeView === "team" && <TeamWorkspace members={data.teamMembers} onSaveMember={saveTeamMember} onAddMember={addTeamMember} onDeleteMember={removeTeamMember} />}
-        {activeView === "agents" && <AgentRuns runs={runs} backends={data.agentBackends} />}
+        {activeView === "agents" && <ActionsView actions={actions} onClear={removeAction} />}
         {activeView === "settings" && (
           <SettingsView
             backendId={backendId}
@@ -264,6 +290,8 @@ export function App() {
           backend={backend}
           onClose={() => setSelectedPr(null)}
           onStartRun={() => startRun(selectedPr)}
+          onCheckout={() => checkoutPr(selectedPr)}
+          checkoutMessage={checkoutMessage}
         />
       )}
     </div>
@@ -618,24 +646,25 @@ function draftToNewMember(draft: TeamMemberDraft): Omit<TeamMember, "id"> {
   };
 }
 
-function AgentRuns({ runs, backends }: { runs: AgentRun[]; backends: AgentBackend[] }) {
-  const backendNames = new Map<string, string>(backends.map((backend) => [backend.id, backend.displayName]));
+function ActionsView({ actions, onClear }: { actions: ActionRecord[]; onClear: (actionId: string) => Promise<void> }) {
+  const terminalStatuses = new Set(["ready", "failed", "cancelled", "pushed", "approved", "awaiting_approval"]);
   return (
     <section className="view is-visible" aria-labelledby="agentsTitle">
       <div className="view-head">
         <div>
-          <h1 id="agentsTitle">Agent runs</h1>
-          <p>Remediation sessions, generated patches, checks, and approval state.</p>
+          <h1 id="agentsTitle">Actions</h1>
+          <p>Checkout workspaces and agent sessions across the PR queue.</p>
         </div>
       </div>
       <div className="runs-list">
-        {runs.map((run) => (
-          <article className="run-item" key={run.id}>
+        {actions.length === 0 ? <p className="empty-state">No actions yet.</p> : actions.map((action) => (
+          <article className="run-item" key={action.id}>
             <div>
-              <strong>#{run.pullRequestNumber} · {run.action.replace("_", " ")}</strong>
-              <p>{run.summary}</p>
+              <strong>{action.kind === "checkout" ? "Checkout" : "Agent run"} · {action.repository} #{action.pullRequestNumber}</strong>
+              <p>{action.summary}</p>
+              {action.workspacePath ? <span className="action-meta">Workspace: {action.workspacePath} · base {action.baseCommit?.slice(0, 12) ?? "unknown"}</span> : null}
             </div>
-            <span className="status agent">{backendNames.get(run.backendId) ?? run.backendId} · {run.status.replace("_", " ")}</span>
+            <div className="action-controls"><span className="status agent">{action.status.replace("_", " ")}</span>{terminalStatuses.has(action.status) ? <button className="icon-btn" type="button" onClick={() => onClear(action.id)} aria-label={`Clear ${action.kind} action`} title="Clear action and workspace"><Trash2 size={16} /></button> : <button className="secondary-btn" type="button" disabled title="Stopping active runs is planned">Stop</button>}</div>
           </article>
         ))}
       </div>
@@ -785,6 +814,8 @@ function PrDrawer(props: {
   backend: AgentBackend;
   onClose: () => void;
   onStartRun: () => void;
+  onCheckout: () => void;
+  checkoutMessage: string;
 }) {
   const status = statusFor(props.pr);
   return (
@@ -814,6 +845,7 @@ function PrDrawer(props: {
               <div className="kv"><span>Age</span><strong>{props.pr.ageDays} days</strong></div>
               <div className="kv"><span>Comments</span><strong>{props.pr.unresolvedCommentCount}</strong></div>
             </div>
+            <p className="drawer-meta"><strong>{props.pr.repositoryFullName ?? props.pr.repository}</strong> · {props.pr.sourceBranch} → {props.pr.baseBranch} · {props.pr.changedFilesCount} changed files</p>
           </section>
           <section className="detail-block">
             <h3>Owner context</h3>
@@ -824,8 +856,8 @@ function PrDrawer(props: {
           <section className="detail-block">
             <h3>{props.backend.displayName} remediation plan</h3>
             <div className="timeline">
-              <div className="step is-done"><i>1</i><span>Create backend run for {props.pr.sourceBranch}</span></div>
-              <div className="step is-done"><i>2</i><span>Analyze conflicts, comments, checks, and linked issue context</span></div>
+              <div className="step"><i>1</i><span>Checkout the PR into an isolated workspace</span></div>
+              <div className="step"><i>2</i><span>Analyze conflicts, comments, checks, and linked issue context</span></div>
               <div className="step"><i>3</i><span>Prepare fix branch and patch summary</span></div>
               <div className="step"><i>4</i><span>Run required checks</span></div>
               <div className="step"><i>5</i><span>Request human approval before push</span></div>
@@ -835,10 +867,12 @@ function PrDrawer(props: {
             <strong>Approval gate</strong>
             <p>Agent work may prepare the patch. Pushing remains locked until a human approves the diff and check result.</p>
             <div className="button-row">
+              <button className="secondary-btn" onClick={props.onCheckout}><FolderGit2 size={18} /><span>Checkout</span></button>
               <button className="primary-btn" onClick={props.onStartRun}><Play size={18} /><span>Prepare fix</span></button>
-              <button className="secondary-btn">Request review</button>
-              <button className="danger-btn">Hold PR</button>
+              <button className="secondary-btn" disabled title="GitHub write action is planned">Request review</button>
+              <button className="danger-btn" disabled title="Hold policy is planned">Hold PR</button>
             </div>
+            {props.checkoutMessage ? <p className="sync-status" role="status">{props.checkoutMessage}</p> : null}
           </section>
         </div>
       </aside>

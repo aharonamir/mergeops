@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from .github_sync import sync_github_pull_requests
-from .models import AgentRun, AppData, CreateAgentRunRequest, CreateTeamMemberRequest, GitHubSettingsPublic, GitHubSyncResult, TeamMember, UpdateGitHubSettingsRequest, UpdateTeamMemberRequest
+from .models import AgentRun, AppData, CheckoutResult, CreateAgentRunRequest, CreateCheckoutRequest, CreateTeamMemberRequest, GitHubSettingsPublic, GitHubSyncResult, TeamMember, UpdateGitHubSettingsRequest, UpdateTeamMemberRequest
 from .store import store
 
 app = FastAPI(title="MergeOps API", version="0.1.0")
@@ -33,6 +33,22 @@ async def get_app_data() -> AppData:
 async def post_agent_run(payload: CreateAgentRunRequest) -> AgentRun:
     try:
         return store.create_agent_run(payload.backendId, payload.pullRequestId, payload.action)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/checkouts")
+async def post_checkout(payload: CreateCheckoutRequest) -> CheckoutResult:
+    try:
+        return store.create_checkout(payload.pullRequestId)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.delete("/api/actions/{action_id}", status_code=204)
+async def delete_action(action_id: str) -> None:
+    try:
+        store.clear_action(action_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

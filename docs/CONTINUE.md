@@ -82,6 +82,9 @@ owner/repo | /absolute/local/path
 
 The local path is required before an agent action can run against that checkout.
 
+Isolated run workspaces are created automatically under
+`~/.mergeops/workspace/<run-id>/`.
+
 ## Last Milestone
 
 The duplicate-repository path resolution blocker is implemented and covered by
@@ -95,8 +98,9 @@ matching local checkout. Revisit this check later.
 No review blocker is currently open. Continue with the approval-gated fix flow
 and its observability work. The first Agent Runs task is Phase 1 sandboxing:
 fresh detached clones per run, captured base commits, scrubbed environments,
-timeouts, and no push authority. Rootless containers and network policy follow
-after this local workspace implementation.
+timeouts, and no push authority. Checkout can use an optional local source or
+the GitHub PR ref. Rootless containers and network policy follow after this
+local workspace implementation.
 
 ## Near-Term Product Work
 

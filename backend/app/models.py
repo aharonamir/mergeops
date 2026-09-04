@@ -103,11 +103,26 @@ class AgentRun(BaseModel):
     createdAt: str
 
 
+class ActionRecord(BaseModel):
+    id: str
+    kind: Literal["checkout", "agent_run"]
+    repository: str
+    pullRequestId: str
+    pullRequestNumber: int
+    action: str
+    status: str
+    summary: str
+    workspacePath: str | None = None
+    baseCommit: str | None = None
+    createdAt: str
+
+
 class AppData(BaseModel):
     teamMembers: list[TeamMember]
     pullRequests: list[PullRequest]
     agentBackends: list[AgentBackend]
     agentRuns: list[AgentRun]
+    actions: list[ActionRecord] = []
     github: GitHubSettingsPublic | None = None
 
 
@@ -115,6 +130,19 @@ class CreateAgentRunRequest(BaseModel):
     backendId: str
     pullRequestId: str
     action: Literal["analyze", "rebase", "fix_conflicts", "address_review", "fix_checks"]
+
+
+class CreateCheckoutRequest(BaseModel):
+    pullRequestId: str
+
+
+class CheckoutResult(BaseModel):
+    pullRequestId: str
+    status: Literal["ready", "failed"]
+    workspacePath: str | None = None
+    baseCommit: str | None = None
+    summary: str
+    action: ActionRecord
 
 
 class CreateTeamMemberRequest(BaseModel):

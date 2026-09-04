@@ -5,9 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import base64
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 from typing import Protocol
 
@@ -21,6 +23,9 @@ class AgentRunRequest:
     action: str
     backend_id: str
     repository_local_path: str | None = None
+    repository_remote_url: str | None = None
+    repository_token: str | None = None
+    pull_request_ref: str | None = None
     base_branch: str | None = None
     source_branch: str | None = None
 
@@ -75,7 +80,7 @@ class SubprocessAgentAdapter:
                     "inside `agent-runner/`, then retry."
                 ),
             )
-        if request.repository_local_path is None:
+        if request.repository_local_path is None and request.repository_remote_url is None:
             return AgentRunResult(
                 status="failed",
                 summary=(
@@ -177,7 +182,7 @@ class SubprocessAgentAdapter:
 class RunWorkspace:
     """Creates an independent, detached clone for one agent run."""
 
-    root = Path(__file__).resolve().parents[1] / "data" / "agent-runs"
+    root = Path("~/.mergeops/workspace").expanduser()
 
     def __init__(self, path: Path, base_commit: str) -> None:
         self.path = path
@@ -185,44 +190,78 @@ class RunWorkspace:
 
     @classmethod
     def create(cls, request: AgentRunRequest) -> "RunWorkspace":
-        source = Path(request.repository_local_path or "").expanduser().resolve()
-        if not source.is_dir():
-            raise RuntimeError(f"Configured repository path does not exist: {source}")
-        source_root = cls._git(source, "rev-parse", "--show-toplevel").strip()
-        if Path(source_root).resolve() != source:
-            raise RuntimeError(f"Configured path is not the repository root: {source}")
+        source = Path(request.repository_local_path or "").expanduser().resolve() if request.repository_local_path else None
+        if source is not None:
+            if not source.is_dir():
+                raise RuntimeError(f"Configured repository path does not exist: {source}")
+            source_root = cls._git(source, "rev-parse", "--show-toplevel").strip()
+            if Path(source_root).resolve() != source:
+                raise RuntimeError(f"Configured path is not the repository root: {source}")
+        elif request.repository_remote_url is None:
+            raise RuntimeError("No local checkout or remote repository is configured")
 
         run_root = cls.root / request.run_id
         checkout = run_root / "checkout"
         if run_root.exists():
             raise RuntimeError(f"Run workspace already exists: {run_root}")
+        cls.root.mkdir(parents=True, exist_ok=True)
         run_root.mkdir(parents=True, exist_ok=False)
         try:
-            cls._git(run_root, "clone", "--no-local", "--no-checkout", str(source), str(checkout))
+            clone_args = ["clone", "--no-checkout"]
+            if source is not None:
+                clone_args.insert(1, "--no-local")
+            cls._git(run_root, *clone_args, str(source) if source is not None else request.repository_remote_url or "", str(checkout), token=request.repository_token)
             branch = request.source_branch or request.base_branch
-            if branch and cls._git_optional(checkout, "rev-parse", "--verify", f"refs/heads/{branch}"):
+            if request.pull_request_ref:
+                pr_branch = f"mergeops-pr-{request.pull_request_number}"
+                cls._git(checkout, "fetch", "origin", f"+{request.pull_request_ref}:refs/heads/{pr_branch}", token=request.repository_token)
+                cls._git(checkout, "checkout", "--detach", pr_branch)
+            elif branch and cls._git_optional(checkout, "rev-parse", "--verify", f"refs/heads/{branch}"):
                 cls._git(checkout, "checkout", "--detach", branch)
             else:
                 cls._git(checkout, "checkout", "--detach", "HEAD")
             base_commit = cls._git(checkout, "rev-parse", "HEAD").strip()
         except Exception:
-            # Preserve the run directory for diagnosis, but never expose a partial checkout.
+            cls.cleanup(request.run_id)
             raise
         return cls(checkout, base_commit)
 
+    @classmethod
+    def cleanup(cls, run_id: str) -> None:
+        run_root = (cls.root / run_id).resolve()
+        root = cls.root.resolve()
+        if root not in run_root.parents:
+            raise ValueError("Run workspace is outside the MergeOps workspace root")
+        if run_root.exists():
+            shutil.rmtree(run_root)
+
     @staticmethod
-    def _git(cwd: Path, *args: str) -> str:
+    def _git(cwd: Path, *args: str, token: str | None = None) -> str:
         result = subprocess.run(
-            ["git", *args], cwd=cwd, capture_output=True, text=True, check=True, timeout=30
+            ["git", *args], cwd=cwd, capture_output=True, text=True, check=True, timeout=120,
+            env=RunWorkspace._git_environment(token),
         )
         return result.stdout
 
     @staticmethod
-    def _git_optional(cwd: Path, *args: str) -> bool:
+    def _git_optional(cwd: Path, *args: str, token: str | None = None) -> bool:
         result = subprocess.run(
-            ["git", *args], cwd=cwd, capture_output=True, text=True, check=False, timeout=30
+            ["git", *args], cwd=cwd, capture_output=True, text=True, check=False, timeout=120,
+            env=RunWorkspace._git_environment(token),
         )
         return result.returncode == 0
+
+    @staticmethod
+    def _git_environment(token: str | None) -> dict[str, str]:
+        environment = os.environ.copy()
+        if token:
+            credentials = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+            environment.update({
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "http.extraheader",
+                "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {credentials}",
+            })
+        return environment
 
 
 def adapter_registry(backends: list[tuple[str, str]]) -> dict[str, AgentAdapter]:
