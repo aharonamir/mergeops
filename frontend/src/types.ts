@@ -20,6 +20,7 @@ export type TeamMember = {
 export type PullRequest = {
   id: string;
   repository: string;
+  repositoryFullName?: string | null;
   number: number;
   title: string;
   author: string;
@@ -45,6 +46,7 @@ export type RepositoryConfig = {
   name: string;
   defaultBranch: string;
   enabled: boolean;
+  localPath?: string | null;
   lastSyncedAt?: string | null;
   lastSyncStatus?: string | null;
 };
@@ -76,6 +78,7 @@ export type AgentRun = {
   status: "queued" | "running" | "patch_ready" | "checks_running" | "awaiting_approval" | "approved" | "pushed" | "failed" | "cancelled";
   requester: string;
   summary: string;
+  backendSessionId?: string | null;
   createdAt: string;
 };
 

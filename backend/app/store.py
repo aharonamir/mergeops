@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
+from .adapters import AgentRunRequest, adapter_registry, utc_now
 from .fixtures import agent_backends, agent_runs, github_settings, pull_requests, team_members
-from .models import AgentRun, AppData, CreateTeamMemberRequest, GitHubSettings, GitHubSettingsPublic, PullRequest, TeamMember, UpdateGitHubSettingsRequest, UpdateTeamMemberRequest
+from .models import AgentRun, AppData, CreateTeamMemberRequest, GitHubSettings, GitHubSettingsPublic, PullRequest, RepositoryConfig, TeamMember, UpdateGitHubSettingsRequest, UpdateTeamMemberRequest
 
 
 class PersistedAppData(AppData):
@@ -28,6 +28,24 @@ class LocalJsonStore:
         pull_request = next((item for item in data.pullRequests if item.id == pull_request_id), None)
         if pull_request is None:
             raise ValueError("Unknown pull request")
+        repository = self._repository_config(data, self._pull_request_repository_key(pull_request, data))
+        adapter = adapter_registry(
+            [(backend.id, backend.endpoint) for backend in data.agentBackends if backend.enabled]
+        ).get(backend_id)
+        if adapter is None:
+            raise ValueError("Unknown agent backend")
+        result = adapter.create_run(
+            AgentRunRequest(
+                pull_request_id=pull_request.id,
+                repository=pull_request.repositoryFullName or pull_request.repository,
+                pull_request_number=pull_request.number,
+                action=action,
+                backend_id=backend_id,
+                repository_local_path=repository.localPath if repository else None,
+                base_branch=pull_request.baseBranch,
+                source_branch=pull_request.sourceBranch,
+            )
+        )
 
         run = AgentRun(
             id=f"run-{len(data.agentRuns) + 1}",
@@ -36,10 +54,11 @@ class LocalJsonStore:
             pullRequestId=pull_request.id,
             pullRequestNumber=pull_request.number,
             action=action,
-            status="awaiting_approval",
+            status=result.status,
             requester="local user",
-            summary=f"Queued {action.replace('_', ' ')} run. No push will happen until approval.",
-            createdAt=datetime.now(timezone.utc).isoformat(),
+            summary=result.summary,
+            backendSessionId=result.backend_session_id,
+            createdAt=utc_now(),
         )
         data.agentRuns.insert(0, run)
         self._save(data)
@@ -129,7 +148,7 @@ class LocalJsonStore:
             payload["githubPrivate"] = github_settings.model_dump(mode="json")
         payload["github"] = self._public_github(GitHubSettings.model_validate(payload["githubPrivate"])).model_dump(mode="json")
         data = PersistedAppData.model_validate(payload)
-        normalized = [self._normalize_owner(pull_request, data) for pull_request in data.pullRequests]
+        normalized = [self._normalize_pull_request(pull_request, data) for pull_request in data.pullRequests]
         if normalized != data.pullRequests:
             data.pullRequests = normalized
             self._save(data)
@@ -153,15 +172,26 @@ class LocalJsonStore:
             github=self._public_github(data.githubPrivate),
         )
 
-    def _normalize_owner(self, pull_request: PullRequest, data: PersistedAppData) -> PullRequest:
+    def _normalize_pull_request(self, pull_request: PullRequest, data: PersistedAppData) -> PullRequest:
+        patch: dict[str, str] = {}
         author = pull_request.author.casefold()
         for member in data.teamMembers:
             identities = [member.githubUsername, *member.gitAliases]
             if any(author == identity.casefold() for identity in identities if identity):
-                return pull_request.model_copy(update={"ownerMemberId": member.id})
-        if data.githubPrivate.username and author == data.githubPrivate.username.casefold() and len(data.teamMembers) == 1:
-            return pull_request.model_copy(update={"ownerMemberId": data.teamMembers[0].id})
-        return pull_request.model_copy(update={"ownerMemberId": "unknown"})
+                patch["ownerMemberId"] = member.id
+                break
+        else:
+            if data.githubPrivate.username and author == data.githubPrivate.username.casefold() and len(data.teamMembers) == 1:
+                patch["ownerMemberId"] = data.teamMembers[0].id
+            else:
+                patch["ownerMemberId"] = "unknown"
+
+        if pull_request.repositoryFullName is None:
+            repository_full_name = self._unique_repository_full_name(data, pull_request.repository)
+            if repository_full_name is not None:
+                patch["repositoryFullName"] = repository_full_name
+
+        return pull_request.model_copy(update=patch)
 
     def _public_github(self, settings: GitHubSettings) -> GitHubSettingsPublic:
         return GitHubSettingsPublic(
@@ -171,6 +201,34 @@ class LocalJsonStore:
             repositories=settings.repositories,
             lastSyncedAt=settings.lastSyncedAt,
         )
+
+    def _repository_config(self, data: PersistedAppData, repository_full_name: str | None) -> RepositoryConfig | None:
+        if repository_full_name is None:
+            return None
+        normalized = repository_full_name.casefold()
+        for repository in data.githubPrivate.repositories:
+            full_name = f"{repository.owner}/{repository.name}".casefold()
+            if normalized == full_name:
+                return repository
+        return None
+
+    def _pull_request_repository_key(self, pull_request: PullRequest, data: PersistedAppData) -> str | None:
+        if pull_request.repositoryFullName:
+            return pull_request.repositoryFullName
+        return self._unique_repository_full_name(data, pull_request.repository)
+
+    def _unique_repository_full_name(self, data: PersistedAppData, repository_name: str) -> str | None:
+        normalized = repository_name.casefold()
+        for repository in data.githubPrivate.repositories:
+            full_name = f"{repository.owner}/{repository.name}"
+            if full_name.casefold() == normalized:
+                return full_name
+        matches = [
+            f"{repository.owner}/{repository.name}"
+            for repository in data.githubPrivate.repositories
+            if repository.name.casefold() == normalized
+        ]
+        return matches[0] if len(matches) == 1 else None
 
     def _unique_member_id(self, seed: str, members: list[TeamMember]) -> str:
         base = "".join(character.lower() if character.isalnum() else "-" for character in seed).strip("-") or "member"

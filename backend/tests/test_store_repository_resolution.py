@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.adapters import AgentRunRequest, AgentRunResult
+from app.models import AgentBackend, GitHubSettings, GitHubSettingsPublic, PullRequest, RepositoryConfig, TeamMember
+from app.store import LocalJsonStore, PersistedAppData
+
+
+class CapturingAdapter:
+    backend_id = "opencode"
+
+    def __init__(self) -> None:
+        self.requests: list[AgentRunRequest] = []
+
+    def create_run(self, request: AgentRunRequest) -> AgentRunResult:
+        self.requests.append(request)
+        return AgentRunResult(status="awaiting_approval", summary="captured")
+
+
+class StoreRepositoryResolutionTest(unittest.TestCase):
+    def test_agent_run_uses_repository_full_name_for_duplicate_repo_names(self) -> None:
+        data = self._data(
+            PullRequest(
+                id="pr-1",
+                repository="service",
+                repositoryFullName="owner-b/service",
+                number=12,
+                title="Fix service",
+                author="dev",
+                ownerMemberId="dev",
+                sourceBranch="feature/service",
+                baseBranch="main",
+                state="open",
+                mergeable="mergeable",
+                reviewState="approved",
+                unresolvedCommentCount=0,
+                requestedReviewers=[],
+                checkState="passing",
+                linkedIssueIds=[],
+                changedFilesCount=1,
+                ageDays=1,
+                summary="Ready",
+                searchText="ready",
+            )
+        )
+        adapter = CapturingAdapter()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalJsonStore(Path(tmpdir) / "mergeops.local.json")
+            store._save(data)
+            with patch("app.store.adapter_registry", return_value={"opencode": adapter}):
+                store.create_agent_run("opencode", "pr-1", "analyze")
+
+        self.assertEqual(adapter.requests[0].repository, "owner-b/service")
+        self.assertEqual(adapter.requests[0].repository_local_path, "/tmp/owner-b-service")
+
+    def test_legacy_short_repo_name_does_not_select_an_ambiguous_checkout(self) -> None:
+        data = self._data(
+            PullRequest(
+                id="pr-legacy",
+                repository="service",
+                number=12,
+                title="Fix service",
+                author="dev",
+                ownerMemberId="dev",
+                sourceBranch="feature/service",
+                baseBranch="main",
+                state="open",
+                mergeable="mergeable",
+                reviewState="approved",
+                unresolvedCommentCount=0,
+                requestedReviewers=[],
+                checkState="passing",
+                linkedIssueIds=[],
+                changedFilesCount=1,
+                ageDays=1,
+                summary="Ready",
+                searchText="ready",
+            )
+        )
+        adapter = CapturingAdapter()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LocalJsonStore(Path(tmpdir) / "mergeops.local.json")
+            store._save(data)
+            with patch("app.store.adapter_registry", return_value={"opencode": adapter}):
+                store.create_agent_run("opencode", "pr-legacy", "analyze")
+
+        self.assertEqual(adapter.requests[0].repository, "service")
+        self.assertIsNone(adapter.requests[0].repository_local_path)
+
+    def _data(self, pull_request: PullRequest) -> PersistedAppData:
+        repositories = [
+            RepositoryConfig(id="owner-a-service", owner="owner-a", name="service", localPath="/tmp/owner-a-service"),
+            RepositoryConfig(id="owner-b-service", owner="owner-b", name="service", localPath="/tmp/owner-b-service"),
+        ]
+        github = GitHubSettings(accessMode="contributor_token", token=None, username=None, repositories=repositories)
+        return PersistedAppData(
+            teamMembers=[
+                TeamMember(
+                    id="dev",
+                    displayName="Dev",
+                    githubUsername="dev",
+                    gitAliases=[],
+                    emails=[],
+                    currentFocus="",
+                    responsibilities="",
+                    ownedRepos=[],
+                    ownedPaths=[],
+                    expertiseTags=[],
+                    timezone="UTC",
+                    availability="active",
+                )
+            ],
+            pullRequests=[pull_request],
+            agentBackends=[
+                AgentBackend(
+                    id="opencode",
+                    displayName="opencode",
+                    adapterType="@opencode-ai/sdk",
+                    endpoint="local TypeScript runner",
+                    defaultModel="team default",
+                    enabled=True,
+                )
+            ],
+            agentRuns=[],
+            github=GitHubSettingsPublic(
+                accessMode=github.accessMode,
+                hasToken=False,
+                username=github.username,
+                repositories=github.repositories,
+                lastSyncedAt=github.lastSyncedAt,
+            ),
+            githubPrivate=github,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -66,6 +66,7 @@ pull_requests = [
     PullRequest(
         id="pr-842",
         repository="agent-core",
+        repositoryFullName="your-org/agent-core",
         number=842,
         title="Rework session permission prompts for opencode bridge",
         author="danak",
@@ -87,6 +88,7 @@ pull_requests = [
     PullRequest(
         id="pr-317",
         repository="token-optimizer",
+        repositoryFullName="your-org/token-optimizer",
         number=317,
         title="Add Hebrew/English issue expansion to repository search",
         author="mayalevi",
@@ -108,6 +110,7 @@ pull_requests = [
     PullRequest(
         id="pr-1055",
         repository="jiuwenswarm-memtier",
+        repositoryFullName="your-org/jiuwenswarm-memtier",
         number=1055,
         title="Stabilize memtier docker compose harness",
         author="noambar",
@@ -129,6 +132,7 @@ pull_requests = [
     PullRequest(
         id="pr-229",
         repository="perfrouter",
+        repositoryFullName="your-org/perfrouter",
         number=229,
         title="Extract billing router from benchmark runner",
         author="liorco",
@@ -154,7 +158,7 @@ agent_backends = [
         id="opencode",
         displayName="opencode",
         adapterType="@opencode-ai/sdk",
-        endpoint="http://127.0.0.1:4096",
+        endpoint="local TypeScript runner",
         defaultModel="team default",
         enabled=True,
     ),

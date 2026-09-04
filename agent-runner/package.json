@@ -1,0 +1,19 @@
+{
+  "name": "@mergeops/agent-runner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "*",
+    "@opencode-ai/sdk": "*",
+    "@openai/codex-sdk": "*",
+    "effect": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  }
+}

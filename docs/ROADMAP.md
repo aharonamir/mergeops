@@ -4,6 +4,27 @@
 
 `mergeops/` contains the original static prototype plus the first React/Vite and FastAPI local-only scaffold. It validates product shape, information architecture, core screens, theme behavior, team workspace fields, backend agent SDK selection, and fixture-backed API flow.
 
+## Review Blockers
+
+### P2: Avoid selecting local paths by bare repo name
+
+Current risk: live GitHub sync stores PRs with `repository` as the bare repo name
+only, while repository settings can contain multiple entries with the same name
+under different owners. `LocalJsonStore._repository_config()` can therefore pick
+the first matching `name` and launch an agent run in the wrong local checkout.
+
+Required fix:
+- Preserve an unambiguous repository key on every synced PR, preferably
+  `repositoryId` or `repositoryFullName` using `owner/name`.
+- Match agent run local paths by that key, not by bare `repository.name`.
+- Keep display text free to show the short repo name, but never use that short
+  name as the execution lookup key.
+- Add a regression test with two configured repositories sharing the same
+  `name` and different `owner`/`localPath` values.
+
+Until this is fixed, agent execution should stay guarded by explicit local path
+configuration and should not be considered safe for duplicate repository names.
+
 ## Recommended Next Build Path
 
 ### Slice 1: App Foundation
@@ -65,6 +86,11 @@ Deliverables:
 - Event stream shape.
 - opencode adapter prototype.
 
+Progress: the dashboard-facing contract now launches a local Node/TypeScript
+runner instead of an HTTP opencode server. The runner protocol is stdin JSON in
+and newline-delimited JSON events out, with opencode, Codex, and Claude behind
+the same boundary.
+
 Exit criteria:
 - Starting a run creates a durable run record.
 - UI does not depend on a specific backend SDK.
@@ -117,3 +143,6 @@ Build a local developer version with:
 - local settings persistence
 - backend adapter selection preserved from the prototype
 - explicit repository path allowlist for later agent runs
+
+Repository settings accept `owner/repo | /absolute/local/path` so agent runs can
+be constrained to known local checkouts.

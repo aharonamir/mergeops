@@ -95,6 +95,7 @@ def _sync_repository(
             PullRequest(
                 id=f"{repository.owner}-{repository.name}-{number}",
                 repository=repository.name,
+                repositoryFullName=f"{repository.owner}/{repository.name}",
                 number=number,
                 title=str(detail.get("title") or f"PR #{number}"),
                 author=author,

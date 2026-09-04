@@ -717,7 +717,7 @@ function SettingsView(props: {
             </label>
             <label className="field full">
               <span>Repositories</span>
-              <textarea value={repoText} onChange={(event) => setRepoText(event.target.value)} rows={5} placeholder="owner/repo, one per line" />
+              <textarea value={repoText} onChange={(event) => setRepoText(event.target.value)} rows={5} placeholder="owner/repo | /absolute/local/path" />
             </label>
           </div>
           <div className="settings-actions">
@@ -732,19 +732,24 @@ function SettingsView(props: {
 }
 
 function formatRepositories(repositories: RepositoryConfig[]) {
-  return repositories.map((repository) => `${repository.owner}/${repository.name}`).join("\n");
+  return repositories.map((repository) => {
+    const remote = `${repository.owner}/${repository.name}`;
+    return repository.localPath ? `${remote} | ${repository.localPath}` : remote;
+  }).join("\n");
 }
 
 function parseRepositories(value: string): RepositoryConfig[] {
   return value.split("\n").map((line) => line.trim()).filter(Boolean).map((line) => {
-    const [owner, name] = line.split("/");
+    const [remote, localPath] = line.split("|").map((part) => part.trim());
+    const [owner, name] = remote.split("/");
     const repoName = name || owner;
     return {
       id: `${owner}-${repoName}`.replace(/[^a-zA-Z0-9_.-]/g, "-"),
       owner: owner || "",
       name: repoName || "",
       defaultBranch: "main",
-      enabled: true
+      enabled: true,
+      localPath: localPath || null
     };
   }).filter((repository) => repository.owner && repository.name);
 }

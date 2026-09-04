@@ -21,6 +21,7 @@ class TeamMember(BaseModel):
 class PullRequest(BaseModel):
     id: str
     repository: str
+    repositoryFullName: str | None = None
     number: int
     title: str
     author: str
@@ -46,6 +47,7 @@ class RepositoryConfig(BaseModel):
     name: str
     defaultBranch: str = "main"
     enabled: bool = True
+    localPath: str | None = None
     lastSyncedAt: str | None = None
     lastSyncStatus: str | None = None
 
@@ -95,6 +97,7 @@ class AgentRun(BaseModel):
     ]
     requester: str
     summary: str
+    backendSessionId: str | None = None
     createdAt: str
 
 
