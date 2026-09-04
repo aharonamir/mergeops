@@ -117,12 +117,21 @@ class ActionRecord(BaseModel):
     createdAt: str
 
 
+class ActivityEvent(BaseModel):
+    id: str
+    kind: str
+    message: str
+    actionId: str | None = None
+    createdAt: str
+
+
 class AppData(BaseModel):
     teamMembers: list[TeamMember]
     pullRequests: list[PullRequest]
     agentBackends: list[AgentBackend]
     agentRuns: list[AgentRun]
     actions: list[ActionRecord] = []
+    activity: list[ActivityEvent] = []
     github: GitHubSettingsPublic | None = None
 
 

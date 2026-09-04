@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from .adapters import AgentRunRequest, RunWorkspace, adapter_registry, utc_now
 from .fixtures import agent_backends, agent_runs, github_settings, pull_requests, team_members
-from .models import ActionRecord, AgentRun, AppData, CheckoutResult, CreateTeamMemberRequest, GitHubSettings, GitHubSettingsPublic, PullRequest, RepositoryConfig, TeamMember, UpdateGitHubSettingsRequest, UpdateTeamMemberRequest
+from .models import ActionRecord, ActivityEvent, AgentRun, AppData, CheckoutResult, CreateTeamMemberRequest, GitHubSettings, GitHubSettingsPublic, PullRequest, RepositoryConfig, TeamMember, UpdateGitHubSettingsRequest, UpdateTeamMemberRequest
 
 
 class PersistedAppData(AppData):
@@ -82,6 +82,7 @@ class LocalJsonStore:
             baseCommit=run.baseCommit,
             createdAt=run.createdAt,
         ))
+        data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="agent_run", message=f"Agent run {run.action} for {run.repository}#{run.pullRequestNumber} is {run.status}.", actionId=run.id, createdAt=run.createdAt))
         self._save(data)
         return run
 
@@ -123,6 +124,7 @@ class LocalJsonStore:
             createdAt=utc_now(),
         )
         data.actions.insert(0, action)
+        data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="checkout", message=action.summary, actionId=action.id, createdAt=action.createdAt))
         self._save(data)
         return CheckoutResult(
             pullRequestId=pull_request.id,
@@ -152,6 +154,7 @@ class LocalJsonStore:
                 import shutil
                 shutil.rmtree(run_root)
         data.actions = [item for item in data.actions if item.id != action_id]
+        data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="action_cleared", message=f"Cleared {action.kind} for {action.repository}#{action.pullRequestNumber}.", actionId=action.id, createdAt=utc_now()))
         self._save(data)
 
     def create_team_member(self, payload: CreateTeamMemberRequest) -> TeamMember:
@@ -159,6 +162,7 @@ class LocalJsonStore:
         member_id = self._unique_member_id(payload.githubUsername or payload.displayName, data.teamMembers)
         member = TeamMember(id=member_id, **payload.model_dump())
         data.teamMembers.append(member)
+        data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="team", message=f"Added team member {member.displayName}.", createdAt=utc_now()))
         self._save(data)
         return member
 
@@ -171,6 +175,7 @@ class LocalJsonStore:
         patch = payload.model_dump(exclude_unset=True, exclude_none=True)
         updated = data.teamMembers[index].model_copy(update=patch)
         data.teamMembers[index] = updated
+        data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="team", message=f"Updated team member {updated.displayName}.", createdAt=utc_now()))
         self._save(data)
         return updated
 
@@ -187,6 +192,7 @@ class LocalJsonStore:
             else pull_request
             for pull_request in data.pullRequests
         ]
+        data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="team", message=f"Removed team member {member_id}.", createdAt=utc_now()))
         self._save(data)
 
     def update_github_settings(self, payload: UpdateGitHubSettingsRequest) -> GitHubSettingsPublic:
@@ -200,6 +206,7 @@ class LocalJsonStore:
         next_payload.update(patch)
         data.githubPrivate = GitHubSettings.model_validate(next_payload)
         data.github = self._public_github(data.githubPrivate)
+        data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="settings", message="GitHub settings updated.", createdAt=utc_now()))
         self._save(data)
         return data.github
 
@@ -215,6 +222,7 @@ class LocalJsonStore:
             repositories.append(repository.model_copy(update={"lastSyncedAt": synced_at, "lastSyncStatus": status}))
         data.githubPrivate.repositories = repositories
         data.github = self._public_github(data.githubPrivate)
+        data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="sync", message=f"GitHub sync imported {len(pull_requests)} PRs" + (f" with {len(errors)} error(s)." if errors else "."), createdAt=synced_at))
         self._save(data)
         return data
 
@@ -239,6 +247,7 @@ class LocalJsonStore:
                     baseCommit=run.baseCommit,
                     createdAt=run.createdAt,
                 ) for run in agent_runs],
+                activity=[ActivityEvent(id=f"activity-{run.id}", kind="agent_run", message=f"Agent run {run.action} for {run.repository}#{run.pullRequestNumber} is {run.status}.", actionId=run.id, createdAt=run.createdAt) for run in agent_runs],
                 github=self._public_github(private_github),
                 githubPrivate=private_github,
             )
@@ -267,6 +276,8 @@ class LocalJsonStore:
                 for raw_run in payload.get("agentRuns", [])
                 for run in [AgentRun.model_validate(raw_run)]
             ]
+        if "activity" not in payload:
+            payload["activity"] = [ActivityEvent(id=f"activity-{action.id}", kind=action.kind, message=action.summary, actionId=action.id, createdAt=action.createdAt).model_dump(mode="json") for raw_action in payload.get("actions", []) for action in [ActionRecord.model_validate(raw_action)]]
         payload["github"] = self._public_github(GitHubSettings.model_validate(payload["githubPrivate"])).model_dump(mode="json")
         data = PersistedAppData.model_validate(payload)
         normalized = [self._normalize_pull_request(pull_request, data) for pull_request in data.pullRequests]
@@ -291,6 +302,7 @@ class LocalJsonStore:
             agentBackends=data.agentBackends,
             agentRuns=data.agentRuns,
             actions=data.actions,
+            activity=data.activity,
             github=self._public_github(data.githubPrivate),
         )
 

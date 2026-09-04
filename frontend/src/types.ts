@@ -1,5 +1,5 @@
 export type ThemePreference = "system" | "light" | "dark";
-export type View = "cockpit" | "team" | "agents" | "settings";
+export type View = "cockpit" | "team" | "agents" | "activity" | "settings";
 export type QueueFilter = "all" | "blocked" | "review" | "ready" | "merged";
 
 export type TeamMember = {
@@ -98,6 +98,14 @@ export type ActionRecord = {
   createdAt: string;
 };
 
+export type ActivityEvent = {
+  id: string;
+  kind: string;
+  message: string;
+  actionId?: string | null;
+  createdAt: string;
+};
+
 export type CheckoutResult = {
   pullRequestId: string;
   status: "ready" | "failed";
@@ -113,6 +121,7 @@ export type AppData = {
   agentBackends: AgentBackend[];
   agentRuns: AgentRun[];
   actions?: ActionRecord[];
+  activity?: ActivityEvent[];
   github?: GitHubSettings | null;
 };
 

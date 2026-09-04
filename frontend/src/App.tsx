@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   GitPullRequest,
+  Activity,
   Plus,
   Save,
   Trash2,
@@ -16,7 +17,7 @@ import {
   FolderGit2
 } from "lucide-react";
 import { clearAction, createAgentRun, createCheckout, createTeamMember, deleteTeamMember, loadAppData, syncGitHub, updateGitHubSettings, updateTeamMember } from "./api";
-import type { ActionRecord, AgentBackend, AgentRun, AppData, GitHubSettings, GitHubSyncResult, PullRequest, QueueFilter, RepositoryConfig, TeamMember, ThemePreference, View } from "./types";
+import type { ActionRecord, ActivityEvent, AgentBackend, AgentRun, AppData, GitHubSettings, GitHubSyncResult, PullRequest, QueueFilter, RepositoryConfig, TeamMember, ThemePreference, View } from "./types";
 
 const themeIcons = {
   system: Monitor,
@@ -28,6 +29,7 @@ const views: Array<{ id: View; label: string; icon: typeof GitPullRequest }> = [
   { id: "cockpit", label: "PR Cockpit", icon: GitPullRequest },
   { id: "team", label: "Team Workspace", icon: Users },
   { id: "agents", label: "Actions", icon: Play },
+  { id: "activity", label: "Activity", icon: Activity },
   { id: "settings", label: "Settings", icon: Settings }
 ];
 
@@ -74,13 +76,17 @@ export function App() {
   const [selectedPr, setSelectedPr] = useState<PullRequest | null>(null);
   const [runs, setRuns] = useState<AgentRun[]>([]);
   const [actions, setActions] = useState<ActionRecord[]>([]);
+  const [activity, setActivity] = useState<ActivityEvent[]>([]);
   const [checkoutMessage, setCheckoutMessage] = useState("");
+  const [syncing, setSyncing] = useState(false);
+  const [syncMessage, setSyncMessage] = useState("");
 
   useEffect(() => {
     loadAppData().then((payload) => {
       setData(payload);
       setRuns(payload.agentRuns);
       setActions(payload.actions ?? payload.agentRuns.map(actionFromRun));
+      setActivity(payload.activity ?? []);
     });
   }, []);
 
@@ -140,6 +146,8 @@ export function App() {
     const run = await createAgentRun({ backendId, pullRequestId: pr.id, action: pr.mergeable === "conflicting" ? "fix_conflicts" : "rebase" });
     setRuns((current) => [run, ...current]);
     setActions((current) => [actionFromRun(run), ...current]);
+    const refreshed = await loadAppData();
+    setActivity(refreshed.activity ?? []);
   }
 
   async function checkoutPr(pr: PullRequest) {
@@ -147,6 +155,8 @@ export function App() {
     try {
       const result = await createCheckout(pr.id);
       setActions((current) => [result.action, ...current]);
+      const refreshed = await loadAppData();
+      setActivity(refreshed.activity ?? []);
       setCheckoutMessage(`${result.summary} Base ${result.baseCommit?.slice(0, 12) ?? "unknown"}.`);
     } catch (error) {
       setCheckoutMessage(error instanceof Error ? error.message : "Could not create isolated checkout");
@@ -190,12 +200,28 @@ export function App() {
     setData(payload);
     setRuns(payload.agentRuns);
     setActions(payload.actions ?? payload.agentRuns.map(actionFromRun));
+    setActivity(payload.activity ?? []);
     return result;
+  }
+
+  async function syncFromToolbar() {
+    setSyncing(true);
+    setSyncMessage("");
+    try {
+      const result = await runGitHubSync();
+      setSyncMessage(result.errors.length ? `Synced ${result.pullRequestsImported} PRs · ${result.errors.length} error${result.errors.length === 1 ? "" : "s"}` : `Synced ${result.pullRequestsImported} PRs`);
+    } catch {
+      setSyncMessage("Sync failed · check Settings");
+    } finally {
+      setSyncing(false);
+    }
   }
 
   async function removeAction(actionId: string) {
     await clearAction(actionId);
     setActions((current) => current.filter((action) => action.id !== actionId));
+    const refreshed = await loadAppData();
+    setActivity(refreshed.activity ?? []);
   }
 
   return (
@@ -227,24 +253,37 @@ export function App() {
       </aside>
 
       <main className="workspace">
-        <header className="topbar">
-          <label className="search-wrap" aria-label="Bilingual PR and issue search">
-            <Search size={18} />
-            <input value={query} onChange={(event) => setQuery(event.target.value)} type="search" placeholder="Search PRs, issues, comments, Hebrew or English" />
-          </label>
-          <div className="top-actions">
-            <select value={repo} onChange={(event) => setRepo(event.target.value)} aria-label="Repository filter">
-              {repos.map((item) => <option key={item} value={item}>{item === "all" ? "All repos" : item}</option>)}
-            </select>
-            <select value={owner} onChange={(event) => setOwner(event.target.value)} aria-label="Team member filter">
-              <option value="all">All members</option>
-              {data.teamMembers.map((member) => <option key={member.id} value={member.id}>{member.displayName}</option>)}
-            </select>
-            <button className="icon-btn" type="button" onClick={() => setTheme(theme === "system" ? "light" : theme === "light" ? "dark" : "system")} aria-label={`Theme: ${theme}`} title={`Theme: ${theme}`}>
-              <ThemeIcon size={18} />
-            </button>
-          </div>
-        </header>
+        {activeView === "cockpit" && (
+          <header className="topbar">
+            <label className="search-wrap" aria-label="Bilingual PR and issue search">
+              <Search size={18} />
+              <input value={query} onChange={(event) => setQuery(event.target.value)} type="search" placeholder="Search PRs, issues, comments, Hebrew or English" />
+            </label>
+            <div className="top-actions">
+              <select value={repo} onChange={(event) => setRepo(event.target.value)} aria-label="Repository filter">
+                {repos.map((item) => <option key={item} value={item}>{item === "all" ? "All repos" : item}</option>)}
+              </select>
+              <select value={owner} onChange={(event) => setOwner(event.target.value)} aria-label="Team member filter">
+                <option value="all">All members</option>
+                {data.teamMembers.map((member) => <option key={member.id} value={member.id}>{member.displayName}</option>)}
+              </select>
+              <select value={dateRange} onChange={(event) => setDateRange(event.target.value === "all" ? "all" : Number(event.target.value))} aria-label="PR age range">
+                <option value={30}>Last 30 days</option>
+                <option value={60}>Last 60 days</option>
+                <option value={90}>Last 90 days</option>
+                <option value="all">All time</option>
+              </select>
+              <button className="secondary-btn sync-btn" type="button" onClick={syncFromToolbar} disabled={syncing}>
+                <RefreshCw size={16} className={syncing ? "spin" : ""} />
+                {syncing ? "Syncing" : "Re-sync"}
+              </button>
+              {syncMessage ? <span className="sync-status">{syncMessage}</span> : null}
+              <button className="icon-btn" type="button" onClick={() => setTheme(theme === "system" ? "light" : theme === "light" ? "dark" : "system")} aria-label={`Theme: ${theme}`} title={`Theme: ${theme}`}>
+                <ThemeIcon size={18} />
+              </button>
+            </div>
+          </header>
+        )}
 
         {activeView === "cockpit" && (
           <Cockpit
@@ -258,11 +297,11 @@ export function App() {
             onSelectPr={setSelectedPr}
             dateRange={dateRange}
             onDateRangeChange={setDateRange}
-            onSyncGitHub={runGitHubSync}
           />
         )}
         {activeView === "team" && <TeamWorkspace members={data.teamMembers} onSaveMember={saveTeamMember} onAddMember={addTeamMember} onDeleteMember={removeTeamMember} />}
         {activeView === "agents" && <ActionsView actions={actions} onClear={removeAction} />}
+        {activeView === "activity" && <ActivityView events={activity} />}
         {activeView === "settings" && (
           <SettingsView
             backendId={backendId}
@@ -309,10 +348,7 @@ function Cockpit(props: {
   onSelectPr: (pr: PullRequest) => void;
   dateRange: number | "all";
   onDateRangeChange: (range: number | "all") => void;
-  onSyncGitHub: () => Promise<GitHubSyncResult>;
 }) {
-  const [syncing, setSyncing] = useState(false);
-  const [syncMessage, setSyncMessage] = useState("");
   const openCount = props.allPrs.filter((pr) => pr.state === "open").length;
   const mergedCount = props.allPrs.filter((pr) => pr.state === "merged").length;
   const closedCount = props.allPrs.filter((pr) => pr.state === "closed").length;
@@ -327,42 +363,16 @@ function Cockpit(props: {
     ["Ready", props.allPrs.filter((pr) => statusFor(pr) === "ready").length]
   ];
 
-  async function syncNow() {
-    setSyncing(true);
-    setSyncMessage("");
-    try {
-      const result = await props.onSyncGitHub();
-      setSyncMessage(result.errors.length ? `Synced ${result.pullRequestsImported} PRs · ${result.errors.length} repo error${result.errors.length === 1 ? "" : "s"}` : `Synced ${result.pullRequestsImported} PRs`);
-    } catch {
-      setSyncMessage("Sync failed · check Settings");
-    } finally {
-      setSyncing(false);
-    }
-  }
-
   return (
     <section className="view is-visible" aria-labelledby="cockpitTitle">
       <div className="view-head">
         <div>
-          <h1 id="cockpitTitle">Pull request intervention queue</h1>
+          <h1 id="cockpitTitle">PR Triage</h1>
           <p>
             {props.allPrs.length
               ? `${props.allPrs.length} team PRs in the last ${props.dateRange === "all" ? "all time" : `${props.dateRange} days`} · ${repositoryNames || "configured repositories"} · last sync ${lastSynced}`
               : `No registered-member PRs in the last ${props.dateRange === "all" ? "all time" : `${props.dateRange} days`} · last sync ${lastSynced}`}
           </p>
-        </div>
-        <div className="cockpit-actions">
-          <select value={props.dateRange} onChange={(event) => props.onDateRangeChange(event.target.value === "all" ? "all" : Number(event.target.value))} aria-label="PR age range">
-            <option value={30}>Last 30 days</option>
-            <option value={60}>Last 60 days</option>
-            <option value={90}>Last 90 days</option>
-            <option value="all">All time</option>
-          </select>
-          <button className="secondary-btn sync-btn" type="button" onClick={syncNow} disabled={syncing}>
-            <RefreshCw size={16} className={syncing ? "spin" : ""} />
-            {syncing ? "Syncing" : "Re-sync"}
-          </button>
-          {syncMessage ? <span className="sync-status">{syncMessage}</span> : null}
         </div>
       </div>
       <div className="cockpit-filters">
@@ -665,6 +675,32 @@ function ActionsView({ actions, onClear }: { actions: ActionRecord[]; onClear: (
               {action.workspacePath ? <span className="action-meta">Workspace: {action.workspacePath} · base {action.baseCommit?.slice(0, 12) ?? "unknown"}</span> : null}
             </div>
             <div className="action-controls"><span className="status agent">{action.status.replace("_", " ")}</span>{terminalStatuses.has(action.status) ? <button className="icon-btn" type="button" onClick={() => onClear(action.id)} aria-label={`Clear ${action.kind} action`} title="Clear action and workspace"><Trash2 size={16} /></button> : <button className="secondary-btn" type="button" disabled title="Stopping active runs is planned">Stop</button>}</div>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ActivityView({ events }: { events: ActivityEvent[] }) {
+  const sortedEvents = [...events].sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  return (
+    <section className="view is-visible" aria-labelledby="activityTitle">
+      <div className="view-head">
+        <div>
+          <h1 id="activityTitle">Activity</h1>
+          <p>Operational events across PR triage, actions, sync, team, and settings.</p>
+        </div>
+      </div>
+      <div className="activity-list">
+        {sortedEvents.length === 0 ? <p className="empty-state">No activity yet.</p> : sortedEvents.map((event) => (
+          <article className="activity-item" key={event.id}>
+            <span className="activity-dot" aria-hidden="true" />
+            <div>
+              <strong>{event.message}</strong>
+              <span className="activity-meta">{event.kind.replace(/_/g, " ")}{event.actionId ? ` · ${event.actionId}` : ""}</span>
+            </div>
+            <time dateTime={event.createdAt}>{new Date(event.createdAt).toLocaleString()}</time>
           </article>
         ))}
       </div>
