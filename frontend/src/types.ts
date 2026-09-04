@@ -79,6 +79,8 @@ export type AgentRun = {
   requester: string;
   summary: string;
   backendSessionId?: string | null;
+  workspacePath?: string | null;
+  baseCommit?: string | null;
   createdAt: string;
 };
 

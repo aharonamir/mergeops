@@ -8,6 +8,8 @@
 
 ### P2: Avoid selecting local paths by bare repo name
 
+Status: Resolved. Manual UI verification remains pending.
+
 Current risk: live GitHub sync stores PRs with `repository` as the bare repo name
 only, while repository settings can contain multiple entries with the same name
 under different owners. `LocalJsonStore._repository_config()` can therefore pick
@@ -110,6 +112,27 @@ Deliverables:
 Exit criteria:
 - No backend can push without an approval record.
 - Lead can inspect patch, checks, risk, and session log before approving.
+
+### Agent Run Sandboxing
+
+Before expanding Agent Runs into a patch approval workspace, every run must
+operate in an isolated workspace. The first local implementation uses a fresh
+clone per run, detached at the captured base commit, under
+`backend/data/agent-runs/<run-id>/`. The configured checkout is used only as a
+source and is never passed directly to an agent.
+
+Phase 1 requirements:
+- One independent workspace per run, including concurrent runs for one repo.
+- Capture and persist the base commit used by the run.
+- Scrub the child-process environment and never provide push credentials.
+- Enforce a wall-clock timeout and terminate the child process group on timeout.
+- Keep push as a separate, approval-gated host action.
+
+Later hardening:
+- Rootless container per run.
+- Network disabled by default with explicit package-registry allowlists.
+- CPU, memory, process-count, and disk quotas.
+- Workspace retention, cancellation, and cleanup policies.
 
 ### Slice 6: Bilingual Search
 

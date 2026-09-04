@@ -28,6 +28,7 @@ class LocalJsonStore:
         pull_request = next((item for item in data.pullRequests if item.id == pull_request_id), None)
         if pull_request is None:
             raise ValueError("Unknown pull request")
+        run_id = f"run-{len(data.agentRuns) + 1}"
         repository = self._repository_config(data, self._pull_request_repository_key(pull_request, data))
         adapter = adapter_registry(
             [(backend.id, backend.endpoint) for backend in data.agentBackends if backend.enabled]
@@ -36,6 +37,7 @@ class LocalJsonStore:
             raise ValueError("Unknown agent backend")
         result = adapter.create_run(
             AgentRunRequest(
+                run_id=run_id,
                 pull_request_id=pull_request.id,
                 repository=pull_request.repositoryFullName or pull_request.repository,
                 pull_request_number=pull_request.number,
@@ -48,7 +50,7 @@ class LocalJsonStore:
         )
 
         run = AgentRun(
-            id=f"run-{len(data.agentRuns) + 1}",
+            id=run_id,
             backendId=backend_id,
             repository=pull_request.repository,
             pullRequestId=pull_request.id,
@@ -58,6 +60,8 @@ class LocalJsonStore:
             requester="local user",
             summary=result.summary,
             backendSessionId=result.backend_session_id,
+            workspacePath=result.workspace_path,
+            baseCommit=result.base_commit,
             createdAt=utc_now(),
         )
         data.agentRuns.insert(0, run)

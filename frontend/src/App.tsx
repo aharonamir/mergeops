@@ -243,6 +243,13 @@ export function App() {
             backends={data.agentBackends}
             onBackendChange={setBackendId}
             theme={theme}
+            onThemeChange={setTheme}
+            dateRange={dateRange}
+            onDateRangeChange={setDateRange}
+            query={query}
+            onQueryChange={setQuery}
+            members={data.teamMembers}
+            onOpenTeam={() => setActiveView("team")}
             github={data.github}
             onSaveGitHub={saveGitHubSettings}
             onSyncGitHub={runGitHubSync}
@@ -641,10 +648,19 @@ function SettingsView(props: {
   backends: AgentBackend[];
   onBackendChange: (backendId: AgentBackend["id"]) => void;
   theme: ThemePreference;
+  onThemeChange: (theme: ThemePreference) => void;
+  dateRange: number | "all";
+  onDateRangeChange: (dateRange: number | "all") => void;
+  query: string;
+  onQueryChange: (query: string) => void;
+  members: TeamMember[];
+  onOpenTeam: () => void;
   github?: GitHubSettings | null;
   onSaveGitHub: (input: { username?: string | null; token?: string; repositories?: RepositoryConfig[] }) => Promise<void>;
   onSyncGitHub: () => Promise<GitHubSyncResult>;
 }) {
+  type SettingsTab = "Team" | "Repositories" | "Integrations" | "Automation Policy" | "Search" | "Preferences";
+  const [activeTab, setActiveTab] = useState<SettingsTab>("Integrations");
   const [token, setToken] = useState("");
   const [username, setUsername] = useState(props.github?.username ?? "");
   const [repoText, setRepoText] = useState(formatRepositories(props.github?.repositories ?? []));
@@ -691,41 +707,50 @@ function SettingsView(props: {
       </div>
       <div className="settings-layout">
         <nav className="settings-tabs" aria-label="Settings sections">
-          {["Team", "Repositories", "Integrations", "Automation Policy", "Search", "Preferences"].map((item, index) => (
-            <button key={item} className={index === 2 ? "is-active" : ""}>{item}</button>
+          {["Team", "Repositories", "Integrations", "Automation Policy", "Search", "Preferences"].map((item) => (
+            <button key={item} type="button" className={activeTab === item ? "is-active" : ""} onClick={() => setActiveTab(item as SettingsTab)}>{item}</button>
           ))}
         </nav>
-        <form className="settings-panel is-visible" onSubmit={saveGitHub}>
-          <h2>Integrations</h2>
-          <div className="settings-grid">
-            <label className="field"><span>GitHub access</span><input defaultValue="OAuth/device login, local contributor mode" /></label>
-            <label className="field">
-              <span>Backend agent SDK</span>
-              <select value={props.backendId} onChange={(event) => props.onBackendChange(event.target.value as AgentBackend["id"])}>
-                {props.backends.map((backend) => <option key={backend.id} value={backend.id}>{backend.displayName}</option>)}
-              </select>
-            </label>
-            <label className="field"><span>Agent endpoint</span><input defaultValue={props.backends.find((item) => item.id === props.backendId)?.endpoint} /></label>
-            <label className="field"><span>Theme preference</span><input readOnly value={props.theme} /></label>
-            <label className="field">
-              <span>GitHub username</span>
-              <input value={username} onChange={(event) => setUsername(event.target.value)} placeholder="your-github-id" />
-            </label>
-            <label className="field">
-              <span>Contributor token <small>{props.github?.hasToken ? "stored locally" : "not set"}</small></span>
-              <input value={token} onChange={(event) => setToken(event.target.value)} type="password" placeholder={props.github?.hasToken ? "Leave blank to keep current token" : "Fine-grained token"} />
-            </label>
-            <label className="field full">
-              <span>Repositories</span>
-              <textarea value={repoText} onChange={(event) => setRepoText(event.target.value)} rows={5} placeholder="owner/repo | /absolute/local/path" />
-            </label>
+        {activeTab === "Team" && (
+          <div className="settings-panel is-visible">
+            <h2>Team</h2>
+            <p className="settings-intro">Team identity and ownership fields are managed in the Team Workspace.</p>
+            <div className="settings-list">
+              {props.members.map((member) => <div className="settings-list-row" key={member.id}><strong>{member.displayName}</strong><span>@{member.githubUsername || "unlinked"} · {member.availability.replace("_", " ")}</span></div>)}
+            </div>
+            <div className="settings-actions"><button className="secondary-btn" type="button" onClick={props.onOpenTeam}>Open Team Workspace</button></div>
           </div>
-          <div className="settings-actions">
-            <button className="primary-btn" type="submit">Save GitHub settings</button>
-            <button className="secondary-btn" type="button" onClick={syncNow}>Sync now</button>
-            {status ? <span className="sync-status">{status}</span> : null}
-          </div>
-        </form>
+        )}
+        {activeTab === "Repositories" && (
+          <form className="settings-panel is-visible" onSubmit={saveGitHub}>
+            <h2>Repositories</h2>
+            <p className="settings-intro">Register GitHub repositories and optional local checkouts for agent runs.</p>
+            <label className="field full"><span>Repository allowlist</span><textarea value={repoText} onChange={(event) => setRepoText(event.target.value)} rows={7} placeholder="owner/repo | /absolute/local/path" /></label>
+            <div className="settings-actions"><button className="primary-btn" type="submit">Save repositories</button><button className="secondary-btn" type="button" onClick={syncNow}>Sync now</button>{status ? <span className="sync-status">{status}</span> : null}</div>
+          </form>
+        )}
+        {activeTab === "Integrations" && (
+          <form className="settings-panel is-visible" onSubmit={saveGitHub}>
+            <h2>Integrations</h2>
+            <div className="settings-grid">
+              <label className="field"><span>GitHub access</span><input readOnly value="Contributor token" /></label>
+              <label className="field"><span>Backend agent SDK</span><select value={props.backendId} onChange={(event) => props.onBackendChange(event.target.value as AgentBackend["id"])}>{props.backends.map((backend) => <option key={backend.id} value={backend.id}>{backend.displayName}</option>)}</select></label>
+              <label className="field"><span>Agent endpoint</span><input readOnly value={props.backends.find((item) => item.id === props.backendId)?.endpoint ?? "Unavailable"} /></label>
+              <label className="field"><span>GitHub username</span><input value={username} onChange={(event) => setUsername(event.target.value)} placeholder="your-github-id" /></label>
+              <label className="field"><span>Contributor token <small>{props.github?.hasToken ? "stored locally" : "not set"}</small></span><input value={token} onChange={(event) => setToken(event.target.value)} type="password" placeholder={props.github?.hasToken ? "Leave blank to keep current token" : "Fine-grained token"} /></label>
+            </div>
+            <div className="settings-actions"><button className="primary-btn" type="submit">Save integration settings</button>{status ? <span className="sync-status">{status}</span> : null}</div>
+          </form>
+        )}
+        {activeTab === "Automation Policy" && (
+          <div className="settings-panel is-visible"><h2>Automation Policy</h2><p className="settings-intro">Policy controls are planned for the approval-gated fix flow and are not connected yet.</p><div className="settings-notice"><strong>Planned</strong><span>Push approval, required checks, and per-action guardrails will be persisted here before any automatic push capability is added.</span></div></div>
+        )}
+        {activeTab === "Search" && (
+          <div className="settings-panel is-visible"><h2>Search</h2><p className="settings-intro">Search is active across PR titles, branches, linked issues, summaries, comments, and English/Hebrew text.</p><label className="field full"><span>Current dashboard query</span><input value={props.query} onChange={(event) => props.onQueryChange(event.target.value)} placeholder="Search PRs, issues, comments, Hebrew or English" /></label><div className="settings-notice"><strong>Search scope</strong><span>The current release searches the loaded PR snapshot. Issue, comment, and code-result adapters are planned.</span></div></div>
+        )}
+        {activeTab === "Preferences" && (
+          <div className="settings-panel is-visible"><h2>Preferences</h2><div className="settings-grid"><label className="field"><span>Theme</span><select value={props.theme} onChange={(event) => props.onThemeChange(event.target.value as ThemePreference)}><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label><label className="field"><span>PR age range</span><select value={props.dateRange} onChange={(event) => props.onDateRangeChange(event.target.value === "all" ? "all" : Number(event.target.value))}><option value="30">Last 30 days</option><option value="60">Last 60 days</option><option value="90">Last 90 days</option><option value="all">All time</option></select></label></div><p className="settings-intro">These preferences are stored locally in this browser.</p></div>
+        )}
       </div>
     </section>
   );

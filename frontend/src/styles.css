@@ -664,6 +664,52 @@ h1 {
   color: var(--ink);
 }
 
+.settings-tabs button:hover,
+.settings-tabs button:focus-visible {
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+.settings-intro {
+  max-width: 68ch;
+  color: var(--muted);
+  margin: 8px 0 16px;
+}
+
+.settings-list {
+  display: grid;
+  gap: 8px;
+}
+
+.settings-list-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 14px;
+  border-bottom: 1px solid var(--line);
+  padding: 10px 0;
+}
+
+.settings-list-row span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.settings-notice {
+  display: grid;
+  gap: 5px;
+  margin-top: 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  padding: 13px;
+}
+
+.settings-notice span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
 .settings-actions {
   display: flex;
   flex-wrap: wrap;

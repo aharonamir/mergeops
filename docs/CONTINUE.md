@@ -82,29 +82,23 @@ owner/repo | /absolute/local/path
 
 The local path is required before an agent action can run against that checkout.
 
-## Next Required Fix
+## Last Milestone
 
-Fix review blocker `P2: Avoid selecting local paths by bare repo name`.
+The duplicate-repository path resolution blocker is implemented and covered by
+`backend/tests/test_store_repository_resolution.py`. Manual UI verification is
+still pending: configure two repositories with the same short name under
+different owners, start a fix run for each, and confirm each run uses the
+matching local checkout. Revisit this check later.
 
-Problem:
+## Next Product Phase
 
-- `PullRequest.repository` currently stores/display the short repo name.
-- `LocalJsonStore._repository_config()` matches by either short name or
-  `owner/name`.
-- If two settings entries share the same repo name under different owners, an
-  agent run can select the wrong local checkout.
+No review blocker is currently open. Continue with the approval-gated fix flow
+and its observability work. The first Agent Runs task is Phase 1 sandboxing:
+fresh detached clones per run, captured base commits, scrubbed environments,
+timeouts, and no push authority. Rootless containers and network policy follow
+after this local workspace implementation.
 
-Implementation target:
-
-- Add an unambiguous repository field to PRs, such as `repositoryFullName` or
-  `repositoryId`.
-- Populate it in fixtures and in `github_sync.py`.
-- Use that field in `store.create_agent_run()` when resolving local paths.
-- Keep the UI display compatible with the short repo label.
-- Add a regression test or deterministic harness proving that
-  `owner-a/service | /tmp/a` and `owner-b/service | /tmp/b` resolve correctly.
-
-## Near-Term Product Work After That
+## Near-Term Product Work
 
 - Persist agent event logs instead of keeping only final run summary.
 - Surface runner progress in the Agent Runs view.

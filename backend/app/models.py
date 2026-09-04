@@ -98,6 +98,8 @@ class AgentRun(BaseModel):
     requester: str
     summary: str
     backendSessionId: str | None = None
+    workspacePath: str | None = None
+    baseCommit: str | None = None
     createdAt: str
 
 

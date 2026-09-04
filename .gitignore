@@ -2,6 +2,8 @@ backend/.venv/
 backend/app/__pycache__/
 backend/tests/__pycache__/
 backend/data/*.json
+backend/data/agent-runs/
+backend/data/agent-workspaces/
 frontend/dist/
 frontend/node_modules/
 frontend/.tsbuild/
