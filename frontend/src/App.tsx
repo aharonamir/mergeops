@@ -16,7 +16,7 @@ import {
   RefreshCw,
   FolderGit2
 } from "lucide-react";
-import { clearAction, createAgentRun, createCheckout, createTeamMember, deleteTeamMember, loadAppData, syncGitHub, updateGitHubSettings, updateTeamMember } from "./api";
+import { approveAgentRun, cancelAgentRun, clearAction, createAgentRun, createCheckout, createTeamMember, deleteTeamMember, loadAppData, pushAgentRun, syncGitHub, updateGitHubSettings, updateTeamMember } from "./api";
 import type { ActionRecord, ActivityEvent, AgentBackend, AgentRun, AppData, GitHubSettings, GitHubSyncResult, PullRequest, QueueFilter, RepositoryConfig, TeamMember, ThemePreference, View } from "./types";
 
 const themeIcons = {
@@ -60,7 +60,7 @@ function statusLabel(status: string) {
 }
 
 function actionFromRun(run: AgentRun): ActionRecord {
-  return { id: run.id, kind: "agent_run", repository: run.repository, pullRequestId: run.pullRequestId, pullRequestNumber: run.pullRequestNumber, action: run.action, status: run.status, summary: run.summary, workspacePath: run.workspacePath, baseCommit: run.baseCommit, createdAt: run.createdAt };
+  return { id: run.id, kind: "agent_run", repository: run.repository, pullRequestId: run.pullRequestId, pullRequestNumber: run.pullRequestNumber, action: run.action, status: run.status, summary: run.summary, workspacePath: run.workspacePath, baseCommit: run.baseCommit, events: run.events, patchSummary: run.patchSummary, diff: run.diff, checks: run.checks, riskSummary: run.riskSummary, approval: run.approval, pushRef: run.pushRef, createdAt: run.createdAt };
 }
 
 export function App() {
@@ -89,6 +89,20 @@ export function App() {
       setActivity(payload.activity ?? []);
     });
   }, []);
+
+  useEffect(() => {
+    const activeStatuses = new Set(["queued", "running", "patch_ready", "checks_running"]);
+    if (!actions.some((action) => activeStatuses.has(action.status))) return;
+    const timer = window.setInterval(() => {
+      loadAppData().then((payload) => {
+        setData(payload);
+        setRuns(payload.agentRuns);
+        setActions(payload.actions ?? payload.agentRuns.map(actionFromRun));
+        setActivity(payload.activity ?? []);
+      });
+    }, 750);
+    return () => window.clearInterval(timer);
+  }, [actions]);
 
   useEffect(() => {
     const resolved = theme === "system"
@@ -224,6 +238,24 @@ export function App() {
     setActivity(refreshed.activity ?? []);
   }
 
+  async function stopRun(runId: string) {
+    const run = await cancelAgentRun(runId);
+    setRuns((current) => current.map((item) => item.id === run.id ? run : item));
+    setActions((current) => current.map((item) => item.id === run.id ? actionFromRun(run) : item));
+  }
+
+  async function approveRun(runId: string) {
+    const run = await approveAgentRun(runId);
+    setRuns((current) => current.map((item) => item.id === run.id ? run : item));
+    setActions((current) => current.map((item) => item.id === run.id ? actionFromRun(run) : item));
+  }
+
+  async function pushRun(runId: string) {
+    const run = await pushAgentRun(runId);
+    setRuns((current) => current.map((item) => item.id === run.id ? run : item));
+    setActions((current) => current.map((item) => item.id === run.id ? actionFromRun(run) : item));
+  }
+
   return (
     <div className="app-shell">
       <aside className="side-nav" aria-label="Primary">
@@ -300,7 +332,7 @@ export function App() {
           />
         )}
         {activeView === "team" && <TeamWorkspace members={data.teamMembers} onSaveMember={saveTeamMember} onAddMember={addTeamMember} onDeleteMember={removeTeamMember} />}
-        {activeView === "agents" && <ActionsView actions={actions} onClear={removeAction} />}
+        {activeView === "agents" && <ActionsView actions={actions} onClear={removeAction} onStop={stopRun} onApprove={approveRun} onPush={pushRun} />}
         {activeView === "activity" && <ActivityView events={activity} />}
         {activeView === "settings" && (
           <SettingsView
@@ -327,9 +359,12 @@ export function App() {
           pr={selectedPr}
           member={teamById.get(selectedPr.ownerMemberId)}
           backend={backend}
+          run={actions.find((action) => action.kind === "agent_run" && action.pullRequestId === selectedPr.id)}
           onClose={() => setSelectedPr(null)}
           onStartRun={() => startRun(selectedPr)}
           onCheckout={() => checkoutPr(selectedPr)}
+          onApproveRun={approveRun}
+          onPushRun={pushRun}
           checkoutMessage={checkoutMessage}
         />
       )}
@@ -656,8 +691,8 @@ function draftToNewMember(draft: TeamMemberDraft): Omit<TeamMember, "id"> {
   };
 }
 
-function ActionsView({ actions, onClear }: { actions: ActionRecord[]; onClear: (actionId: string) => Promise<void> }) {
-  const terminalStatuses = new Set(["ready", "failed", "cancelled", "pushed", "approved", "awaiting_approval"]);
+function ActionsView({ actions, onClear, onStop, onApprove, onPush }: { actions: ActionRecord[]; onClear: (actionId: string) => Promise<void>; onStop: (runId: string) => Promise<void>; onApprove: (runId: string) => Promise<void>; onPush: (runId: string) => Promise<void> }) {
+  const terminalStatuses = new Set(["ready", "failed", "cancelled", "pushed", "approved", "awaiting_approval", "patch_ready"]);
   return (
     <section className="view is-visible" aria-labelledby="agentsTitle">
       <div className="view-head">
@@ -673,8 +708,10 @@ function ActionsView({ actions, onClear }: { actions: ActionRecord[]; onClear: (
               <strong>{action.kind === "checkout" ? "Checkout" : "Agent run"} · {action.repository} #{action.pullRequestNumber}</strong>
               <p>{action.summary}</p>
               {action.workspacePath ? <span className="action-meta">Workspace: {action.workspacePath} · base {action.baseCommit?.slice(0, 12) ?? "unknown"}</span> : null}
+              {action.patchSummary ? <div className="review-material"><strong>Patch</strong><span>{action.patchSummary}</span>{action.riskSummary ? <span>Risk: {action.riskSummary}</span> : null}{action.checks?.map((check) => <span className={`check-result ${check.status}`} key={`${action.id}-${check.name}`}>{check.name}: {check.status}</span>)}{action.diff ? <details><summary>View diff</summary><pre>{action.diff}</pre></details> : null}</div> : null}
+              {action.events?.length ? <details className="run-events"><summary>{action.events.length} recorded events</summary><ol>{action.events.map((event) => <li key={`${action.id}-${event.sequence}`}><span>{event.type}</span><p>{event.message}</p><time dateTime={event.createdAt}>{new Date(event.createdAt).toLocaleTimeString()}</time></li>)}</ol></details> : null}
             </div>
-            <div className="action-controls"><span className="status agent">{action.status.replace("_", " ")}</span>{terminalStatuses.has(action.status) ? <button className="icon-btn" type="button" onClick={() => onClear(action.id)} aria-label={`Clear ${action.kind} action`} title="Clear action and workspace"><Trash2 size={16} /></button> : <button className="secondary-btn" type="button" disabled title="Stopping active runs is planned">Stop</button>}</div>
+            <div className="action-controls"><span className="status agent">{action.status.replace("_", " ")}</span>{action.status === "patch_ready" ? <button className="primary-btn" type="button" onClick={() => onApprove(action.id)}>Approve</button> : null}{action.status === "approved" ? <button className="primary-btn" type="button" onClick={() => onPush(action.id)}>Push</button> : null}{terminalStatuses.has(action.status) ? <button className="icon-btn" type="button" onClick={() => onClear(action.id)} aria-label={`Clear ${action.kind} action`} title="Clear action and workspace"><Trash2 size={16} /></button> : <button className="secondary-btn" type="button" onClick={() => onStop(action.id)}>Stop</button>}</div>
           </article>
         ))}
       </div>
@@ -789,8 +826,8 @@ function SettingsView(props: {
         {activeTab === "Repositories" && (
           <form className="settings-panel is-visible" onSubmit={saveGitHub}>
             <h2>Repositories</h2>
-            <p className="settings-intro">Register GitHub repositories and optional local checkouts for agent runs.</p>
-            <label className="field full"><span>Repository allowlist</span><textarea value={repoText} onChange={(event) => setRepoText(event.target.value)} rows={7} placeholder="owner/repo | /absolute/local/path" /></label>
+          <p className="settings-intro">Register repositories, optional local checkouts, and required checks for agent runs.</p>
+            <label className="field full"><span>Repository allowlist</span><textarea value={repoText} onChange={(event) => setRepoText(event.target.value)} rows={7} placeholder="owner/repo | /absolute/local/path | npm test, git diff --check" /></label>
             <div className="settings-actions"><button className="primary-btn" type="submit">Save repositories</button><button className="secondary-btn" type="button" onClick={syncNow}>Sync now</button>{status ? <span className="sync-status">{status}</span> : null}</div>
           </form>
         )}
@@ -808,7 +845,7 @@ function SettingsView(props: {
           </form>
         )}
         {activeTab === "Automation Policy" && (
-          <div className="settings-panel is-visible"><h2>Automation Policy</h2><p className="settings-intro">Policy controls are planned for the approval-gated fix flow and are not connected yet.</p><div className="settings-notice"><strong>Planned</strong><span>Push approval, required checks, and per-action guardrails will be persisted here before any automatic push capability is added.</span></div></div>
+          <div className="settings-panel is-visible"><h2>Automation Policy</h2><p className="settings-intro">Agent patches are isolated, checked, and held for explicit approval before push.</p><div className="settings-notice"><strong>Approval gate</strong><span>Required checks are configured per repository. Push is blocked until every recorded check passes and a reviewer approves the patch.</span></div></div>
         )}
         {activeTab === "Search" && (
           <div className="settings-panel is-visible"><h2>Search</h2><p className="settings-intro">Search is active across PR titles, branches, linked issues, summaries, comments, and English/Hebrew text.</p><label className="field full"><span>Current dashboard query</span><input value={props.query} onChange={(event) => props.onQueryChange(event.target.value)} placeholder="Search PRs, issues, comments, Hebrew or English" /></label><div className="settings-notice"><strong>Search scope</strong><span>The current release searches the loaded PR snapshot. Issue, comment, and code-result adapters are planned.</span></div></div>
@@ -824,13 +861,15 @@ function SettingsView(props: {
 function formatRepositories(repositories: RepositoryConfig[]) {
   return repositories.map((repository) => {
     const remote = `${repository.owner}/${repository.name}`;
-    return repository.localPath ? `${remote} | ${repository.localPath}` : remote;
+    const path = repository.localPath ? ` | ${repository.localPath}` : "";
+    const checks = repository.requiredChecks?.filter(Boolean).join(", ") ?? "";
+    return `${remote}${path}${checks ? ` | ${checks}` : ""}`;
   }).join("\n");
 }
 
 function parseRepositories(value: string): RepositoryConfig[] {
   return value.split("\n").map((line) => line.trim()).filter(Boolean).map((line) => {
-    const [remote, localPath] = line.split("|").map((part) => part.trim());
+    const [remote, localPath, checksText] = line.split("|").map((part) => part.trim());
     const [owner, name] = remote.split("/");
     const repoName = name || owner;
     return {
@@ -839,7 +878,8 @@ function parseRepositories(value: string): RepositoryConfig[] {
       name: repoName || "",
       defaultBranch: "main",
       enabled: true,
-      localPath: localPath || null
+      localPath: localPath || null,
+      requiredChecks: checksText ? checksText.split(",").map((check) => check.trim()).filter(Boolean) : ["git diff --check"]
     };
   }).filter((repository) => repository.owner && repository.name);
 }
@@ -848,9 +888,12 @@ function PrDrawer(props: {
   pr: PullRequest;
   member?: TeamMember;
   backend: AgentBackend;
+  run?: ActionRecord;
   onClose: () => void;
   onStartRun: () => void;
   onCheckout: () => void;
+  onApproveRun: (runId: string) => Promise<void>;
+  onPushRun: (runId: string) => Promise<void>;
   checkoutMessage: string;
 }) {
   const status = statusFor(props.pr);
@@ -910,6 +953,19 @@ function PrDrawer(props: {
             </div>
             {props.checkoutMessage ? <p className="sync-status" role="status">{props.checkoutMessage}</p> : null}
           </section>
+          {props.run ? (
+            <section className="detail-block review-panel">
+              <div className="review-panel-head"><h3>Approval review</h3><span className={`status agent`}>{props.run.status.replace("_", " ")}</span></div>
+              {props.run.patchSummary ? <p>{props.run.patchSummary}{props.run.riskSummary ? ` Risk: ${props.run.riskSummary}` : ""}</p> : <p>Patch material is still being prepared.</p>}
+              {props.run.checks?.map((check) => <div className="check-row" key={check.name}><span>{check.name}</span><strong className={check.status}>{check.status}</strong></div>)}
+              {props.run.diff ? <details className="diff-details"><summary>View patch diff</summary><pre>{props.run.diff}</pre></details> : null}
+              <div className="button-row">
+                {props.run.status === "patch_ready" ? <button className="primary-btn" type="button" onClick={() => props.onApproveRun(props.run!.id)}>Approve patch</button> : null}
+                {props.run.status === "approved" ? <button className="primary-btn" type="button" onClick={() => props.onPushRun(props.run!.id)}>Push approved patch</button> : null}
+                {props.run.pushRef ? <span className="action-meta">Pushed to {props.run.pushRef}</span> : null}
+              </div>
+            </section>
+          ) : null}
         </div>
       </aside>
       <div className="scrim is-open" onClick={props.onClose} />

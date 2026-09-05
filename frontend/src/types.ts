@@ -47,6 +47,7 @@ export type RepositoryConfig = {
   defaultBranch: string;
   enabled: boolean;
   localPath?: string | null;
+  requiredChecks?: string[];
   lastSyncedAt?: string | null;
   lastSyncStatus?: string | null;
 };
@@ -81,6 +82,38 @@ export type AgentRun = {
   backendSessionId?: string | null;
   workspacePath?: string | null;
   baseCommit?: string | null;
+  events?: AgentRunEvent[];
+  patchSummary?: string | null;
+  diff?: string | null;
+  checks?: CheckResult[];
+  riskSummary?: string | null;
+  approval?: ApprovalRecord | null;
+  pushRef?: string | null;
+  createdAt: string;
+};
+
+export type AgentRunEvent = {
+  sequence: number;
+  type: string;
+  message: string;
+  createdAt: string;
+};
+
+export type CheckResult = {
+  name: string;
+  status: "passed" | "failed" | "skipped";
+  summary: string;
+  output: string;
+  startedAt: string;
+  finishedAt: string;
+};
+
+export type ApprovalRecord = {
+  id: string;
+  runId: string;
+  decision: "approved" | "rejected";
+  reviewer: string;
+  baseCommit?: string | null;
   createdAt: string;
 };
 
@@ -95,6 +128,13 @@ export type ActionRecord = {
   summary: string;
   workspacePath?: string | null;
   baseCommit?: string | null;
+  events?: AgentRunEvent[];
+  patchSummary?: string | null;
+  diff?: string | null;
+  checks?: CheckResult[];
+  riskSummary?: string | null;
+  approval?: ApprovalRecord | null;
+  pushRef?: string | null;
   createdAt: string;
 };
 

@@ -78,12 +78,18 @@ In Settings, repositories can be entered as:
 ```text
 owner/repo
 owner/repo | /absolute/local/path
+owner/repo | /absolute/local/path | npm test, git diff --check
 ```
 
 The local path is required before an agent action can run against that checkout.
 
 Isolated run workspaces are created automatically under
 `~/.mergeops/workspace/<run-id>/`.
+
+Required checks are run in the isolated workspace and are persisted with the
+patch review. Approval is blocked when any required check fails. Push remains a
+separate host action and requires a persisted approval record whose base commit
+still matches the run.
 
 ## Last Milestone
 
@@ -104,9 +110,10 @@ local workspace implementation.
 
 ## Near-Term Product Work
 
-- Persist agent event logs instead of keeping only final run summary.
-- Surface runner progress in the Agent Runs view.
-- Add patch/diff review before approval.
-- Add explicit approve-and-push action.
+- Persist agent event logs instead of keeping only final run summary. Done.
+- Surface runner progress in the Actions view. Done with polling; SSE/WebSocket streaming remains future hardening.
+- Add deterministic slow-run coverage and active-run cancellation. Done.
+- Add patch/diff review before approval. Implemented for isolated-run diffs and baseline checks.
+- Add explicit approve-and-push action. Implemented locally; real GitHub push smoke testing remains pending.
 - Connect bilingual issue/PR search.
 - Ingest checks/reviews more deeply from GitHub.

@@ -9,9 +9,13 @@ import base64
 import os
 from pathlib import Path
 import signal
+import shlex
 import shutil
 import subprocess
-from typing import Protocol
+import threading
+import time
+from queue import Empty, Queue
+from typing import Callable, Protocol
 
 
 @dataclass(frozen=True)
@@ -37,6 +41,7 @@ class AgentRunResult:
     backend_session_id: str | None = None
     workspace_path: str | None = None
     base_commit: str | None = None
+    events: list[dict[str, object]] | None = None
 
 
 class AgentAdapter(Protocol):
@@ -44,7 +49,7 @@ class AgentAdapter(Protocol):
 
     backend_id: str
 
-    def create_run(self, request: AgentRunRequest) -> AgentRunResult:
+    def create_run(self, request: AgentRunRequest, on_event: Callable[[dict[str, object]], None] | None = None, cancel_event: threading.Event | None = None) -> AgentRunResult:
         ...
 
 
@@ -54,14 +59,22 @@ class LocalAgentAdapter:
     def __init__(self, backend_id: str) -> None:
         self.backend_id = backend_id
 
-    def create_run(self, request: AgentRunRequest) -> AgentRunResult:
-        return AgentRunResult(
+    def create_run(self, request: AgentRunRequest, on_event: Callable[[dict[str, object]], None] | None = None, cancel_event: threading.Event | None = None) -> AgentRunResult:
+        if cancel_event and cancel_event.is_set():
+            result = AgentRunResult(status="cancelled", summary="Agent run cancelled before the worker started.", events=[self._event("cancelled", "Agent run cancelled before the worker started.")])
+            if on_event:
+                on_event(result.events[0])
+            return result
+        result = AgentRunResult(
             status="awaiting_approval",
             summary=(
                 f"Queued {request.action.replace('_', ' ')} run via {self.backend_id}. "
                 "No push will happen without approval."
             ),
         )
+        if on_event:
+            on_event({"type": "final", "message": result.summary, "createdAt": utc_now()})
+        return result
 
 
 class SubprocessAgentAdapter:
@@ -71,28 +84,48 @@ class SubprocessAgentAdapter:
         self.backend_id = backend_id
         self.runner_path = runner_path
 
-    def create_run(self, request: AgentRunRequest) -> AgentRunResult:
+    def create_run(self, request: AgentRunRequest, on_event: Callable[[dict[str, object]], None] | None = None, cancel_event: threading.Event | None = None) -> AgentRunResult:
+        if cancel_event and cancel_event.is_set():
+            result = AgentRunResult(status="cancelled", summary="Agent run cancelled before workspace creation.", events=[self._event("cancelled", "Agent run cancelled before workspace creation.")])
+            if on_event:
+                on_event(result.events[0])
+            return result
         if not self.runner_path.exists():
-            return AgentRunResult(
+            result = AgentRunResult(
                 status="failed",
                 summary=(
                     "Agent runner is not built yet. Run `npm install` and `npm run build` "
                     "inside `agent-runner/`, then retry."
                 ),
+                events=[self._event("error", "Agent runner is not built yet.")],
             )
+            if on_event:
+                on_event(result.events[0])
+            return result
         if request.repository_local_path is None and request.repository_remote_url is None:
-            return AgentRunResult(
+            result = AgentRunResult(
                 status="failed",
                 summary=(
                     f"No local path is configured for {request.repository}. "
                     "Add one in Settings as `owner/repo | /absolute/path`."
                 ),
+                events=[self._event("error", f"No local path or remote repository is configured for {request.repository}.")],
             )
+            if on_event:
+                on_event(result.events[0])
+            return result
 
         try:
             workspace = RunWorkspace.create(request)
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-            return AgentRunResult(status="failed", summary=f"Could not prepare isolated run workspace: {exc}")
+            result = AgentRunResult(
+                status="failed",
+                summary=f"Could not prepare isolated run workspace: {exc}",
+                events=[self._event("error", f"Could not prepare isolated run workspace: {exc}")],
+            )
+            if on_event:
+                on_event(result.events[0])
+            return result
 
         payload = {
             "backendId": request.backend_id,
@@ -125,21 +158,79 @@ class SubprocessAgentAdapter:
                 env=environment,
                 start_new_session=True,
             )
-            try:
-                stdout, stderr = process.communicate(input=json.dumps(payload), timeout=90)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGTERM)
-                stdout, stderr = process.communicate(timeout=5)
-                return AgentRunResult(
-                    status="failed",
-                    summary="Agent runner timed out after 90 seconds; its process group was terminated.",
-                    workspace_path=str(workspace.path),
-                    base_commit=workspace.base_commit,
-                )
-        except (OSError, subprocess.SubprocessError) as exc:
-            return AgentRunResult(status="failed", summary=f"Could not start agent runner: {exc}")
+            assert process.stdin is not None
+            process.stdin.write(json.dumps(payload))
+            process.stdin.close()
+            output_queue: Queue[tuple[str, str | None]] = Queue()
 
-        result = self._parse_result(stdout)
+            def drain(stream: object, stream_name: str) -> None:
+                for line in stream:  # type: ignore[union-attr]
+                    output_queue.put((stream_name, line))
+                output_queue.put((stream_name, None))
+
+            stdout_thread = threading.Thread(target=drain, args=(process.stdout, "stdout"), daemon=True)
+            stderr_thread = threading.Thread(target=drain, args=(process.stderr, "stderr"), daemon=True)
+            stdout_thread.start()
+            stderr_thread.start()
+            stdout_lines: list[str] = []
+            stderr_lines: list[str] = []
+            streams_closed = 0
+            deadline = time.monotonic() + 90
+            while streams_closed < 2:
+                if cancel_event and cancel_event.is_set() and process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait(timeout=5)
+                    result = AgentRunResult(
+                        status="cancelled",
+                        summary="Agent run cancelled; its process group was terminated.",
+                        workspace_path=str(workspace.path),
+                        base_commit=workspace.base_commit,
+                        events=[self._event("cancelled", "Agent run cancelled; its process group was terminated.")],
+                    )
+                    if on_event:
+                        on_event(result.events[0])
+                    return result
+                if time.monotonic() > deadline and process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait(timeout=5)
+                    result = AgentRunResult(
+                        status="failed",
+                        summary="Agent runner timed out after 90 seconds; its process group was terminated.",
+                        workspace_path=str(workspace.path),
+                        base_commit=workspace.base_commit,
+                        events=[self._event("error", "Agent runner timed out after 90 seconds; its process group was terminated.")],
+                    )
+                    if on_event:
+                        on_event(result.events[0])
+                    return result
+                try:
+                    stream_name, line = output_queue.get(timeout=0.1)
+                except Empty:
+                    continue
+                if line is None:
+                    streams_closed += 1
+                    continue
+                if stream_name == "stdout":
+                    stdout_lines.append(line)
+                    event = self._parse_event_line(line)
+                    if event:
+                        if on_event:
+                            on_event(event)
+                else:
+                    stderr_lines.append(line)
+            stdout = "".join(stdout_lines)
+            stderr = "".join(stderr_lines)
+            stdout_thread.join(timeout=1)
+            stderr_thread.join(timeout=1)
+            if process.poll() is None:
+                process.wait(timeout=5)
+        except (OSError, subprocess.SubprocessError) as exc:
+            result = AgentRunResult(status="failed", summary=f"Could not start agent runner: {exc}", events=[self._event("error", f"Could not start agent runner: {exc}")])
+            if on_event:
+                on_event(result.events[0])
+            return result
+
+        result, events = self._parse_result(stdout)
         if result is not None:
             return result.__class__(
                 status=result.status,
@@ -147,36 +238,74 @@ class SubprocessAgentAdapter:
                 backend_session_id=result.backend_session_id,
                 workspace_path=str(workspace.path),
                 base_commit=workspace.base_commit,
+                events=events,
             )
         message = stderr.strip() or f"Agent runner exited with code {process.returncode}"
+        if stderr.strip():
+            stderr_event = self._event("stderr", stderr.strip())
+            events.append(stderr_event)
+            if on_event:
+                on_event(stderr_event)
+        error_event = self._event("error", message)
+        events.append(error_event)
+        if on_event:
+            on_event(error_event)
         return AgentRunResult(
             status="failed",
             summary=message,
             workspace_path=str(workspace.path),
             base_commit=workspace.base_commit,
+            events=events,
         )
 
-    def _parse_result(self, output: str) -> AgentRunResult | None:
+    @staticmethod
+    def _parse_event_line(line: str) -> dict[str, object] | None:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+            return None
+        message = event.get("message") or event.get("summary")
+        if not isinstance(message, str):
+            return None
+        return {"type": event["type"], "message": message, "createdAt": event.get("createdAt") if isinstance(event.get("createdAt"), str) else utc_now()}
+
+    @staticmethod
+    def _event(event_type: str, message: str) -> dict[str, object]:
+        return {"type": event_type, "message": message, "createdAt": utc_now()}
+
+    def _parse_result(self, output: str) -> tuple[AgentRunResult | None, list[dict[str, object]]]:
         final_event: dict[str, object] | None = None
+        events: list[dict[str, object]] = []
         for line in output.splitlines():
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if isinstance(event, dict) and event.get("type") == "final":
+            if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+                continue
+            message = event.get("message") or event.get("summary")
+            if isinstance(message, str):
+                events.append({
+                    "type": event["type"],
+                    "message": message,
+                    "createdAt": event.get("createdAt") if isinstance(event.get("createdAt"), str) else utc_now(),
+                })
+            if event.get("type") == "final":
                 final_event = event
         if final_event is None:
-            return None
+            return None, events
         status = final_event.get("status")
         summary = final_event.get("summary")
         session_id = final_event.get("backendSessionId")
         if not isinstance(status, str) or not isinstance(summary, str):
-            return None
+            return None, events
         return AgentRunResult(
             status=status,
             summary=summary,
             backend_session_id=session_id if isinstance(session_id, str) else None,
-        )
+        ), events
 
 
 class RunWorkspace:
@@ -262,6 +391,39 @@ class RunWorkspace:
                 "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {credentials}",
             })
         return environment
+
+
+def inspect_workspace(path: Path, required_checks: list[str] | None = None) -> tuple[str, str, list[dict[str, object]], str]:
+    """Capture the review material produced in an isolated workspace."""
+    started = utc_now()
+    stat = subprocess.run(["git", "diff", "--stat"], cwd=path, capture_output=True, text=True, check=False, timeout=30)
+    diff = subprocess.run(["git", "diff", "--no-ext-diff", "--unified=3"], cwd=path, capture_output=True, text=True, check=False, timeout=30)
+    summary = stat.stdout.strip() or "No working-tree patch was produced."
+    checks = []
+    for command in required_checks or ["git diff --check"]:
+        check_started = utc_now()
+        args = ["git", "diff", "--check"] if command == "git diff --check" else shlex.split(command)
+        try:
+            result = subprocess.run(args, cwd=path, capture_output=True, text=True, check=False, timeout=120)
+            status = "passed" if result.returncode == 0 else "failed"
+            output = (result.stdout + result.stderr).strip()[:20_000]
+            check_summary = "Check passed." if result.returncode == 0 else f"Check exited with code {result.returncode}."
+        except (OSError, subprocess.SubprocessError) as exc:
+            status = "failed"
+            output = str(exc)
+            check_summary = f"Check could not complete: {exc}"
+        check_finished = utc_now()
+        checks.append({
+            "name": command,
+            "status": status,
+            "summary": check_summary,
+            "output": output,
+            "startedAt": check_started,
+            "finishedAt": check_finished,
+        })
+    failed = sum(check["status"] == "failed" for check in checks)
+    risk = "High risk: one or more required checks failed." if failed else ("Medium risk: patch requires human review." if diff.stdout.strip() else "Low risk: no working-tree patch detected.")
+    return summary, diff.stdout[:100_000], checks, risk
 
 
 def adapter_registry(backends: list[tuple[str, str]]) -> dict[str, AgentAdapter]:

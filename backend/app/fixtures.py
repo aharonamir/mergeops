@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from .models import AgentBackend, AgentRun, AppData, GitHubSettings, GitHubSettingsPublic, PullRequest, RepositoryConfig, TeamMember
+from .models import AgentBackend, AgentRun, AgentRunEvent, AppData, CheckResult, GitHubSettings, GitHubSettingsPublic, PullRequest, RepositoryConfig, TeamMember
 
 
 team_members = [
@@ -191,6 +191,11 @@ agent_runs = [
         status="awaiting_approval",
         requester="amir",
         summary="Conflict analysis prepared; patch plan identifies 3 files to reconcile.",
+        events=[AgentRunEvent(sequence=1, type="patch_ready", message="Patch and check results are ready for human approval.", createdAt="2026-09-03T12:00:00Z")],
+        patchSummary="3 files changed; conflict markers reconciled in the isolated workspace.",
+        diff="diff --git a/permissions/policy.ts b/permissions/policy.ts\n+updated approval handling",
+        checks=[CheckResult(name="git diff --check", status="passed", summary="Check passed.", startedAt="2026-09-03T12:01:00Z", finishedAt="2026-09-03T12:01:02Z")],
+        riskSummary="Medium risk: patch requires human review.",
         createdAt="2026-09-03T12:00:00Z",
     )
 ]

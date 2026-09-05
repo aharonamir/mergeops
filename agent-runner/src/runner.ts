@@ -21,8 +21,8 @@ type RunnerInput = {
 };
 
 type RunnerEvent =
-  | { type: "log"; message: string }
-  | { type: "final"; status: RunStatus; summary: string; backendSessionId?: string };
+  | { type: "log"; message: string; createdAt?: string }
+  | { type: "final"; status: RunStatus; summary: string; backendSessionId?: string; createdAt?: string };
 
 const dynamicImport = new Function("specifier", "return import(specifier)") as <T = unknown>(specifier: string) => Promise<T>;
 
@@ -46,20 +46,25 @@ async function main() {
 async function runOpenCode(input: RunnerInput) {
   let server: { close(): void } | undefined;
   try {
+    emit({ type: "log", message: "Loading OpenCode SDK" });
     const { createOpencode } = await dynamicImport<{
       createOpencode(options?: { timeout?: number }): Promise<{ client: any; server: { url: string; close(): void } }>;
     }>("@opencode-ai/sdk/v2");
     const instance = await createOpencode({ timeout: 120_000 });
     server = instance.server;
+    emit({ type: "log", message: "OpenCode session server started" });
     const session = await unwrapData<{ id: string }>(instance.client.v2.session.create({
       location: { directory: input.repositoryLocalPath }
     }));
+    emit({ type: "log", message: `OpenCode session created: ${session.id}` });
     await instance.client.v2.session.prompt({
       sessionID: session.id,
       delivery: "queue",
       prompt: { text: buildPrompt(input) }
     });
+    emit({ type: "log", message: "Prompt queued; waiting for agent completion" });
     await instance.client.v2.session.wait({ sessionID: session.id });
+    emit({ type: "log", message: "OpenCode agent completed" });
     emitFinal(
       "awaiting_approval",
       `OpenCode completed for ${input.repository}#${input.pullRequestNumber}. Review the local diff before approval.`,
@@ -74,10 +79,13 @@ async function runOpenCode(input: RunnerInput) {
 
 async function runCodex(input: RunnerInput) {
   try {
+    emit({ type: "log", message: "Loading Codex SDK" });
     const { Codex } = await dynamicImport<{ Codex: new () => { startThread(): { run(prompt: string): Promise<{ finalResponse?: string }> } } }>("@openai/codex-sdk");
     const codex = new Codex();
     const thread = codex.startThread();
+    emit({ type: "log", message: "Codex thread started" });
     const result = await thread.run(buildPrompt(input));
+    emit({ type: "log", message: "Codex thread completed" });
     emitFinal("awaiting_approval", result.finalResponse ?? "Codex completed. Review the local diff before approval.");
   } catch (error) {
     emitFinal("failed", missingDependencySummary("Codex", error));
@@ -86,10 +94,12 @@ async function runCodex(input: RunnerInput) {
 
 async function runAnthropic(input: RunnerInput) {
   try {
+    emit({ type: "log", message: "Loading Claude SDK" });
     const { query } = await dynamicImport<{ query(params: { prompt: string; options: { cwd: string; permissionMode: string } }): AsyncIterable<unknown> }>("@anthropic-ai/claude-agent-sdk");
     let finalSummary = "Claude run completed. Review the local diff before approval.";
     for await (const message of query({ prompt: buildPrompt(input), options: { cwd: input.repositoryLocalPath, permissionMode: "default" } })) {
       const maybeResult = message as { type?: string; subtype?: string; result?: string };
+      if (maybeResult.type) emit({ type: "log", message: `Claude event: ${maybeResult.type}${maybeResult.subtype ? `/${maybeResult.subtype}` : ""}` });
       if (maybeResult.type === "result" && maybeResult.subtype === "success" && typeof maybeResult.result === "string") {
         finalSummary = maybeResult.result;
       }
@@ -159,7 +169,7 @@ function parseInput(raw: string): RunnerInput {
 }
 
 function emit(event: RunnerEvent) {
-  process.stdout.write(`${JSON.stringify(event)}\n`);
+  process.stdout.write(`${JSON.stringify({ ...event, createdAt: new Date().toISOString() })}\n`);
 }
 
 function emitFinal(status: RunStatus, summary: string, backendSessionId?: string) {

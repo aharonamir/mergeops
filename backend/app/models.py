@@ -48,6 +48,7 @@ class RepositoryConfig(BaseModel):
     defaultBranch: str = "main"
     enabled: bool = True
     localPath: str | None = None
+    requiredChecks: list[str] = ["git diff --check"]
     lastSyncedAt: str | None = None
     lastSyncStatus: str | None = None
 
@@ -77,6 +78,15 @@ class AgentBackend(BaseModel):
     enabled: bool
 
 
+class ApprovalRecord(BaseModel):
+    id: str
+    runId: str
+    decision: Literal["approved", "rejected"]
+    reviewer: str
+    baseCommit: str | None = None
+    createdAt: str
+
+
 class AgentRun(BaseModel):
     id: str
     backendId: str
@@ -100,7 +110,30 @@ class AgentRun(BaseModel):
     backendSessionId: str | None = None
     workspacePath: str | None = None
     baseCommit: str | None = None
+    events: list["AgentRunEvent"] = []
+    patchSummary: str | None = None
+    diff: str | None = None
+    checks: list["CheckResult"] = []
+    riskSummary: str | None = None
+    approval: ApprovalRecord | None = None
+    pushRef: str | None = None
     createdAt: str
+
+
+class AgentRunEvent(BaseModel):
+    sequence: int
+    type: str
+    message: str
+    createdAt: str
+
+
+class CheckResult(BaseModel):
+    name: str
+    status: Literal["passed", "failed", "skipped"]
+    summary: str
+    output: str = ""
+    startedAt: str
+    finishedAt: str
 
 
 class ActionRecord(BaseModel):
@@ -114,6 +147,13 @@ class ActionRecord(BaseModel):
     summary: str
     workspacePath: str | None = None
     baseCommit: str | None = None
+    events: list[AgentRunEvent] = []
+    patchSummary: str | None = None
+    diff: str | None = None
+    checks: list[CheckResult] = []
+    riskSummary: str | None = None
+    approval: ApprovalRecord | None = None
+    pushRef: str | None = None
     createdAt: str
 
 
@@ -132,6 +172,7 @@ class AppData(BaseModel):
     agentRuns: list[AgentRun]
     actions: list[ActionRecord] = []
     activity: list[ActivityEvent] = []
+    approvals: list[ApprovalRecord] = []
     github: GitHubSettingsPublic | None = None
 
 

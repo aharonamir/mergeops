@@ -1,9 +1,13 @@
+from concurrent.futures import ThreadPoolExecutor
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from .github_sync import sync_github_pull_requests
 from .models import AgentRun, AppData, CheckoutResult, CreateAgentRunRequest, CreateCheckoutRequest, CreateTeamMemberRequest, GitHubSettingsPublic, GitHubSyncResult, TeamMember, UpdateGitHubSettingsRequest, UpdateTeamMemberRequest
 from .store import store
+
+agent_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mergeops-agent")
 
 app = FastAPI(title="MergeOps API", version="0.1.0")
 
@@ -32,9 +36,35 @@ async def get_app_data() -> AppData:
 @app.post("/api/agent-runs")
 async def post_agent_run(payload: CreateAgentRunRequest) -> AgentRun:
     try:
-        return store.create_agent_run(payload.backendId, payload.pullRequestId, payload.action)
+        run = store.queue_agent_run(payload.backendId, payload.pullRequestId, payload.action)
+        agent_executor.submit(store.execute_agent_run, run.id, payload.backendId, payload.pullRequestId, payload.action)
+        return run
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/agent-runs/{run_id}/cancel")
+async def post_agent_run_cancel(run_id: str) -> AgentRun:
+    try:
+        return store.cancel_agent_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/agent-runs/{run_id}/approve")
+async def post_agent_run_approve(run_id: str) -> AgentRun:
+    try:
+        return store.approve_agent_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/agent-runs/{run_id}/push")
+async def post_agent_run_push(run_id: str) -> AgentRun:
+    try:
+        return store.push_agent_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/checkouts")

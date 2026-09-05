@@ -58,6 +58,24 @@ export async function clearAction(actionId: string): Promise<void> {
   if (!response.ok) throw new Error(`API returned ${response.status}`);
 }
 
+export async function cancelAgentRun(runId: string): Promise<AgentRun> {
+  const response = await fetch(`${API_BASE}/api/agent-runs/${runId}/cancel`, { method: "POST" });
+  if (!response.ok) throw new Error(`API returned ${response.status}`);
+  return await response.json();
+}
+
+export async function approveAgentRun(runId: string): Promise<AgentRun> {
+  const response = await fetch(`${API_BASE}/api/agent-runs/${runId}/approve`, { method: "POST" });
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
+  return await response.json();
+}
+
+export async function pushAgentRun(runId: string): Promise<AgentRun> {
+  const response = await fetch(`${API_BASE}/api/agent-runs/${runId}/push`, { method: "POST" });
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
+  return await response.json();
+}
+
 export async function updateTeamMember(memberId: string, patch: Partial<TeamMember>): Promise<TeamMember> {
   const response = await fetch(`${API_BASE}/api/team-members/${memberId}`, {
     method: "PATCH",

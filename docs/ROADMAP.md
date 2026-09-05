@@ -91,7 +91,10 @@ Deliverables:
 Progress: the dashboard-facing contract now launches a local Node/TypeScript
 runner instead of an HTTP opencode server. The runner protocol is stdin JSON in
 and newline-delimited JSON events out, with opencode, Codex, and Claude behind
-the same boundary.
+the same boundary. Runs are queued and executed asynchronously by the backend;
+timestamped runner events are persisted and Actions polls while a run is active.
+Active runs can be cancelled through the API and Actions; deterministic slow-run
+coverage verifies streamed progress and process termination.
 
 Exit criteria:
 - Starting a run creates a durable run record.
@@ -112,6 +115,12 @@ Deliverables:
 Exit criteria:
 - No backend can push without an approval record.
 - Lead can inspect patch, checks, risk, and session log before approving.
+
+Status: local implementation complete. Agent runs persist timestamped stage
+events, isolated-workspace patch and diff material, configured check results,
+risk summary, approval records, push outcomes, and Activity audit events. The
+deterministic backend harness covers the approval gate and a successful push to
+a local bare Git remote. A live GitHub push smoke test remains outstanding.
 
 ### Agent Run Sandboxing
 

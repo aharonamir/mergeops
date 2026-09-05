@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from threading import Event, Lock
 from uuid import uuid4
 
-from .adapters import AgentRunRequest, RunWorkspace, adapter_registry, utc_now
+from .adapters import AgentRunRequest, AgentRunResult, RunWorkspace, adapter_registry, inspect_workspace, utc_now
 from .fixtures import agent_backends, agent_runs, github_settings, pull_requests, team_members
-from .models import ActionRecord, ActivityEvent, AgentRun, AppData, CheckoutResult, CreateTeamMemberRequest, GitHubSettings, GitHubSettingsPublic, PullRequest, RepositoryConfig, TeamMember, UpdateGitHubSettingsRequest, UpdateTeamMemberRequest
+from .models import ActionRecord, ActivityEvent, AgentRun, AgentRunEvent, AppData, ApprovalRecord, CheckResult, CheckoutResult, CreateTeamMemberRequest, GitHubSettings, GitHubSettingsPublic, PullRequest, RepositoryConfig, TeamMember, UpdateGitHubSettingsRequest, UpdateTeamMemberRequest
 
 
 class PersistedAppData(AppData):
@@ -17,6 +18,8 @@ class PersistedAppData(AppData):
 class LocalJsonStore:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self._write_lock = Lock()
+        self._cancel_events: dict[str, Event] = {}
 
     def app_data(self) -> AppData:
         return self._public(self._load())
@@ -24,20 +27,75 @@ class LocalJsonStore:
     def persisted_data(self) -> PersistedAppData:
         return self._load()
 
-    def create_agent_run(self, backend_id: str, pull_request_id: str, action: str) -> AgentRun:
+    def queue_agent_run(self, backend_id: str, pull_request_id: str, action: str) -> AgentRun:
         data = self._load()
         pull_request = next((item for item in data.pullRequests if item.id == pull_request_id), None)
         if pull_request is None:
             raise ValueError("Unknown pull request")
-        run_id = f"run-{len(data.agentRuns) + 1}"
-        repository = self._repository_config(data, self._pull_request_repository_key(pull_request, data))
-        adapter = adapter_registry(
+        run_id = f"run-{uuid4().hex[:12]}"
+        enabled_backends = adapter_registry(
             [(backend.id, backend.endpoint) for backend in data.agentBackends if backend.enabled]
-        ).get(backend_id)
+        )
+        if backend_id not in enabled_backends:
+            raise ValueError("Unknown agent backend")
+        created_at = utc_now()
+        run = AgentRun(
+            id=run_id,
+            backendId=backend_id,
+            repository=pull_request.repository,
+            pullRequestId=pull_request.id,
+            pullRequestNumber=pull_request.number,
+            action=action,
+            status="queued",
+            requester="local user",
+            summary=f"Queued {action.replace('_', ' ')} run. Preparing isolated workspace.",
+            events=[AgentRunEvent(sequence=1, type="queued", message="Run queued; waiting for an available worker.", createdAt=created_at)],
+            createdAt=created_at,
+        )
+        data.agentRuns.insert(0, run)
+        data.actions.insert(0, ActionRecord(
+            id=run.id,
+            kind="agent_run",
+            repository=run.repository,
+            pullRequestId=run.pullRequestId,
+            pullRequestNumber=run.pullRequestNumber,
+            action=run.action,
+            status=run.status,
+            summary=run.summary,
+            events=run.events,
+            createdAt=run.createdAt,
+        ))
+        data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="agent_run", message=f"Agent run {run.action} for {run.repository}#{run.pullRequestNumber} was queued.", actionId=run.id, createdAt=run.createdAt))
+        self._cancel_events[run.id] = Event()
+        self._save(data)
+        return run
+
+    def create_agent_run(self, backend_id: str, pull_request_id: str, action: str) -> AgentRun:
+        run = self.queue_agent_run(backend_id, pull_request_id, action)
+        return self.execute_agent_run(run.id, backend_id, pull_request_id, action)
+
+    def execute_agent_run(self, run_id: str, backend_id: str, pull_request_id: str, action: str) -> AgentRun:
+        data = self._load()
+        pull_request = next((item for item in data.pullRequests if item.id == pull_request_id), None)
+        run = next((item for item in data.agentRuns if item.id == run_id), None)
+        if pull_request is None or run is None:
+            raise ValueError("Unknown agent run")
+        repository = self._repository_config(data, self._pull_request_repository_key(pull_request, data))
+        adapter = adapter_registry([(backend.id, backend.endpoint) for backend in data.agentBackends if backend.enabled]).get(backend_id)
         if adapter is None:
             raise ValueError("Unknown agent backend")
-        result = adapter.create_run(
-            AgentRunRequest(
+        cancel_event = self._cancel_events.setdefault(run_id, Event())
+        started_at = utc_now()
+        running = run.model_copy(update={
+            "status": "running",
+            "summary": "Worker started; preparing isolated workspace and launching agent.",
+            "events": [*run.events, AgentRunEvent(sequence=len(run.events) + 1, type="running", message="Worker started; preparing isolated workspace and launching agent.", createdAt=started_at)],
+        })
+        data.agentRuns = [running if item.id == run_id else item for item in data.agentRuns]
+        data.actions = [item.model_copy(update={"status": running.status, "summary": running.summary, "events": running.events}) if item.id == run_id else item for item in data.actions]
+        self._save(data)
+        try:
+            result = adapter.create_run(AgentRunRequest(
                 run_id=run_id,
                 pull_request_id=pull_request.id,
                 repository=pull_request.repositoryFullName or pull_request.repository,
@@ -50,41 +108,130 @@ class LocalJsonStore:
                 pull_request_ref=f"refs/pull/{pull_request.number}/head" if repository is None or repository.localPath is None else None,
                 base_branch=pull_request.baseBranch,
                 source_branch=pull_request.sourceBranch,
-            )
-        )
+            ), on_event=lambda event: self.append_agent_event(run_id, event), cancel_event=cancel_event)
+        except Exception as exc:
+            result = AgentRunResult(status="failed", summary=f"Agent worker failed: {exc}", events=[{"type": "error", "message": f"Agent worker failed: {exc}", "createdAt": utc_now()}])
+        patch_summary = None
+        diff = None
+        checks: list[CheckResult] = []
+        risk_summary = None
+        if result.workspace_path and result.status not in {"cancelled", "failed"}:
+            self.append_agent_event(run_id, {"type": "checks_started", "message": "Running required checks against the prepared workspace."})
+            patch_summary, diff, raw_checks, risk_summary = inspect_workspace(Path(result.workspace_path), repository.requiredChecks if repository else None)
+            checks = [CheckResult.model_validate(check) for check in raw_checks]
+            self.append_agent_event(run_id, {"type": "checks_completed", "message": f"Completed {len(checks)} required check(s)."})
+        with self._write_lock:
+            data = self._load()
+            current = next((item for item in data.agentRuns if item.id == run_id), running)
+            final_status = "cancelled" if cancel_event.is_set() else ("patch_ready" if result.status == "awaiting_approval" and patch_summary is not None else result.status)
+            final_events = current.events
+            if final_status == "patch_ready" and not any(event.type == "patch_ready" for event in final_events):
+                final_events = [*final_events, AgentRunEvent(sequence=len(final_events) + 1, type="patch_ready", message="Patch and check results are ready for human approval.", createdAt=utc_now())]
+            updated = current.model_copy(update={
+                "status": final_status,
+                "summary": (f"Patch prepared for review. {patch_summary}" if result.status == "awaiting_approval" and patch_summary else result.summary),
+                "backendSessionId": result.backend_session_id,
+                "workspacePath": result.workspace_path,
+                "baseCommit": result.base_commit,
+                "events": final_events,
+                "patchSummary": patch_summary,
+                "diff": diff,
+                "checks": checks,
+                "riskSummary": risk_summary,
+            })
+            data.agentRuns = [updated if item.id == run_id else item for item in data.agentRuns]
+            data.actions = [item.model_copy(update={"status": updated.status, "summary": updated.summary, "workspacePath": updated.workspacePath, "baseCommit": updated.baseCommit, "events": updated.events, "patchSummary": updated.patchSummary, "diff": updated.diff, "checks": updated.checks, "riskSummary": updated.riskSummary}) if item.id == run_id else item for item in data.actions]
+            if checks:
+                data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="checks", message=f"Required checks completed for {updated.repository}#{updated.pullRequestNumber}.", actionId=updated.id, createdAt=utc_now()))
+            data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="agent_run", message=f"Agent run {updated.action} for {updated.repository}#{updated.pullRequestNumber} is {updated.status}.", actionId=updated.id, createdAt=utc_now()))
+            self._save(data)
+        return updated
 
-        run = AgentRun(
-            id=run_id,
-            backendId=backend_id,
-            repository=pull_request.repository,
-            pullRequestId=pull_request.id,
-            pullRequestNumber=pull_request.number,
-            action=action,
-            status=result.status,
-            requester="local user",
-            summary=result.summary,
-            backendSessionId=result.backend_session_id,
-            workspacePath=result.workspace_path,
-            baseCommit=result.base_commit,
-            createdAt=utc_now(),
-        )
-        data.agentRuns.insert(0, run)
-        data.actions.insert(0, ActionRecord(
-            id=run.id,
-            kind="agent_run",
-            repository=run.repository,
-            pullRequestId=run.pullRequestId,
-            pullRequestNumber=run.pullRequestNumber,
-            action=run.action,
-            status=run.status,
-            summary=run.summary,
-            workspacePath=run.workspacePath,
-            baseCommit=run.baseCommit,
-            createdAt=run.createdAt,
-        ))
-        data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="agent_run", message=f"Agent run {run.action} for {run.repository}#{run.pullRequestNumber} is {run.status}.", actionId=run.id, createdAt=run.createdAt))
+    def cancel_agent_run(self, run_id: str) -> AgentRun:
+        with self._write_lock:
+            data = self._load()
+            run = next((item for item in data.agentRuns if item.id == run_id), None)
+            if run is None:
+                raise ValueError("Unknown agent run")
+            if run.status not in {"queued", "running", "patch_ready", "checks_running"}:
+                return run
+            self._cancel_events.setdefault(run_id, Event()).set()
+            cancelled = run.model_copy(update={
+                "status": "cancelled",
+                "summary": "Cancellation requested; stopping the worker.",
+                "events": [*run.events, AgentRunEvent(sequence=len(run.events) + 1, type="cancel_requested", message="Cancellation requested; stopping the worker.", createdAt=utc_now())],
+            })
+            data.agentRuns = [cancelled if item.id == run_id else item for item in data.agentRuns]
+            data.actions = [item.model_copy(update={"status": cancelled.status, "summary": cancelled.summary, "events": cancelled.events}) if item.id == run_id else item for item in data.actions]
+            data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="agent_run", message=f"Cancellation requested for {run.repository}#{run.pullRequestNumber}.", actionId=run.id, createdAt=utc_now()))
+            self._save(data)
+            return cancelled
+
+    def approve_agent_run(self, run_id: str, reviewer: str = "local user") -> AgentRun:
+        with self._write_lock:
+            data = self._load()
+            run = next((item for item in data.agentRuns if item.id == run_id), None)
+            if run is None:
+                raise ValueError("Unknown agent run")
+            if run.status not in {"patch_ready", "awaiting_approval"}:
+                raise ValueError(f"Run is not ready for approval: {run.status}")
+            if not run.checks or any(check.status != "passed" for check in run.checks):
+                raise ValueError("All required checks must pass before approval")
+            approval = ApprovalRecord(id=f"approval-{uuid4().hex[:12]}", runId=run.id, decision="approved", reviewer=reviewer, baseCommit=run.baseCommit, createdAt=utc_now())
+            approved = run.model_copy(update={"status": "approved", "approval": approval, "summary": f"Approved by {reviewer}; ready to push."})
+            data.agentRuns = [approved if item.id == run_id else item for item in data.agentRuns]
+            data.approvals.insert(0, approval)
+            data.actions = [item.model_copy(update={"status": approved.status, "summary": approved.summary, "approval": approved.approval}) if item.id == run_id else item for item in data.actions]
+            data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="approval", message=f"Approved agent run for {run.repository}#{run.pullRequestNumber} by {reviewer}.", actionId=run.id, createdAt=approval.createdAt))
+            self._save(data)
+            return approved
+
+    def push_agent_run(self, run_id: str) -> AgentRun:
+        data = self._load()
+        run = next((item for item in data.agentRuns if item.id == run_id), None)
+        if run is None:
+            raise ValueError("Unknown agent run")
+        if run.status != "approved" or run.approval is None or run.approval.decision != "approved":
+            raise ValueError("Run must have an approval record before push")
+        if not run.workspacePath:
+            raise ValueError("Run has no isolated workspace to push")
+        if run.baseCommit != run.approval.baseCommit:
+            raise ValueError("Run base commit changed after approval")
+        push_ref = f"mergeops/{run.id}"
+        try:
+            workspace = Path(run.workspacePath)
+            if run.diff:
+                RunWorkspace._git(workspace, "add", "-A")
+                if RunWorkspace._git_optional(workspace, "diff", "--cached", "--quiet") is False:
+                    RunWorkspace._git(workspace, "commit", "-m", f"MergeOps prepare {run.repository}#{run.pullRequestNumber}")
+            RunWorkspace._git(workspace, "push", "origin", f"HEAD:refs/heads/{push_ref}", token=data.githubPrivate.token)
+        except Exception as exc:
+            data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="push", message=f"Push failed for {run.repository}#{run.pullRequestNumber}: {exc}", actionId=run.id, createdAt=utc_now()))
+            self._save(data)
+            raise ValueError(f"Push failed: {exc}") from exc
+        pushed = run.model_copy(update={"status": "pushed", "pushRef": push_ref, "summary": f"Pushed approved patch to {push_ref}."})
+        data.agentRuns = [pushed if item.id == run_id else item for item in data.agentRuns]
+        data.actions = [item.model_copy(update={"status": pushed.status, "summary": pushed.summary, "approval": pushed.approval, "pushRef": pushed.pushRef}) if item.id == run_id else item for item in data.actions]
+        data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="push", message=f"Pushed approved run for {run.repository}#{run.pullRequestNumber} to {push_ref}.", actionId=run.id, createdAt=utc_now()))
         self._save(data)
-        return run
+        return pushed
+
+    def append_agent_event(self, run_id: str, event: dict[str, object]) -> None:
+        with self._write_lock:
+            data = self._load()
+            run = next((item for item in data.agentRuns if item.id == run_id), None)
+            if run is None:
+                return
+            recorded = AgentRunEvent(
+                sequence=len(run.events) + 1,
+                type=str(event.get("type", "log")),
+                message=str(event.get("message", "")),
+                createdAt=event.get("createdAt") if isinstance(event.get("createdAt"), str) else utc_now(),
+            )
+            updated = run.model_copy(update={"events": [*run.events, recorded]})
+            data.agentRuns = [updated if item.id == run_id else item for item in data.agentRuns]
+            data.actions = [item.model_copy(update={"events": updated.events}) if item.id == run_id else item for item in data.actions]
+            self._save(data)
 
     def create_checkout(self, pull_request_id: str) -> CheckoutResult:
         data = self._load()
@@ -278,6 +425,8 @@ class LocalJsonStore:
             ]
         if "activity" not in payload:
             payload["activity"] = [ActivityEvent(id=f"activity-{action.id}", kind=action.kind, message=action.summary, actionId=action.id, createdAt=action.createdAt).model_dump(mode="json") for raw_action in payload.get("actions", []) for action in [ActionRecord.model_validate(raw_action)]]
+        if "approvals" not in payload:
+            payload["approvals"] = []
         payload["github"] = self._public_github(GitHubSettings.model_validate(payload["githubPrivate"])).model_dump(mode="json")
         data = PersistedAppData.model_validate(payload)
         normalized = [self._normalize_pull_request(pull_request, data) for pull_request in data.pullRequests]
@@ -303,6 +452,7 @@ class LocalJsonStore:
             agentRuns=data.agentRuns,
             actions=data.actions,
             activity=data.activity,
+            approvals=data.approvals,
             github=self._public_github(data.githubPrivate),
         )
 
