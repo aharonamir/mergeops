@@ -59,6 +59,50 @@ function statusLabel(status: string) {
   }[status] ?? status;
 }
 
+function drawerPlan(status: string) {
+  if (status === "conflict") {
+    return {
+      title: "Recommended action: rebase and resolve conflicts",
+      explanation: "This PR is blocked by merge conflicts. Prepare an isolated rebase, resolve the conflicting files, and rerun the required checks.",
+      steps: ["Create an isolated checkout", "Rebase the source branch onto the base branch", "Resolve conflicts and summarize the patch", "Run required checks"],
+      action: "Prepare conflict fix"
+    };
+  }
+  if (status === "checks") {
+    return {
+      title: "Recommended action: repair failing checks",
+      explanation: "Required checks are failing. Prepare a focused fix in an isolated workspace and verify the failing checks before review.",
+      steps: ["Create an isolated checkout", "Inspect failing check output", "Prepare the smallest fix", "Run required checks"],
+      action: "Prepare check fix"
+    };
+  }
+  if (status === "review") {
+    return {
+      title: "Recommended action: address review feedback",
+      explanation: "This PR needs reviewer attention. Inspect the unresolved comments and prepare a focused response before requesting another review.",
+      steps: ["Create an isolated checkout", "Inspect comments and changed files", "Prepare the requested changes", "Run required checks"],
+      action: "Prepare review fix"
+    };
+  }
+  if (status === "ready") {
+    return {
+      title: "Recommended action: verify and approve",
+      explanation: "The PR has passing checks and no detected merge blocker. Review the change and approve it through the repository workflow.",
+      steps: ["Inspect the existing patch", "Confirm checks are passing", "Request or complete review", "Merge through GitHub"],
+      action: "Prepare review"
+    };
+  }
+  if (status === "draft") {
+    return {
+      title: "Draft PR: review only",
+      explanation: "This PR is still a draft. Keep remediation actions disabled until the author marks it ready for review.",
+      steps: ["Inspect the draft context", "Confirm the author is ready", "Review checks and comments"],
+      action: null
+    };
+  }
+  return null;
+}
+
 function actionFromRun(run: AgentRun): ActionRecord {
   return { id: run.id, kind: "agent_run", repository: run.repository, pullRequestId: run.pullRequestId, pullRequestNumber: run.pullRequestNumber, action: run.action, status: run.status, summary: run.summary, workspacePath: run.workspacePath, baseCommit: run.baseCommit, events: run.events, patchSummary: run.patchSummary, diff: run.diff, checks: run.checks, riskSummary: run.riskSummary, approval: run.approval, pushRef: run.pushRef, createdAt: run.createdAt };
 }
@@ -826,7 +870,7 @@ function SettingsView(props: {
         {activeTab === "Repositories" && (
           <form className="settings-panel is-visible" onSubmit={saveGitHub}>
             <h2>Repositories</h2>
-          <p className="settings-intro">Register repositories, optional local checkouts, and required checks for agent runs.</p>
+          <p className="settings-intro">Register repositories, optional local checkouts, and required checks for agent runs. Defaults to <code>git diff --check</code>.</p>
             <label className="field full"><span>Repository allowlist</span><textarea value={repoText} onChange={(event) => setRepoText(event.target.value)} rows={7} placeholder="owner/repo | /absolute/local/path | npm test, git diff --check" /></label>
             <div className="settings-actions"><button className="primary-btn" type="submit">Save repositories</button><button className="secondary-btn" type="button" onClick={syncNow}>Sync now</button>{status ? <span className="sync-status">{status}</span> : null}</div>
           </form>
@@ -897,12 +941,14 @@ function PrDrawer(props: {
   checkoutMessage: string;
 }) {
   const status = statusFor(props.pr);
+  const plan = drawerPlan(status);
+  const isOpen = props.pr.state === "open";
   return (
     <>
       <aside className="drawer is-open" aria-labelledby="drawerTitle">
         <div className="drawer-head">
           <div>
-            <span>{props.pr.repository} #{props.pr.number}</span>
+            <span><a className="pr-link" href={`https://github.com/${props.pr.repositoryFullName ?? props.pr.repository}/pull/${props.pr.number}`} target="_blank" rel="noreferrer">{props.pr.repository} #{props.pr.number}</a></span>
             <h2 id="drawerTitle">{props.pr.title}</h2>
           </div>
           <button className="icon-btn" onClick={props.onClose} aria-label="Close drawer"><X size={18} /></button>
@@ -926,31 +972,29 @@ function PrDrawer(props: {
             </div>
             <p className="drawer-meta"><strong>{props.pr.repositoryFullName ?? props.pr.repository}</strong> · {props.pr.sourceBranch} → {props.pr.baseBranch} · {props.pr.changedFilesCount} changed files</p>
           </section>
-          <section className="detail-block">
-            <h3>Owner context</h3>
-            <p><strong>{props.member?.currentFocus}</strong></p>
-            <p>{props.member?.responsibilities}</p>
-            <div className="tag-row">{props.member?.expertiseTags.map((tag) => <span className="tag" key={tag}>{tag}</span>)}</div>
-          </section>
-          <section className="detail-block">
-            <h3>{props.backend.displayName} remediation plan</h3>
-            <div className="timeline">
-              <div className="step"><i>1</i><span>Checkout the PR into an isolated workspace</span></div>
-              <div className="step"><i>2</i><span>Analyze conflicts, comments, checks, and linked issue context</span></div>
-              <div className="step"><i>3</i><span>Prepare fix branch and patch summary</span></div>
-              <div className="step"><i>4</i><span>Run required checks</span></div>
-              <div className="step"><i>5</i><span>Request human approval before push</span></div>
-            </div>
-          </section>
+          {plan ? (
+            <section className="detail-block recommendation-panel">
+              <div className="recommendation-head"><h3>{plan.title}</h3><span className={`status ${status}`}>{statusLabel(status)}</span></div>
+              <p>{plan.explanation}</p>
+              <div className="timeline">
+                {plan.steps.map((step, index) => <div className="step" key={step}><i>{index + 1}</i><span>{step}</span></div>)}
+              </div>
+            </section>
+          ) : (
+            <section className="detail-block read-only-state">
+              <h3>{statusLabel(status)} PR</h3>
+              <p>This PR is no longer open for remediation. Checkout, agent preparation, approval, and push actions are unavailable.</p>
+            </section>
+          )}
           <section className="approval-panel">
-            <strong>Approval gate</strong>
-            <p>Agent work may prepare the patch. Pushing remains locked until a human approves the diff and check result.</p>
-            <div className="button-row">
-              <button className="secondary-btn" onClick={props.onCheckout}><FolderGit2 size={18} /><span>Checkout</span></button>
-              <button className="primary-btn" onClick={props.onStartRun}><Play size={18} /><span>Prepare fix</span></button>
-              <button className="secondary-btn" disabled title="GitHub write action is planned">Request review</button>
-              <button className="danger-btn" disabled title="Hold policy is planned">Hold PR</button>
-            </div>
+            <strong>{isOpen ? "Available actions" : "Read-only state"}</strong>
+            <p>{isOpen ? "Agent work prepares a patch in isolation. Pushing remains locked until a human approves the diff and check result." : "Historical agent results remain visible below, but this PR cannot start or push new remediation work."}</p>
+            {isOpen ? (
+              <div className="button-row">
+                <button className="secondary-btn" onClick={props.onCheckout}><FolderGit2 size={18} /><span>Checkout</span></button>
+                {plan?.action ? <button className="primary-btn" onClick={props.onStartRun}><Play size={18} /><span>{plan.action}</span></button> : null}
+              </div>
+            ) : null}
             {props.checkoutMessage ? <p className="sync-status" role="status">{props.checkoutMessage}</p> : null}
           </section>
           {props.run ? (
@@ -960,8 +1004,8 @@ function PrDrawer(props: {
               {props.run.checks?.map((check) => <div className="check-row" key={check.name}><span>{check.name}</span><strong className={check.status}>{check.status}</strong></div>)}
               {props.run.diff ? <details className="diff-details"><summary>View patch diff</summary><pre>{props.run.diff}</pre></details> : null}
               <div className="button-row">
-                {props.run.status === "patch_ready" ? <button className="primary-btn" type="button" onClick={() => props.onApproveRun(props.run!.id)}>Approve patch</button> : null}
-                {props.run.status === "approved" ? <button className="primary-btn" type="button" onClick={() => props.onPushRun(props.run!.id)}>Push approved patch</button> : null}
+                {isOpen && props.run.status === "patch_ready" ? <button className="primary-btn" type="button" onClick={() => props.onApproveRun(props.run!.id)}>Approve patch</button> : null}
+                {isOpen && props.run.status === "approved" ? <button className="primary-btn" type="button" onClick={() => props.onPushRun(props.run!.id)}>Push approved patch</button> : null}
                 {props.run.pushRef ? <span className="action-meta">Pushed to {props.run.pushRef}</span> : null}
               </div>
             </section>

@@ -868,6 +868,18 @@ h1 {
   font: 12px/1.2 var(--mono);
 }
 
+.pr-link {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--line-strong);
+  text-underline-offset: 3px;
+}
+
+.pr-link:hover {
+  color: var(--text);
+  text-decoration-color: currentColor;
+}
+
 .drawer-head h2 {
   margin-top: 6px;
   font-size: 22px;
@@ -907,6 +919,25 @@ h1 {
 .timeline {
   display: grid;
   gap: 9px;
+}
+
+.recommendation-panel {
+  gap: 12px;
+}
+
+.recommendation-head {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.recommendation-head h3 {
+  margin: 0;
+}
+
+.read-only-state p {
+  color: var(--muted);
 }
 
 .step {
