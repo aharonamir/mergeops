@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from .github_sync import sync_github_pull_requests
-from .models import AgentRun, AppData, CheckoutResult, CreateAgentRunRequest, CreateCheckoutRequest, CreateTeamMemberRequest, GitHubSettingsPublic, GitHubSyncResult, TeamMember, UpdateGitHubSettingsRequest, UpdateTeamMemberRequest
+from .models import AgentRun, AgentSettings, AppData, CheckoutResult, CreateAgentRunRequest, CreateCheckoutRequest, CreateTeamMemberRequest, GitHubSettingsPublic, GitHubSyncResult, TeamMember, UpdateAgentSettingsRequest, UpdateGitHubSettingsRequest, UpdateTeamMemberRequest
 from .store import store
 
 agent_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mergeops-agent")
@@ -107,6 +107,11 @@ async def delete_team_member(member_id: str) -> None:
 @app.patch("/api/settings/github")
 async def patch_github_settings(payload: UpdateGitHubSettingsRequest) -> GitHubSettingsPublic:
     return store.update_github_settings(payload)
+
+
+@app.patch("/api/settings/agent")
+async def patch_agent_settings(payload: UpdateAgentSettingsRequest) -> AgentSettings:
+    return store.update_agent_settings(payload)
 
 
 @app.post("/api/sync/github")

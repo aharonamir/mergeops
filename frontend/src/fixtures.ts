@@ -154,7 +154,7 @@ export const fixtureData: AppData = {
       id: "opencode",
       displayName: "opencode",
       adapterType: "@opencode-ai/sdk",
-      endpoint: "local TypeScript runner",
+      endpoint: "local SDK process (dynamic port)",
       defaultModel: "team default",
       enabled: true
     },
@@ -175,6 +175,9 @@ export const fixtureData: AppData = {
       enabled: true
     }
   ],
+  agentSettings: {
+    runnerTimeoutSeconds: 600
+  },
   agentRuns: [
     {
       id: "run-842",

@@ -32,12 +32,14 @@ class AgentRunRequest:
     pull_request_ref: str | None = None
     base_branch: str | None = None
     source_branch: str | None = None
+    runner_timeout_seconds: int = 600
 
 
 @dataclass(frozen=True)
 class AgentRunResult:
     status: str
     summary: str
+    output: str | None = None
     backend_session_id: str | None = None
     workspace_path: str | None = None
     base_commit: str | None = None
@@ -127,6 +129,34 @@ class SubprocessAgentAdapter:
                 on_event(result.events[0])
             return result
 
+        if request.action in {"fix_conflicts", "rebase"}:
+            try:
+                rebase_state = RunWorkspace.prepare_rebase(workspace, request.base_branch)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                event = self._event("error", f"Could not prepare required rebase: {exc}")
+                result = AgentRunResult(
+                    status="failed",
+                    summary=f"Could not prepare required rebase: {exc}",
+                    workspace_path=str(workspace.path),
+                    base_commit=workspace.base_commit,
+                    events=[event],
+                )
+                if on_event:
+                    on_event(event)
+                return result
+            if on_event:
+                on_event(self._event(
+                    "rebase_conflicts" if rebase_state else "rebase_prepared",
+                    "Rebase started with conflicts; waiting for the agent to resolve them."
+                    if rebase_state
+                    else "Workspace rebased onto the base branch before the agent started.",
+                ))
+            conflict_files = RunWorkspace.unmerged_files(workspace)
+        else:
+            conflict_files = []
+
+        opencode_profile_files = self._prepare_opencode_profile(workspace.path)
+        git_guard = self._prepare_git_guard(workspace.path.parent)
         payload = {
             "backendId": request.backend_id,
             "repository": request.repository,
@@ -136,13 +166,19 @@ class SubprocessAgentAdapter:
             "repositoryLocalPath": str(workspace.path),
             "baseBranch": request.base_branch,
             "sourceBranch": request.source_branch,
+            "runnerTimeoutSeconds": request.runner_timeout_seconds,
+            "conflictFiles": conflict_files,
         }
         try:
+            inherited_path = os.environ.get("PATH", "")
+            opencode_bin = Path.home() / ".opencode" / "bin"
+            path_entries = [str(git_guard.parent), str(opencode_bin), inherited_path] if opencode_bin.is_dir() else [str(git_guard.parent), inherited_path]
             environment = {
                 key: os.environ[key]
                 for key in ("PATH", "LANG", "LC_ALL", "TMPDIR")
                 if key in os.environ
             }
+            environment["PATH"] = os.pathsep.join(entry for entry in path_entries if entry)
             environment.update({
                 "HOME": str(workspace.path),
                 "MERGEOPS_RUN_ID": request.run_id,
@@ -175,8 +211,23 @@ class SubprocessAgentAdapter:
             stdout_lines: list[str] = []
             stderr_lines: list[str] = []
             streams_closed = 0
-            deadline = time.monotonic() + 90
+            deadline = time.monotonic() + request.runner_timeout_seconds
             while streams_closed < 2:
+                if request.action in {"fix_conflicts", "rebase"} and RunWorkspace.merge_in_progress(workspace):
+                    if process.poll() is None:
+                        os.killpg(process.pid, signal.SIGTERM)
+                        process.wait(timeout=5)
+                    message = "Agent attempted git merge; conflict fixes must use rebase."
+                    result = AgentRunResult(
+                        status="failed",
+                        summary=message,
+                        workspace_path=str(workspace.path),
+                        base_commit=workspace.base_commit,
+                        events=[self._event("error", message)],
+                    )
+                    if on_event:
+                        on_event(result.events[0])
+                    return result
                 if cancel_event and cancel_event.is_set() and process.poll() is None:
                     os.killpg(process.pid, signal.SIGTERM)
                     process.wait(timeout=5)
@@ -195,10 +246,10 @@ class SubprocessAgentAdapter:
                     process.wait(timeout=5)
                     result = AgentRunResult(
                         status="failed",
-                        summary="Agent runner timed out after 90 seconds; its process group was terminated.",
+                        summary=f"Agent runner timed out after {request.runner_timeout_seconds} seconds; its process group was terminated.",
                         workspace_path=str(workspace.path),
                         base_commit=workspace.base_commit,
-                        events=[self._event("error", "Agent runner timed out after 90 seconds; its process group was terminated.")],
+                        events=[self._event("error", f"Agent runner timed out after {request.runner_timeout_seconds} seconds; its process group was terminated.")],
                     )
                     if on_event:
                         on_event(result.events[0])
@@ -229,6 +280,8 @@ class SubprocessAgentAdapter:
             if on_event:
                 on_event(result.events[0])
             return result
+        finally:
+            self._cleanup_opencode_profile(opencode_profile_files)
 
         result, events = self._parse_result(stdout)
         if result is not None:
@@ -236,6 +289,7 @@ class SubprocessAgentAdapter:
                 status=result.status,
                 summary=result.summary,
                 backend_session_id=result.backend_session_id,
+                output=result.output,
                 workspace_path=str(workspace.path),
                 base_commit=workspace.base_commit,
                 events=events,
@@ -275,6 +329,65 @@ class SubprocessAgentAdapter:
     def _event(event_type: str, message: str) -> dict[str, object]:
         return {"type": event_type, "message": message, "createdAt": utc_now()}
 
+    @staticmethod
+    def _prepare_opencode_profile(workspace: Path) -> list[Path]:
+        """Stage only OpenCode's config/auth files inside the isolated HOME."""
+        (workspace / ".local" / "share" / "opencode" / "log").mkdir(parents=True, exist_ok=True)
+        user_home = Path.home()
+        mappings = [
+            (user_home / ".local" / "share" / "opencode" / "auth.json", workspace / ".local" / "share" / "opencode" / "auth.json"),
+            (user_home / ".config" / "opencode" / "opencode.json", workspace / ".config" / "opencode" / "opencode.json"),
+            (user_home / ".config" / "opencode" / "opencode.jsonc", workspace / ".config" / "opencode" / "opencode.jsonc"),
+            (user_home / ".opencode" / "opencode.json", workspace / ".opencode" / "opencode.json"),
+            (user_home / ".opencode" / "opencode.jsonc", workspace / ".opencode" / "opencode.jsonc"),
+        ]
+        copied: list[Path] = []
+        for source, destination in mappings:
+            if source.is_file():
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+                copied.append(destination)
+        return copied
+
+    @staticmethod
+    def _cleanup_opencode_profile(files: list[Path]) -> None:
+        for path in files:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _prepare_git_guard(run_root: Path) -> Path:
+        """Reject merge commands inside agent runs; conflict fixes must use rebase."""
+        git_path = shutil.which("git")
+        if git_path is None:
+            raise RuntimeError("git is not available for the agent run")
+        guard_dir = run_root / ".mergeops-bin"
+        guard_dir.mkdir(parents=True, exist_ok=True)
+        guard = guard_dir / "git"
+        guard.write_text(
+            "#!/bin/sh\n"
+            "command=''\n"
+            "skip_next=0\n"
+            "for arg in \"$@\"; do\n"
+            "  if [ \"$skip_next\" = 1 ]; then skip_next=0; continue; fi\n"
+            "  case \"$arg\" in\n"
+            "    -C|-c|--git-dir|--work-tree) skip_next=1 ;;\n"
+            "    -*) ;;\n"
+            "    *) command=\"$arg\"; break ;;\n"
+            "  esac\n"
+            "done\n"
+            "if [ \"$command\" = \"merge\" ]; then\n"
+            "  echo 'MergeOps guard: git merge is disabled; use git rebase for conflict fixes.' >&2\n"
+            "  exit 64\n"
+            "fi\n"
+            f"exec {shlex.quote(git_path)} \"$@\"\n",
+            encoding="utf-8",
+        )
+        guard.chmod(0o755)
+        return guard
+
     def _parse_result(self, output: str) -> tuple[AgentRunResult | None, list[dict[str, object]]]:
         final_event: dict[str, object] | None = None
         events: list[dict[str, object]] = []
@@ -299,11 +412,13 @@ class SubprocessAgentAdapter:
         status = final_event.get("status")
         summary = final_event.get("summary")
         session_id = final_event.get("backendSessionId")
+        output = final_event.get("output")
         if not isinstance(status, str) or not isinstance(summary, str):
             return None, events
         return AgentRunResult(
             status=status,
             summary=summary,
+            output=output if isinstance(output, str) else None,
             backend_session_id=session_id if isinstance(session_id, str) else None,
         ), events
 
@@ -347,6 +462,8 @@ class RunWorkspace:
                 cls._git(checkout, "checkout", "--detach", pr_branch)
             elif branch and cls._git_optional(checkout, "rev-parse", "--verify", f"refs/heads/{branch}"):
                 cls._git(checkout, "checkout", "--detach", branch)
+            elif branch and cls._git_optional(checkout, "rev-parse", "--verify", f"refs/remotes/origin/{branch}"):
+                cls._git(checkout, "checkout", "--detach", f"origin/{branch}")
             else:
                 cls._git(checkout, "checkout", "--detach", "HEAD")
             base_commit = cls._git(checkout, "rev-parse", "HEAD").strip()
@@ -363,6 +480,55 @@ class RunWorkspace:
             raise ValueError("Run workspace is outside the MergeOps workspace root")
         if run_root.exists():
             shutil.rmtree(run_root)
+
+    @classmethod
+    def prepare_rebase(cls, workspace: "RunWorkspace", base_branch: str | None) -> bool:
+        """Start the required rebase, returning whether it stopped on conflicts."""
+        if not base_branch:
+            raise RuntimeError("the pull request has no base branch")
+        base_ref = cls._resolve_base_ref(workspace.path, base_branch)
+        cls._git(workspace.path, "config", "user.name", "MergeOps Agent")
+        cls._git(workspace.path, "config", "user.email", "mergeops-agent@localhost")
+        result = subprocess.run(
+            ["git", "rebase", base_ref],
+            cwd=workspace.path,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+            env=cls._git_environment(None),
+        )
+        if result.returncode == 0:
+            return False
+        if (workspace.path / ".git" / "rebase-merge").exists() or (workspace.path / ".git" / "rebase-apply").exists():
+            return True
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"git rebase {base_ref} failed: {detail or f'exited with code {result.returncode}'}")
+
+    @staticmethod
+    def merge_in_progress(workspace: "RunWorkspace") -> bool:
+        """Detect a merge state without confusing it with Git's rebase state."""
+        return (workspace.path / ".git" / "MERGE_HEAD").is_file()
+
+    @staticmethod
+    def unmerged_files(workspace: "RunWorkspace") -> list[str]:
+        result = subprocess.run(
+            ["git", "diff", "--name-only", "--diff-filter=U"],
+            cwd=workspace.path,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        return [line for line in result.stdout.splitlines() if line]
+
+    @staticmethod
+    def _resolve_base_ref(checkout: Path, base_branch: str) -> str:
+        candidates = [f"refs/remotes/origin/{base_branch}", f"refs/heads/{base_branch}", base_branch]
+        for candidate in candidates:
+            if RunWorkspace._git_optional(checkout, "rev-parse", "--verify", candidate):
+                return candidate.removeprefix("refs/remotes/").removeprefix("refs/heads/") if candidate.startswith("refs/") else candidate
+        raise RuntimeError(f"base branch does not exist in the isolated repository: {base_branch}")
 
     @staticmethod
     def _git(cwd: Path, *args: str, token: str | None = None) -> str:
@@ -393,11 +559,14 @@ class RunWorkspace:
         return environment
 
 
-def inspect_workspace(path: Path, required_checks: list[str] | None = None) -> tuple[str, str, list[dict[str, object]], str]:
+def inspect_workspace(path: Path, required_checks: list[str] | None = None, committed_base: str | None = None) -> tuple[str, str, list[dict[str, object]], str]:
     """Capture the review material produced in an isolated workspace."""
     started = utc_now()
     stat = subprocess.run(["git", "diff", "--stat"], cwd=path, capture_output=True, text=True, check=False, timeout=30)
     diff = subprocess.run(["git", "diff", "--no-ext-diff", "--unified=3"], cwd=path, capture_output=True, text=True, check=False, timeout=30)
+    if not diff.stdout.strip() and committed_base:
+        stat = subprocess.run(["git", "diff", "--stat", committed_base], cwd=path, capture_output=True, text=True, check=False, timeout=30)
+        diff = subprocess.run(["git", "diff", "--no-ext-diff", "--unified=3", committed_base], cwd=path, capture_output=True, text=True, check=False, timeout=30)
     summary = stat.stdout.strip() or "No working-tree patch was produced."
     checks = []
     for command in required_checks or ["git diff --check"]:

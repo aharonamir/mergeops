@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from .models import AgentBackend, AgentRun, AgentRunEvent, AppData, CheckResult, GitHubSettings, GitHubSettingsPublic, PullRequest, RepositoryConfig, TeamMember
+from .models import AgentBackend, AgentRun, AgentRunEvent, AgentSettings, AppData, CheckResult, GitHubSettings, GitHubSettingsPublic, PullRequest, RepositoryConfig, TeamMember
 
 
 team_members = [
@@ -158,7 +158,7 @@ agent_backends = [
         id="opencode",
         displayName="opencode",
         adapterType="@opencode-ai/sdk",
-        endpoint="local TypeScript runner",
+        endpoint="local SDK process (dynamic port)",
         defaultModel="team default",
         enabled=True,
     ),
@@ -217,6 +217,7 @@ def app_data() -> AppData:
         teamMembers=team_members,
         pullRequests=pull_requests,
         agentBackends=agent_backends,
+        agentSettings=AgentSettings(),
         agentRuns=agent_runs,
         github=GitHubSettingsPublic(
             accessMode=github_settings.accessMode,

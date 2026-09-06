@@ -16,8 +16,8 @@ import {
   RefreshCw,
   FolderGit2
 } from "lucide-react";
-import { approveAgentRun, cancelAgentRun, clearAction, createAgentRun, createCheckout, createTeamMember, deleteTeamMember, loadAppData, pushAgentRun, syncGitHub, updateGitHubSettings, updateTeamMember } from "./api";
-import type { ActionRecord, ActivityEvent, AgentBackend, AgentRun, AppData, GitHubSettings, GitHubSyncResult, PullRequest, QueueFilter, RepositoryConfig, TeamMember, ThemePreference, View } from "./types";
+import { approveAgentRun, cancelAgentRun, checkBackendHealth, clearAction, createAgentRun, createCheckout, createTeamMember, deleteTeamMember, loadAppData, pushAgentRun, syncGitHub, updateAgentSettings, updateGitHubSettings, updateTeamMember } from "./api";
+import type { ActionRecord, ActivityEvent, AgentBackend, AgentRun, AgentSettings, AppData, GitHubSettings, GitHubSyncResult, PullRequest, QueueFilter, RepositoryConfig, TeamMember, ThemePreference, View } from "./types";
 
 const themeIcons = {
   system: Monitor,
@@ -104,7 +104,7 @@ function drawerPlan(status: string) {
 }
 
 function actionFromRun(run: AgentRun): ActionRecord {
-  return { id: run.id, kind: "agent_run", repository: run.repository, pullRequestId: run.pullRequestId, pullRequestNumber: run.pullRequestNumber, action: run.action, status: run.status, summary: run.summary, workspacePath: run.workspacePath, baseCommit: run.baseCommit, events: run.events, patchSummary: run.patchSummary, diff: run.diff, checks: run.checks, riskSummary: run.riskSummary, approval: run.approval, pushRef: run.pushRef, createdAt: run.createdAt };
+  return { id: run.id, kind: "agent_run", repository: run.repository, pullRequestId: run.pullRequestId, pullRequestNumber: run.pullRequestNumber, action: run.action, status: run.status, summary: run.summary, agentOutput: run.agentOutput, workspacePath: run.workspacePath, baseCommit: run.baseCommit, events: run.events, patchSummary: run.patchSummary, diff: run.diff, checks: run.checks, riskSummary: run.riskSummary, approval: run.approval, pushRef: run.pushRef, createdAt: run.createdAt };
 }
 
 export function App() {
@@ -124,6 +124,7 @@ export function App() {
   const [checkoutMessage, setCheckoutMessage] = useState("");
   const [syncing, setSyncing] = useState(false);
   const [syncMessage, setSyncMessage] = useState("");
+  const [backendStatus, setBackendStatus] = useState<"checking" | "online" | "offline">("checking");
 
   useEffect(() => {
     loadAppData().then((payload) => {
@@ -132,6 +133,20 @@ export function App() {
       setActions(payload.actions ?? payload.agentRuns.map(actionFromRun));
       setActivity(payload.activity ?? []);
     });
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    const refreshHealth = async () => {
+      const online = await checkBackendHealth();
+      if (!disposed) setBackendStatus(online ? "online" : "offline");
+    };
+    void refreshHealth();
+    const timer = window.setInterval(refreshHealth, 10000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
   }, []);
 
   useEffect(() => {
@@ -252,6 +267,11 @@ export function App() {
     setData((current) => current ? { ...current, github } : current);
   }
 
+  async function saveAgentSettings(settings: AgentSettings) {
+    const updated = await updateAgentSettings(settings);
+    setData((current) => current ? { ...current, agentSettings: updated } : current);
+  }
+
   async function runGitHubSync() {
     const result = await syncGitHub();
     const payload = await loadAppData();
@@ -321,10 +341,10 @@ export function App() {
             );
           })}
         </nav>
-        <div className="side-status">
-          <span>{backend.displayName}</span>
-          <strong>{backend.endpoint.replace(/^https?:\/\//, "")}</strong>
-          <small>ready for approval-gated sessions</small>
+        <div className={`side-status is-${backendStatus}`} role="status" aria-live="polite">
+          <span className="health-label"><i className="health-dot" aria-hidden="true" />Backend API</span>
+          <strong>{backendStatus === "checking" ? "Checking" : backendStatus === "online" ? "Online" : "Offline"}</strong>
+          <small>{backendStatus === "offline" ? "Cannot reach /api/health" : "Monitoring /api/health"}</small>
         </div>
       </aside>
 
@@ -393,6 +413,8 @@ export function App() {
             onOpenTeam={() => setActiveView("team")}
             github={data.github}
             onSaveGitHub={saveGitHubSettings}
+            agentSettings={data.agentSettings}
+            onSaveAgentSettings={saveAgentSettings}
             onSyncGitHub={runGitHubSync}
           />
         )}
@@ -753,6 +775,7 @@ function ActionsView({ actions, onClear, onStop, onApprove, onPush }: { actions:
               <p>{action.summary}</p>
               {action.workspacePath ? <span className="action-meta">Workspace: {action.workspacePath} · base {action.baseCommit?.slice(0, 12) ?? "unknown"}</span> : null}
               {action.patchSummary ? <div className="review-material"><strong>Patch</strong><span>{action.patchSummary}</span>{action.riskSummary ? <span>Risk: {action.riskSummary}</span> : null}{action.checks?.map((check) => <span className={`check-result ${check.status}`} key={`${action.id}-${check.name}`}>{check.name}: {check.status}</span>)}{action.diff ? <details><summary>View diff</summary><pre>{action.diff}</pre></details> : null}</div> : null}
+              {action.agentOutput ? <details className="agent-output"><summary>Agent output</summary><pre>{action.agentOutput}</pre></details> : null}
               {action.events?.length ? <details className="run-events"><summary>{action.events.length} recorded events</summary><ol>{action.events.map((event) => <li key={`${action.id}-${event.sequence}`}><span>{event.type}</span><p>{event.message}</p><time dateTime={event.createdAt}>{new Date(event.createdAt).toLocaleTimeString()}</time></li>)}</ol></details> : null}
             </div>
             <div className="action-controls"><span className="status agent">{action.status.replace("_", " ")}</span>{action.status === "patch_ready" ? <button className="primary-btn" type="button" onClick={() => onApprove(action.id)}>Approve</button> : null}{action.status === "approved" ? <button className="primary-btn" type="button" onClick={() => onPush(action.id)}>Push</button> : null}{terminalStatuses.has(action.status) ? <button className="icon-btn" type="button" onClick={() => onClear(action.id)} aria-label={`Clear ${action.kind} action`} title="Clear action and workspace"><Trash2 size={16} /></button> : <button className="secondary-btn" type="button" onClick={() => onStop(action.id)}>Stop</button>}</div>
@@ -803,6 +826,8 @@ function SettingsView(props: {
   onOpenTeam: () => void;
   github?: GitHubSettings | null;
   onSaveGitHub: (input: { username?: string | null; token?: string; repositories?: RepositoryConfig[] }) => Promise<void>;
+  agentSettings: AgentSettings;
+  onSaveAgentSettings: (settings: AgentSettings) => Promise<void>;
   onSyncGitHub: () => Promise<GitHubSyncResult>;
 }) {
   type SettingsTab = "Team" | "Repositories" | "Integrations" | "Automation Policy" | "Search" | "Preferences";
@@ -810,12 +835,14 @@ function SettingsView(props: {
   const [token, setToken] = useState("");
   const [username, setUsername] = useState(props.github?.username ?? "");
   const [repoText, setRepoText] = useState(formatRepositories(props.github?.repositories ?? []));
+  const [runnerTimeoutSeconds, setRunnerTimeoutSeconds] = useState(props.agentSettings.runnerTimeoutSeconds);
   const [status, setStatus] = useState<string>("");
 
   useEffect(() => {
     setUsername(props.github?.username ?? "");
     setRepoText(formatRepositories(props.github?.repositories ?? []));
-  }, [props.github]);
+    setRunnerTimeoutSeconds(props.agentSettings.runnerTimeoutSeconds);
+  }, [props.github, props.agentSettings]);
 
   async function saveGitHub(event: React.FormEvent) {
     event.preventDefault();
@@ -826,8 +853,9 @@ function SettingsView(props: {
         token: token.trim() || undefined,
         repositories: parseRepositories(repoText)
       });
+      await props.onSaveAgentSettings({ runnerTimeoutSeconds });
       setToken("");
-      setStatus("GitHub settings saved");
+      setStatus("Integration settings saved");
     } catch {
       setStatus("GitHub settings failed");
     }
@@ -881,7 +909,8 @@ function SettingsView(props: {
             <div className="settings-grid">
               <label className="field"><span>GitHub access</span><input readOnly value="Contributor token" /></label>
               <label className="field"><span>Backend agent SDK</span><select value={props.backendId} onChange={(event) => props.onBackendChange(event.target.value as AgentBackend["id"])}>{props.backends.map((backend) => <option key={backend.id} value={backend.id}>{backend.displayName}</option>)}</select></label>
-              <label className="field"><span>Agent endpoint</span><input readOnly value={props.backends.find((item) => item.id === props.backendId)?.endpoint ?? "Unavailable"} /></label>
+              <label className="field"><span>Agent endpoint</span><input readOnly value="Local SDK process (dynamic port)" /><small>OpenCode runs locally; no fixed network endpoint is required.</small></label>
+              <label className="field"><span>Runner timeout (seconds)</span><input type="number" min="30" max="3600" step="30" value={runnerTimeoutSeconds} onChange={(event) => setRunnerTimeoutSeconds(Number(event.target.value) || 600)} /><small>Default: 600 seconds.</small></label>
               <label className="field"><span>GitHub username</span><input value={username} onChange={(event) => setUsername(event.target.value)} placeholder="your-github-id" /></label>
               <label className="field"><span>Contributor token <small>{props.github?.hasToken ? "stored locally" : "not set"}</small></span><input value={token} onChange={(event) => setToken(event.target.value)} type="password" placeholder={props.github?.hasToken ? "Leave blank to keep current token" : "Fine-grained token"} /></label>
             </div>
@@ -907,13 +936,17 @@ function formatRepositories(repositories: RepositoryConfig[]) {
     const remote = `${repository.owner}/${repository.name}`;
     const path = repository.localPath ? ` | ${repository.localPath}` : "";
     const checks = repository.requiredChecks?.filter(Boolean).join(", ") ?? "";
-    return `${remote}${path}${checks ? ` | ${checks}` : ""}`;
+    return checks
+      ? `${remote}${path} | ${checks}`
+      : remote;
   }).join("\n");
 }
 
 function parseRepositories(value: string): RepositoryConfig[] {
   return value.split("\n").map((line) => line.trim()).filter(Boolean).map((line) => {
-    const [remote, localPath, checksText] = line.split("|").map((part) => part.trim());
+    const [remote, rawLocalPath, checksText] = line.split("|").map((part) => part.trim());
+    const localPath = checksText ? rawLocalPath : "";
+    const parsedChecks = checksText || (rawLocalPath === "git diff --check" ? rawLocalPath : "");
     const [owner, name] = remote.split("/");
     const repoName = name || owner;
     return {
@@ -923,7 +956,7 @@ function parseRepositories(value: string): RepositoryConfig[] {
       defaultBranch: "main",
       enabled: true,
       localPath: localPath || null,
-      requiredChecks: checksText ? checksText.split(",").map((check) => check.trim()).filter(Boolean) : ["git diff --check"]
+      requiredChecks: parsedChecks ? parsedChecks.split(",").map((check) => check.trim()).filter(Boolean) : ["git diff --check"]
     };
   }).filter((repository) => repository.owner && repository.name);
 }

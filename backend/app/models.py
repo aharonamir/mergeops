@@ -78,6 +78,10 @@ class AgentBackend(BaseModel):
     enabled: bool
 
 
+class AgentSettings(BaseModel):
+    runnerTimeoutSeconds: int = 600
+
+
 class ApprovalRecord(BaseModel):
     id: str
     runId: str
@@ -107,6 +111,7 @@ class AgentRun(BaseModel):
     ]
     requester: str
     summary: str
+    agentOutput: str | None = None
     backendSessionId: str | None = None
     workspacePath: str | None = None
     baseCommit: str | None = None
@@ -145,6 +150,7 @@ class ActionRecord(BaseModel):
     action: str
     status: str
     summary: str
+    agentOutput: str | None = None
     workspacePath: str | None = None
     baseCommit: str | None = None
     events: list[AgentRunEvent] = []
@@ -169,6 +175,7 @@ class AppData(BaseModel):
     teamMembers: list[TeamMember]
     pullRequests: list[PullRequest]
     agentBackends: list[AgentBackend]
+    agentSettings: AgentSettings = AgentSettings()
     agentRuns: list[AgentRun]
     actions: list[ActionRecord] = []
     activity: list[ActivityEvent] = []
@@ -180,6 +187,10 @@ class CreateAgentRunRequest(BaseModel):
     backendId: str
     pullRequestId: str
     action: Literal["analyze", "rebase", "fix_conflicts", "address_review", "fix_checks"]
+
+
+class UpdateAgentSettingsRequest(BaseModel):
+    runnerTimeoutSeconds: int = 600
 
 
 class CreateCheckoutRequest(BaseModel):

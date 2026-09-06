@@ -69,6 +69,10 @@ export type AgentBackend = {
   enabled: boolean;
 };
 
+export type AgentSettings = {
+  runnerTimeoutSeconds: number;
+};
+
 export type AgentRun = {
   id: string;
   backendId: string;
@@ -79,6 +83,7 @@ export type AgentRun = {
   status: "queued" | "running" | "patch_ready" | "checks_running" | "awaiting_approval" | "approved" | "pushed" | "failed" | "cancelled";
   requester: string;
   summary: string;
+  agentOutput?: string | null;
   backendSessionId?: string | null;
   workspacePath?: string | null;
   baseCommit?: string | null;
@@ -126,6 +131,7 @@ export type ActionRecord = {
   action: string;
   status: string;
   summary: string;
+  agentOutput?: string | null;
   workspacePath?: string | null;
   baseCommit?: string | null;
   events?: AgentRunEvent[];
@@ -159,6 +165,7 @@ export type AppData = {
   teamMembers: TeamMember[];
   pullRequests: PullRequest[];
   agentBackends: AgentBackend[];
+  agentSettings: AgentSettings;
   agentRuns: AgentRun[];
   actions?: ActionRecord[];
   activity?: ActivityEvent[];

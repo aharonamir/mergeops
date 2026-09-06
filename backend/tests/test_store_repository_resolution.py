@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -35,6 +36,22 @@ class CapturingAdapter:
 
 
 class StoreRepositoryResolutionTest(unittest.TestCase):
+    def test_legacy_check_command_is_not_loaded_as_repository_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "mergeops.local.json"
+            data = self._data(PullRequest(
+                id="pr-legacy", repository="service", repositoryFullName="owner-a/service", number=1,
+                title="Legacy", author="dev", ownerMemberId="dev", sourceBranch="feature", baseBranch="main",
+                state="open", mergeable="mergeable", reviewState="review_required", unresolvedCommentCount=0,
+                requestedReviewers=[], checkState="passing", linkedIssueIds=[], changedFilesCount=1, ageDays=1,
+                summary="Legacy", searchText="legacy",
+            ))
+            payload = data.model_dump(mode="json")
+            payload["githubPrivate"]["repositories"][0]["localPath"] = "git diff --check"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            loaded = LocalJsonStore(path).persisted_data()
+            self.assertIsNone(loaded.githubPrivate.repositories[0].localPath)
+
     def test_failed_workspace_creation_removes_partial_run_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -86,6 +103,58 @@ class StoreRepositoryResolutionTest(unittest.TestCase):
             self.assertEqual((workspace.path / "README.md").read_text(encoding="utf-8"), "original\n")
             (workspace.path / "README.md").write_text("agent change\n", encoding="utf-8")
             self.assertEqual((source / "README.md").read_text(encoding="utf-8"), "original\n")
+
+    def test_prepare_rebase_stops_on_conflict_without_creating_merge_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "source"
+            source.mkdir()
+            self._git(source, "init", "-b", "main")
+            self._git(source, "config", "user.email", "test@example.com")
+            self._git(source, "config", "user.name", "MergeOps Test")
+            (source / "README.md").write_text("base\n", encoding="utf-8")
+            self._git(source, "add", "README.md")
+            self._git(source, "commit", "-m", "base")
+            self._git(source, "checkout", "-b", "feature")
+            (source / "README.md").write_text("pull request change\n", encoding="utf-8")
+            self._git(source, "commit", "-am", "pull request")
+            self._git(source, "checkout", "main")
+            (source / "README.md").write_text("base branch change\n", encoding="utf-8")
+            self._git(source, "commit", "-am", "base branch")
+
+            request = AgentRunRequest(
+                run_id="run-rebase-conflict",
+                pull_request_id="pr-rebase",
+                repository="owner/service",
+                pull_request_number=4522,
+                action="fix_conflicts",
+                backend_id="opencode",
+                repository_local_path=str(source),
+                source_branch="feature",
+                base_branch="main",
+            )
+            with patch.object(RunWorkspace, "root", root / "runs"):
+                workspace = RunWorkspace.create(request)
+                has_conflicts = RunWorkspace.prepare_rebase(workspace, request.base_branch)
+
+            self.assertTrue(has_conflicts)
+            self.assertTrue((workspace.path / ".git" / "rebase-merge").exists())
+            self.assertFalse(RunWorkspace.merge_in_progress(workspace))
+            status = self._git(workspace.path, "status", "--porcelain")
+            self.assertIn("UU README.md", status)
+            (workspace.path / "README.md").write_text("base branch change + pull request change\n", encoding="utf-8")
+            self._git(workspace.path, "add", "README.md")
+            subprocess.run(
+                ["git", "-c", "core.editor=true", "rebase", "--continue"],
+                cwd=workspace.path,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertFalse((workspace.path / ".git" / "rebase-merge").exists())
+            summary, diff, _checks, _risk = inspect_workspace(workspace.path, ["git diff --check"], "main...HEAD")
+            self.assertIn("README.md", summary)
+            self.assertIn("base branch change + pull request change", diff)
 
     def test_subprocess_agent_receives_isolated_workspace_and_scrubbed_flags(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -195,8 +264,9 @@ class StoreRepositoryResolutionTest(unittest.TestCase):
             with patch("app.store.adapter_registry", return_value={"opencode": adapter}):
                 store.create_agent_run("opencode", "pr-1", "analyze")
             persisted = store.persisted_data()
-            self.assertEqual([event.message for event in persisted.agentRuns[0].events], ["Run queued; waiting for an available worker.", "Worker started; preparing isolated workspace and launching agent.", "captured event"])
-            self.assertEqual([event.message for event in persisted.actions[0].events], ["Run queued; waiting for an available worker.", "Worker started; preparing isolated workspace and launching agent.", "captured event"])
+            expected_events = ["Run queued; waiting for an available worker.", "Worker started; preparing isolated workspace and launching agent.", "captured event", "Agent completed without producing a working-tree patch."]
+            self.assertEqual([event.message for event in persisted.agentRuns[0].events], expected_events)
+            self.assertEqual([event.message for event in persisted.actions[0].events], expected_events)
 
         self.assertEqual(adapter.requests[0].repository, "owner-b/service")
         self.assertEqual(adapter.requests[0].repository_local_path, "/tmp/owner-b-service")
@@ -284,6 +354,10 @@ class StoreRepositoryResolutionTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 store.approve_agent_run(run.id)
             run.checks = [CheckResult(name="git diff --check", status="passed", summary="ok", startedAt="2026-01-01T00:00:00Z", finishedAt="2026-01-01T00:00:01Z")]
+            store._save(data)
+            with self.assertRaisesRegex(ValueError, "non-empty patch"):
+                store.approve_agent_run(run.id)
+            run.diff = "diff --git a/README.md b/README.md"
             store._save(data)
             approved = store.approve_agent_run(run.id)
 

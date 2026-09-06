@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from .adapters import AgentRunRequest, AgentRunResult, RunWorkspace, adapter_registry, inspect_workspace, utc_now
 from .fixtures import agent_backends, agent_runs, github_settings, pull_requests, team_members
-from .models import ActionRecord, ActivityEvent, AgentRun, AgentRunEvent, AppData, ApprovalRecord, CheckResult, CheckoutResult, CreateTeamMemberRequest, GitHubSettings, GitHubSettingsPublic, PullRequest, RepositoryConfig, TeamMember, UpdateGitHubSettingsRequest, UpdateTeamMemberRequest
+from .models import ActionRecord, ActivityEvent, AgentRun, AgentRunEvent, AgentSettings, AppData, ApprovalRecord, CheckResult, CheckoutResult, CreateTeamMemberRequest, GitHubSettings, GitHubSettingsPublic, PullRequest, RepositoryConfig, TeamMember, UpdateAgentSettingsRequest, UpdateGitHubSettingsRequest, UpdateTeamMemberRequest
 
 
 class PersistedAppData(AppData):
@@ -108,6 +108,7 @@ class LocalJsonStore:
                 pull_request_ref=f"refs/pull/{pull_request.number}/head" if repository is None or repository.localPath is None else None,
                 base_branch=pull_request.baseBranch,
                 source_branch=pull_request.sourceBranch,
+                runner_timeout_seconds=data.agentSettings.runnerTimeoutSeconds,
             ), on_event=lambda event: self.append_agent_event(run_id, event), cancel_event=cancel_event)
         except Exception as exc:
             result = AgentRunResult(status="failed", summary=f"Agent worker failed: {exc}", events=[{"type": "error", "message": f"Agent worker failed: {exc}", "createdAt": utc_now()}])
@@ -117,19 +118,33 @@ class LocalJsonStore:
         risk_summary = None
         if result.workspace_path and result.status not in {"cancelled", "failed"}:
             self.append_agent_event(run_id, {"type": "checks_started", "message": "Running required checks against the prepared workspace."})
-            patch_summary, diff, raw_checks, risk_summary = inspect_workspace(Path(result.workspace_path), repository.requiredChecks if repository else None)
+            review_base = None
+            if action in {"fix_conflicts", "rebase"} and pull_request.baseBranch:
+                review_base = f"origin/{pull_request.baseBranch}...HEAD"
+            patch_summary, diff, raw_checks, risk_summary = inspect_workspace(
+                Path(result.workspace_path),
+                repository.requiredChecks if repository else None,
+                review_base,
+            )
             checks = [CheckResult.model_validate(check) for check in raw_checks]
             self.append_agent_event(run_id, {"type": "checks_completed", "message": f"Completed {len(checks)} required check(s)."})
         with self._write_lock:
             data = self._load()
             current = next((item for item in data.agentRuns if item.id == run_id), running)
-            final_status = "cancelled" if cancel_event.is_set() else ("patch_ready" if result.status == "awaiting_approval" and patch_summary is not None else result.status)
+            has_patch = bool(diff and diff.strip())
+            final_status = "cancelled" if cancel_event.is_set() else ("patch_ready" if result.status == "awaiting_approval" and has_patch else ("failed" if result.status == "awaiting_approval" and not has_patch else result.status))
             final_events = current.events
             if final_status == "patch_ready" and not any(event.type == "patch_ready" for event in final_events):
                 final_events = [*final_events, AgentRunEvent(sequence=len(final_events) + 1, type="patch_ready", message="Patch and check results are ready for human approval.", createdAt=utc_now())]
+            if final_status == "failed" and result.status == "awaiting_approval" and not has_patch:
+                final_events = [*final_events, AgentRunEvent(sequence=len(final_events) + 1, type="no_patch", message="Agent completed without producing a working-tree patch.", createdAt=utc_now())]
+            final_summary = result.summary
+            if result.status == "awaiting_approval" and not has_patch:
+                final_summary = "Agent completed without producing a working-tree patch. No approval is available."
             updated = current.model_copy(update={
                 "status": final_status,
-                "summary": (f"Patch prepared for review. {patch_summary}" if result.status == "awaiting_approval" and patch_summary else result.summary),
+                "summary": (f"Patch prepared for review. {patch_summary}" if final_status == "patch_ready" and patch_summary else final_summary),
+                "agentOutput": result.output,
                 "backendSessionId": result.backend_session_id,
                 "workspacePath": result.workspace_path,
                 "baseCommit": result.base_commit,
@@ -140,7 +155,7 @@ class LocalJsonStore:
                 "riskSummary": risk_summary,
             })
             data.agentRuns = [updated if item.id == run_id else item for item in data.agentRuns]
-            data.actions = [item.model_copy(update={"status": updated.status, "summary": updated.summary, "workspacePath": updated.workspacePath, "baseCommit": updated.baseCommit, "events": updated.events, "patchSummary": updated.patchSummary, "diff": updated.diff, "checks": updated.checks, "riskSummary": updated.riskSummary}) if item.id == run_id else item for item in data.actions]
+            data.actions = [item.model_copy(update={"status": updated.status, "summary": updated.summary, "agentOutput": updated.agentOutput, "workspacePath": updated.workspacePath, "baseCommit": updated.baseCommit, "events": updated.events, "patchSummary": updated.patchSummary, "diff": updated.diff, "checks": updated.checks, "riskSummary": updated.riskSummary}) if item.id == run_id else item for item in data.actions]
             if checks:
                 data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="checks", message=f"Required checks completed for {updated.repository}#{updated.pullRequestNumber}.", actionId=updated.id, createdAt=utc_now()))
             data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="agent_run", message=f"Agent run {updated.action} for {updated.repository}#{updated.pullRequestNumber} is {updated.status}.", actionId=updated.id, createdAt=utc_now()))
@@ -175,6 +190,8 @@ class LocalJsonStore:
                 raise ValueError("Unknown agent run")
             if run.status not in {"patch_ready", "awaiting_approval"}:
                 raise ValueError(f"Run is not ready for approval: {run.status}")
+            if not run.diff or not run.diff.strip():
+                raise ValueError("A non-empty patch is required before approval")
             if not run.checks or any(check.status != "passed" for check in run.checks):
                 raise ValueError("All required checks must pass before approval")
             approval = ApprovalRecord(id=f"approval-{uuid4().hex[:12]}", runId=run.id, decision="approved", reviewer=reviewer, baseCommit=run.baseCommit, createdAt=utc_now())
@@ -357,6 +374,14 @@ class LocalJsonStore:
         self._save(data)
         return data.github
 
+    def update_agent_settings(self, payload: UpdateAgentSettingsRequest) -> AgentSettings:
+        data = self._load()
+        settings = AgentSettings(runnerTimeoutSeconds=max(1, payload.runnerTimeoutSeconds))
+        data.agentSettings = settings
+        data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="settings", message=f"Agent runner timeout set to {settings.runnerTimeoutSeconds} seconds.", createdAt=utc_now()))
+        self._save(data)
+        return settings
+
     def replace_pull_requests(self, pull_requests: list[PullRequest], synced_at: str, errors: list[str]) -> PersistedAppData:
         data = self._load()
         if pull_requests or not errors:
@@ -380,6 +405,7 @@ class LocalJsonStore:
                 teamMembers=list(team_members),
                 pullRequests=list(pull_requests),
                 agentBackends=list(agent_backends),
+                agentSettings=AgentSettings(),
                 agentRuns=list(agent_runs),
                 actions=[ActionRecord(
                     id=run.id,
@@ -405,6 +431,15 @@ class LocalJsonStore:
             payload = json.load(handle)
         if "githubPrivate" not in payload:
             payload["githubPrivate"] = github_settings.model_dump(mode="json")
+        if "agentSettings" not in payload:
+            payload["agentSettings"] = AgentSettings().model_dump(mode="json")
+        legacy_repository_path_fixed = False
+        github_payload = payload["githubPrivate"]
+        if isinstance(github_payload, dict):
+            for repository in github_payload.get("repositories", []):
+                if isinstance(repository, dict) and repository.get("localPath") == "git diff --check":
+                    repository["localPath"] = None
+                    legacy_repository_path_fixed = True
         if "actions" not in payload:
             payload["actions"] = [
                 ActionRecord(
@@ -430,7 +465,7 @@ class LocalJsonStore:
         payload["github"] = self._public_github(GitHubSettings.model_validate(payload["githubPrivate"])).model_dump(mode="json")
         data = PersistedAppData.model_validate(payload)
         normalized = [self._normalize_pull_request(pull_request, data) for pull_request in data.pullRequests]
-        if normalized != data.pullRequests:
+        if normalized != data.pullRequests or legacy_repository_path_fixed:
             data.pullRequests = normalized
             self._save(data)
         return data
@@ -449,6 +484,7 @@ class LocalJsonStore:
             teamMembers=data.teamMembers,
             pullRequests=data.pullRequests,
             agentBackends=data.agentBackends,
+            agentSettings=data.agentSettings,
             agentRuns=data.agentRuns,
             actions=data.actions,
             activity=data.activity,

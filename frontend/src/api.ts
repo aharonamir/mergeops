@@ -1,7 +1,19 @@
 import { fixtureData } from "./fixtures";
-import type { AgentRun, AppData, CheckoutResult, GitHubSettings, GitHubSyncResult, RepositoryConfig, TeamMember } from "./types";
+import type { AgentRun, AgentSettings, AppData, CheckoutResult, GitHubSettings, GitHubSyncResult, RepositoryConfig, TeamMember } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "";
+
+export async function checkBackendHealth(): Promise<boolean> {
+  try {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 3000);
+    const response = await fetch(`${API_BASE}/api/health`, { signal: controller.signal });
+    window.clearTimeout(timeout);
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
 
 export async function loadAppData(): Promise<AppData> {
   try {
@@ -110,6 +122,16 @@ export async function updateGitHubSettings(input: {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ accessMode: "contributor_token", ...input })
+  });
+  if (!response.ok) throw new Error(`API returned ${response.status}`);
+  return await response.json();
+}
+
+export async function updateAgentSettings(input: AgentSettings): Promise<AgentSettings> {
+  const response = await fetch(`${API_BASE}/api/settings/agent`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input)
   });
   if (!response.ok) throw new Error(`API returned ${response.status}`);
   return await response.json();
