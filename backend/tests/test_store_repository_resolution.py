@@ -535,6 +535,85 @@ class StoreRepositoryResolutionTest(unittest.TestCase):
             self.assertEqual(adapter.requests[0].review_diff, parent.diff)
             self.assertEqual(adapter.requests[0].previous_agent_output, parent.agentOutput)
 
+    def test_resolution_classification_covers_snapshot_outcomes(self) -> None:
+        self.assertEqual(RunWorkspace.classify_resolution("ours\n", "theirs\n", "ours\n"), "ours")
+        self.assertEqual(RunWorkspace.classify_resolution("ours\n", "theirs\n", "theirs\n"), "theirs")
+        self.assertEqual(RunWorkspace.classify_resolution("ours\n", "theirs\n", "ours\ntheirs\n"), "combined")
+        self.assertEqual(RunWorkspace.classify_resolution("ours\n", "theirs\n", "hand edited\n"), "manual")
+        self.assertEqual(RunWorkspace.classify_resolution("", "theirs\n", "theirs\n"), "added")
+        self.assertEqual(RunWorkspace.classify_resolution("ours\n", "theirs\n", ""), "deleted")
+
+    def test_git_guard_records_and_blocks_merge_and_push(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            guard = SubprocessAgentAdapter._prepare_git_guard(root)
+            log = root / "guard.log"
+            environment = {"MERGEOPS_GIT_GUARD_LOG": str(log)}
+            merge = subprocess.run([str(guard), "merge", "main"], env=environment, capture_output=True, text=True)
+            push = subprocess.run([str(guard), "push", "origin", "main"], env=environment, capture_output=True, text=True)
+            self.assertEqual(merge.returncode, 64)
+            self.assertEqual(push.returncode, 64)
+            self.assertEqual(log.read_text(encoding="utf-8").splitlines(), ["merge", "push"])
+
+    def test_rebase_validation_rejects_head_not_based_on_base_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = root / "source"
+            repo.mkdir()
+            self._git(repo, "init", "-b", "main")
+            self._git(repo, "config", "user.email", "test@example.com")
+            self._git(repo, "config", "user.name", "MergeOps Test")
+            (repo / "README.md").write_text("base\n", encoding="utf-8")
+            self._git(repo, "add", "README.md")
+            self._git(repo, "commit", "-m", "base")
+            self._git(repo, "checkout", "-b", "feature")
+            (repo / "feature.txt").write_text("feature\n", encoding="utf-8")
+            self._git(repo, "add", "feature.txt")
+            self._git(repo, "commit", "-m", "feature")
+            self._git(repo, "checkout", "main")
+            (repo / "main.txt").write_text("main\n", encoding="utf-8")
+            self._git(repo, "add", "main.txt")
+            self._git(repo, "commit", "-m", "main")
+            self._git(repo, "checkout", "feature")
+
+            workspace = RunWorkspace(repo, self._git(repo, "rev-parse", "HEAD").strip())
+            validation = RunWorkspace.validate_rebase(workspace, "main", RunWorkspace.merge_commits(workspace))
+
+            self.assertFalse(validation["ok"])
+            self.assertIn("HEAD is not based on main", validation["messages"])
+
+    def test_conflict_finalization_freezes_previously_resolved_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._git(repo, "init", "-b", "main")
+            self._git(repo, "config", "user.email", "test@example.com")
+            self._git(repo, "config", "user.name", "MergeOps Test")
+            (repo / "README.md").write_text("first resolved\n", encoding="utf-8")
+            self._git(repo, "add", "README.md")
+            self._git(repo, "commit", "-m", "first resolution")
+            workspace = RunWorkspace(repo, self._git(repo, "rev-parse", "HEAD").strip())
+            evidence = {
+                "stages": [],
+                "conflicts": [{
+                    "id": "commit-one:README.md",
+                    "filePath": "README.md",
+                    "ours": {"text": "ours\n", "truncated": False, "originalLength": 5},
+                    "theirs": {"text": "theirs\n", "truncated": False, "originalLength": 7},
+                    "result": {"text": "", "truncated": False, "originalLength": 0},
+                    "classification": "unknown",
+                    "validationState": "unknown",
+                    "createdAt": "2026-01-01T00:00:00Z",
+                }],
+            }
+
+            (repo / "README.md").write_text("<<<<<<< HEAD\nlater ours\n=======\nlater theirs\n>>>>>>> commit\n", encoding="utf-8")
+            SubprocessAgentAdapter._finalize_conflicts(workspace, evidence, result_source="head")
+            SubprocessAgentAdapter._finalize_conflicts(workspace, evidence, result_source="worktree")
+
+            conflict = evidence["conflicts"][0]
+            self.assertEqual(conflict["result"]["text"], "first resolved\n")
+            self.assertEqual(conflict["validationState"], "passed")
+
     def _data(self, pull_request: PullRequest) -> PersistedAppData:
         repositories = [
             RepositoryConfig(id="owner-a-service", owner="owner-a", name="service", localPath="/tmp/owner-a-service"),

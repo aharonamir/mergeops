@@ -95,7 +95,30 @@ export type AgentRun = {
   riskSummary?: string | null;
   approval?: ApprovalRecord | null;
   pushRef?: string | null;
+  rebaseEvidence?: RebaseEvidence | null;
   createdAt: string;
+};
+
+export type AgentRunSummary = {
+  id: string;
+  backendId: string;
+  repository: string;
+  pullRequestId: string;
+  pullRequestNumber: number;
+  action: string;
+  status: string;
+  requester: string;
+  summary: string;
+  parentRunId?: string | null;
+  workspacePath?: string | null;
+  baseCommit?: string | null;
+  createdAt: string;
+  eventCount?: number;
+  checkCount?: number;
+  conflictCount?: number;
+  resolvedConflictCount?: number;
+  blockedCommandCount?: number;
+  hasRebaseEvidence?: boolean;
 };
 
 export type AgentRunEvent = {
@@ -112,6 +135,47 @@ export type CheckResult = {
   output: string;
   startedAt: string;
   finishedAt: string;
+};
+
+export type BoundedText = {
+  text: string;
+  truncated: boolean;
+  originalLength: number;
+};
+
+export type ConflictEvidence = {
+  id: string;
+  commitSha?: string | null;
+  commitSubject?: string | null;
+  filePath: string;
+  ours: BoundedText;
+  theirs: BoundedText;
+  result: BoundedText;
+  classification: "ours" | "theirs" | "combined" | "manual" | "added" | "deleted" | "unknown";
+  validationState: "passed" | "failed" | "unknown";
+  agentExplanation?: string | null;
+  createdAt: string;
+};
+
+export type RebaseStage = {
+  sequence: number;
+  type: string;
+  message: string;
+  createdAt: string;
+  commitSha?: string | null;
+};
+
+export type RebaseEvidence = {
+  baseRef?: string | null;
+  initialHead?: string | null;
+  finalHead?: string | null;
+  state: "not_applicable" | "running" | "completed" | "failed" | "cancelled";
+  stages: RebaseStage[];
+  conflicts: ConflictEvidence[];
+  blockedCommands: string[];
+  validation: string[];
+  diff: BoundedText;
+  transcript: BoundedText;
 };
 
 export type ApprovalRecord = {
@@ -143,6 +207,13 @@ export type ActionRecord = {
   riskSummary?: string | null;
   approval?: ApprovalRecord | null;
   pushRef?: string | null;
+  rebaseEvidence?: RebaseEvidence | null;
+  eventCount?: number;
+  checkCount?: number;
+  conflictCount?: number;
+  resolvedConflictCount?: number;
+  blockedCommandCount?: number;
+  hasRebaseEvidence?: boolean;
   createdAt: string;
 };
 
@@ -168,7 +239,7 @@ export type AppData = {
   pullRequests: PullRequest[];
   agentBackends: AgentBackend[];
   agentSettings: AgentSettings;
-  agentRuns: AgentRun[];
+  agentRuns: AgentRunSummary[];
   actions?: ActionRecord[];
   activity?: ActivityEvent[];
   github?: GitHubSettings | null;

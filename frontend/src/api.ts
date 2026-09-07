@@ -1,5 +1,5 @@
 import { fixtureData } from "./fixtures";
-import type { AgentRun, AgentSettings, AppData, CheckoutResult, GitHubSettings, GitHubSyncResult, RepositoryConfig, TeamMember } from "./types";
+import type { ActionRecord, AgentRun, AgentSettings, AppData, CheckoutResult, GitHubSettings, GitHubSyncResult, RepositoryConfig, TeamMember } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "";
 
@@ -68,6 +68,12 @@ export async function createCheckout(pullRequestId: string): Promise<CheckoutRes
 export async function clearAction(actionId: string): Promise<void> {
   const response = await fetch(`${API_BASE}/api/actions/${actionId}`, { method: "DELETE" });
   if (!response.ok) throw new Error(`API returned ${response.status}`);
+}
+
+export async function loadActionDetails(actionId: string): Promise<AgentRun | ActionRecord> {
+  const response = await fetch(`${API_BASE}/api/actions/${actionId}/details`);
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
+  return await response.json();
 }
 
 export async function cancelAgentRun(runId: string): Promise<AgentRun> {

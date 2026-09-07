@@ -47,6 +47,7 @@ class AgentRunResult:
     workspace_path: str | None = None
     base_commit: str | None = None
     events: list[dict[str, object]] | None = None
+    rebase_evidence: dict[str, object] | None = None
 
 
 class AgentAdapter(Protocol):
@@ -145,31 +146,20 @@ class SubprocessAgentAdapter:
                     on_event(result.events[0])
                 return result
 
-        if request.action in {"fix_conflicts", "rebase"}:
+        rebase_mode = request.action in {"fix_conflicts", "rebase"}
+        base_ref = None
+        initial_merges: set[str] = set()
+        if rebase_mode:
             try:
-                rebase_state = RunWorkspace.prepare_rebase(workspace, request.base_branch)
+                base_ref = RunWorkspace.resolve_base_ref(workspace.path, request.base_branch)
+                RunWorkspace.configure_rebase(workspace)
+                initial_merges = RunWorkspace.merge_commits(workspace)
             except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-                event = self._event("error", f"Could not prepare required rebase: {exc}")
-                result = AgentRunResult(
-                    status="failed",
-                    summary=f"Could not prepare required rebase: {exc}",
-                    workspace_path=str(workspace.path),
-                    base_commit=workspace.base_commit,
-                    events=[event],
-                )
+                event = self._event("error", f"Could not prepare agent-owned rebase: {exc}")
+                result = AgentRunResult(status="failed", summary=f"Could not prepare agent-owned rebase: {exc}", workspace_path=str(workspace.path), base_commit=workspace.base_commit, events=[event], rebase_evidence={"baseRef": base_ref, "state": "failed", "validation": [str(exc)]})
                 if on_event:
                     on_event(event)
                 return result
-            if on_event:
-                on_event(self._event(
-                    "rebase_conflicts" if rebase_state else "rebase_prepared",
-                    "Rebase started with conflicts; waiting for the agent to resolve them."
-                    if rebase_state
-                    else "Workspace rebased onto the base branch before the agent started.",
-                ))
-            conflict_files = RunWorkspace.unmerged_files(workspace)
-        else:
-            conflict_files = []
 
         opencode_profile_files = self._prepare_opencode_profile(workspace.path)
         review_baseline = self._workspace_fingerprint(workspace.path) if request.action == "review_patch" else None
@@ -184,7 +174,8 @@ class SubprocessAgentAdapter:
             "baseBranch": request.base_branch,
             "sourceBranch": request.source_branch,
             "runnerTimeoutSeconds": request.runner_timeout_seconds,
-            "conflictFiles": conflict_files,
+            "baseRef": base_ref,
+            "conflictFiles": [],
             "reviewDiff": request.review_diff,
             "previousAgentOutput": request.previous_agent_output,
         }
@@ -202,6 +193,7 @@ class SubprocessAgentAdapter:
                 "HOME": str(workspace.path),
                 "MERGEOPS_RUN_ID": request.run_id,
                 "MERGEOPS_NO_PUSH": "1",
+                "MERGEOPS_GIT_GUARD_LOG": str(git_guard.parent / "git-guard.log"),
             })
             process = subprocess.Popen(
                 ["node", str(self.runner_path)],
@@ -231,22 +223,41 @@ class SubprocessAgentAdapter:
             stderr_lines: list[str] = []
             streams_closed = 0
             deadline = time.monotonic() + request.runner_timeout_seconds
+            evidence: dict[str, object] | None = {
+                "baseRef": base_ref,
+                "initialHead": workspace.base_commit,
+                "state": "running",
+                "stages": [],
+                "conflicts": [],
+                "blockedCommands": [],
+                "validation": [],
+            } if rebase_mode else None
+            seen_conflict_keys: set[str] = set()
+            guard_cursor = 0
             while streams_closed < 2:
-                if request.action in {"fix_conflicts", "rebase"} and RunWorkspace.merge_in_progress(workspace):
-                    if process.poll() is None:
-                        os.killpg(process.pid, signal.SIGTERM)
-                        process.wait(timeout=5)
-                    message = "Agent attempted git merge; conflict fixes must use rebase."
-                    result = AgentRunResult(
-                        status="failed",
-                        summary=message,
-                        workspace_path=str(workspace.path),
-                        base_commit=workspace.base_commit,
-                        events=[self._event("error", message)],
-                    )
-                    if on_event:
-                        on_event(result.events[0])
-                    return result
+                if rebase_mode:
+                    self._record_rebase_state(workspace, evidence, seen_conflict_keys, on_event)
+                guard_events, guard_cursor = self._read_guard_events(git_guard.parent / "git-guard.log", guard_cursor)
+                if guard_events:
+                    for command in guard_events:
+                        if evidence is not None:
+                            blocked = evidence.setdefault("blockedCommands", [])
+                            if command not in blocked:
+                                blocked.append(command)
+                        event = self._event("blocked_command", f"Blocked agent command: git {command}")
+                        if on_event:
+                            on_event(event)
+                        if process.poll() is None:
+                            os.killpg(process.pid, signal.SIGTERM)
+                            process.wait(timeout=5)
+                        message = f"Agent attempted blocked git {command}; the workspace does not permit merge or push."
+                        failure = self._event("error", message)
+                        if on_event:
+                            on_event(failure)
+                        if evidence is not None:
+                            evidence["state"] = "failed"
+                            evidence.setdefault("validation", []).append(f"blocked git {command}")
+                        return AgentRunResult(status="failed", summary=message, workspace_path=str(workspace.path), base_commit=workspace.base_commit, events=[event, failure], rebase_evidence=evidence)
                 if cancel_event and cancel_event.is_set() and process.poll() is None:
                     os.killpg(process.pid, signal.SIGTERM)
                     process.wait(timeout=5)
@@ -256,6 +267,7 @@ class SubprocessAgentAdapter:
                         workspace_path=str(workspace.path),
                         base_commit=workspace.base_commit,
                         events=[self._event("cancelled", "Agent run cancelled; its process group was terminated.")],
+                        rebase_evidence=evidence if rebase_mode else None,
                     )
                     if on_event:
                         on_event(result.events[0])
@@ -269,6 +281,7 @@ class SubprocessAgentAdapter:
                         workspace_path=str(workspace.path),
                         base_commit=workspace.base_commit,
                         events=[self._event("error", f"Agent runner timed out after {request.runner_timeout_seconds} seconds; its process group was terminated.")],
+                        rebase_evidence=evidence if rebase_mode else None,
                     )
                     if on_event:
                         on_event(result.events[0])
@@ -315,6 +328,24 @@ class SubprocessAgentAdapter:
             )
 
         result, events = self._parse_result(stdout)
+        if rebase_mode:
+            self._record_rebase_state(workspace, evidence, seen_conflict_keys, on_event)
+            validation = RunWorkspace.validate_rebase(workspace, base_ref, initial_merges)
+            if evidence is not None:
+                evidence["validation"] = [*evidence.get("validation", []), *validation["messages"]]
+                evidence["finalHead"] = validation["finalHead"]
+                runner_completed = result is not None
+                evidence["state"] = "completed" if validation["ok"] and runner_completed else "failed"
+                if validation["ok"] and runner_completed and not evidence.get("stages"):
+                    self._append_stage(evidence, "rebase_completed", "Agent completed the rebase lifecycle without stopping on conflicts.", on_event, workspace, validation["finalHead"])
+            if not validation["ok"] or result is None:
+                failure_message = "; ".join(validation["messages"]) if not validation["ok"] else "agent runner exited without a final result"
+                self._append_stage(evidence, "rebase_failed", failure_message, on_event, workspace, validation["finalHead"])
+                failure = self._event("rebase_validation_failed", failure_message)
+                events.append(failure)
+                if on_event:
+                    on_event(failure)
+                return AgentRunResult(status="failed", summary=f"Rebase validation failed: {failure_message}", output=result.output if result else None, backend_session_id=result.backend_session_id if result else None, workspace_path=str(workspace.path), base_commit=workspace.base_commit, events=events, rebase_evidence=evidence)
         if result is not None:
             return result.__class__(
                 status=result.status,
@@ -324,6 +355,7 @@ class SubprocessAgentAdapter:
                 workspace_path=str(workspace.path),
                 base_commit=workspace.base_commit,
                 events=events,
+                rebase_evidence=evidence if rebase_mode else None,
             )
         message = stderr.strip() or f"Agent runner exited with code {process.returncode}"
         if stderr.strip():
@@ -341,6 +373,7 @@ class SubprocessAgentAdapter:
             workspace_path=str(workspace.path),
             base_commit=workspace.base_commit,
             events=events,
+            rebase_evidence=evidence if rebase_mode else None,
         )
 
     @staticmethod
@@ -390,7 +423,7 @@ class SubprocessAgentAdapter:
 
     @staticmethod
     def _prepare_git_guard(run_root: Path) -> Path:
-        """Reject merge commands inside agent runs; conflict fixes must use rebase."""
+        """Reject merge/push commands and leave a machine-readable audit trail."""
         git_path = shutil.which("git")
         if git_path is None:
             raise RuntimeError("git is not available for the agent run")
@@ -410,7 +443,8 @@ class SubprocessAgentAdapter:
             "  esac\n"
             "done\n"
             "if [ \"$command\" = \"merge\" ] || [ \"$command\" = \"push\" ]; then\n"
-            "  echo 'MergeOps guard: git merge and git push are disabled inside agent runs.' >&2\n"
+            "  printf '%s\\n' \"$command\" >> \"${MERGEOPS_GIT_GUARD_LOG:-/dev/null}\"\n"
+            "  echo \"MergeOps guard: git $command is disabled inside agent runs.\" >&2\n"
             "  exit 64\n"
             "fi\n"
             f"exec {shlex.quote(git_path)} \"$@\"\n",
@@ -418,6 +452,75 @@ class SubprocessAgentAdapter:
         )
         guard.chmod(0o755)
         return guard
+
+    @staticmethod
+    def _read_guard_events(path: Path, cursor: int) -> tuple[list[str], int]:
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return [], cursor
+        return [line.strip() for line in lines[cursor:] if line.strip()], len(lines)
+
+    def _record_rebase_state(self, workspace: "RunWorkspace", evidence: dict[str, object] | None, seen_conflict_keys: set[str], on_event: Callable[[dict[str, object]], None] | None) -> None:
+        if evidence is None:
+            return
+        active = RunWorkspace.rebase_in_progress(workspace)
+        was_active = bool(evidence.get("_active"))
+        stages = evidence.setdefault("stages", [])
+        if active and not was_active:
+            self._append_stage(evidence, "rebase_started", f"Agent started rebase onto {evidence.get('baseRef') or 'the resolved base ref'}.", on_event, workspace)
+        files = RunWorkspace.unmerged_files(workspace) if active else []
+        commit_sha, commit_subject = RunWorkspace.rebase_commit(workspace)
+        key = f"{commit_sha or 'unknown'}:{','.join(files)}"
+        if active and files and key not in seen_conflict_keys:
+            if was_active and seen_conflict_keys:
+                self._finalize_conflicts(workspace, evidence, on_event, result_source="head")
+                self._append_stage(evidence, "rebase_continue", "The agent resolved the previous stop and continued into the next rebase commit.", on_event, workspace, commit_sha)
+            seen_conflict_keys.add(key)
+            conflicts = evidence.setdefault("conflicts", [])
+            for path in files:
+                conflicts.append(RunWorkspace.capture_conflict(path, commit_sha, commit_subject, workspace))
+            self._append_stage(evidence, "conflict_stop", f"Rebase paused on {len(files)} conflict file(s) for {commit_subject or commit_sha or 'the current commit'}.", on_event, workspace, commit_sha)
+        elif was_active and active and not files:
+            self._finalize_conflicts(workspace, evidence, on_event, result_source="worktree")
+            self._append_stage(evidence, "rebase_continue", "No unresolved files remain; the agent continued the rebase.", on_event, workspace, commit_sha)
+        elif was_active and not active:
+            self._finalize_conflicts(workspace, evidence, on_event, result_source="worktree")
+            self._append_stage(evidence, "rebase_completed", "Agent completed the rebase lifecycle.", on_event, workspace, commit_sha)
+        evidence["_active"] = active
+
+    @staticmethod
+    def _append_stage(evidence: dict[str, object], event_type: str, message: str, on_event: Callable[[dict[str, object]], None] | None, workspace: "RunWorkspace", commit_sha: str | None = None) -> None:
+        stages = evidence.setdefault("stages", [])
+        if stages and stages[-1].get("type") == event_type and stages[-1].get("message") == message:  # type: ignore[union-attr]
+            return
+        event = {"type": event_type, "message": message, "createdAt": utc_now()}
+        stages.append({"sequence": len(stages) + 1, **event, "commitSha": commit_sha})  # type: ignore[arg-type]
+        if on_event:
+            on_event(event)
+
+    @staticmethod
+    def _finalize_conflicts(workspace: "RunWorkspace", evidence: dict[str, object], on_event: Callable[[dict[str, object]], None] | None = None, result_source: str = "worktree") -> None:
+        resolved = 0
+        for conflict in evidence.get("conflicts", []):  # type: ignore[union-attr]
+            if not isinstance(conflict, dict):
+                continue
+            if conflict.get("validationState") != "unknown":
+                continue
+            result = RunWorkspace.read_snapshot(str(conflict.get("filePath", "")), result_source, workspace)
+            ours = conflict.get("ours", {}).get("text", "") if isinstance(conflict.get("ours"), dict) else ""
+            theirs = conflict.get("theirs", {}).get("text", "") if isinstance(conflict.get("theirs"), dict) else ""
+            conflict["result"] = result
+            conflict["classification"] = RunWorkspace.classify_resolution(ours, theirs, result.get("text", ""))
+            conflict["validationState"] = "failed" if "<<<<<<<" in result.get("text", "") or "=======" in result.get("text", "") or ">>>>>>>" in result.get("text", "") else "passed"
+            if conflict["validationState"] == "passed":
+                resolved += 1
+        if resolved:
+            SubprocessAgentAdapter._append_stage(evidence, "resolution", f"Captured {resolved} validated conflict resolution(s).", on_event, workspace)
+
+    @staticmethod
+    def _bounded(text: str, limit: int = 12000) -> dict[str, object]:
+        return {"text": text[:limit], "truncated": len(text) > limit, "originalLength": len(text)}
 
     def _parse_result(self, output: str) -> tuple[AgentRunResult | None, list[dict[str, object]]]:
         final_event: dict[str, object] | None = None
@@ -506,6 +609,8 @@ class RunWorkspace:
                 cls._git(checkout, "checkout", "--detach", f"origin/{branch}")
             else:
                 cls._git(checkout, "checkout", "--detach", "HEAD")
+            if request.base_branch:
+                cls._git(checkout, "fetch", "origin", f"+refs/heads/{request.base_branch}:refs/remotes/origin/{request.base_branch}", token=request.repository_token)
             base_commit = cls._git(checkout, "rev-parse", "HEAD").strip()
         except Exception:
             cls.cleanup(request.run_id)
@@ -537,7 +642,7 @@ class RunWorkspace:
 
     @classmethod
     def prepare_rebase(cls, workspace: "RunWorkspace", base_branch: str | None) -> bool:
-        """Start the required rebase, returning whether it stopped on conflicts."""
+        """Compatibility helper for older callers; new runs let the agent start rebase."""
         if not base_branch:
             raise RuntimeError("the pull request has no base branch")
         base_ref = cls._resolve_base_ref(workspace.path, base_branch)
@@ -559,6 +664,53 @@ class RunWorkspace:
         detail = (result.stderr or result.stdout).strip()
         raise RuntimeError(f"git rebase {base_ref} failed: {detail or f'exited with code {result.returncode}'}")
 
+    @classmethod
+    def configure_rebase(cls, workspace: "RunWorkspace") -> None:
+        cls._git(workspace.path, "config", "user.name", "MergeOps Agent")
+        cls._git(workspace.path, "config", "user.email", "mergeops-agent@localhost")
+
+    @classmethod
+    def resolve_base_ref(cls, checkout: Path, base_branch: str | None) -> str:
+        if not base_branch:
+            raise RuntimeError("the pull request has no base branch")
+        return cls._resolve_base_ref(checkout, base_branch)
+
+    @staticmethod
+    def rebase_in_progress(workspace: "RunWorkspace") -> bool:
+        return (workspace.path / ".git" / "rebase-merge").exists() or (workspace.path / ".git" / "rebase-apply").exists()
+
+    @classmethod
+    def rebase_commit(cls, workspace: "RunWorkspace") -> tuple[str | None, str | None]:
+        sha = cls._git_optional_value(workspace.path, "rev-parse", "REBASE_HEAD")
+        subject = cls._git_optional_value(workspace.path, "show", "-s", "--format=%s", "REBASE_HEAD")
+        return sha, subject
+
+    @classmethod
+    def merge_commits(cls, workspace: "RunWorkspace") -> set[str]:
+        result = subprocess.run(["git", "rev-list", "--merges", "--all"], cwd=workspace.path, capture_output=True, text=True, check=False, timeout=30)
+        return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+    @classmethod
+    def validate_rebase(cls, workspace: "RunWorkspace", base_ref: str | None, initial_merges: set[str]) -> dict[str, object]:
+        messages: list[str] = []
+        if cls.rebase_in_progress(workspace):
+            messages.append("rebase state is still active")
+        unresolved = cls.unmerged_files(workspace)
+        if unresolved:
+            messages.append(f"unresolved files remain: {', '.join(unresolved)}")
+        final_head = cls._git_optional_value(workspace.path, "rev-parse", "HEAD")
+        if not base_ref:
+            messages.append("base ref is unavailable")
+        elif not cls._git_optional(workspace.path, "merge-base", "--is-ancestor", base_ref, "HEAD"):
+            messages.append(f"HEAD is not based on {base_ref}")
+        new_merges = cls.merge_commits(workspace) - initial_merges
+        if new_merges:
+            messages.append(f"merge commit introduced: {', '.join(sorted(new_merges))}")
+        ok = not messages
+        if ok:
+            messages.append(f"rebase state clear; HEAD is based on {base_ref}; no unresolved files or new merge commits detected")
+        return {"ok": ok, "messages": messages, "finalHead": final_head}
+
     @staticmethod
     def merge_in_progress(workspace: "RunWorkspace") -> bool:
         """Detect a merge state without confusing it with Git's rebase state."""
@@ -576,6 +728,49 @@ class RunWorkspace:
         )
         return [line for line in result.stdout.splitlines() if line]
 
+    @classmethod
+    def read_snapshot(cls, path: str, source: str, workspace: "RunWorkspace") -> dict[str, object]:
+        if source == "worktree":
+            target = workspace.path / path
+            try:
+                value = target.read_text(encoding="utf-8", errors="replace") if target.exists() else ""
+            except OSError:
+                value = ""
+        elif source == "head":
+            result = subprocess.run(["git", "show", f"HEAD:{path}"], cwd=workspace.path, capture_output=True, text=True, check=False, timeout=30)
+            value = result.stdout if result.returncode == 0 else ""
+        else:
+            result = subprocess.run(["git", "show", f":{source}:{path}"], cwd=workspace.path, capture_output=True, text=True, check=False, timeout=30)
+            value = result.stdout if result.returncode == 0 else ""
+        return SubprocessAgentAdapter._bounded(value)
+
+    @classmethod
+    def capture_conflict(cls, path: str, commit_sha: str | None, commit_subject: str | None, workspace: "RunWorkspace" | None = None) -> dict[str, object]:
+        # The optional workspace argument keeps this method convenient for tests and callers.
+        assert workspace is not None
+        ours = cls.read_snapshot(path, "2", workspace)
+        theirs = cls.read_snapshot(path, "3", workspace)
+        result = cls.read_snapshot(path, "worktree", workspace)
+        return {"id": f"{commit_sha or 'unknown'}:{path}", "commitSha": commit_sha, "commitSubject": commit_subject, "filePath": path, "ours": ours, "theirs": theirs, "result": result, "classification": cls.classify_resolution(ours["text"], theirs["text"], result["text"]), "validationState": "failed" if "<<<<<<<" in result["text"] else "unknown", "agentExplanation": "Git snapshots captured by MergeOps; agent transcript is supplementary.", "createdAt": utc_now()}
+
+    @staticmethod
+    def classify_resolution(ours: str, theirs: str, result: str) -> str:
+        if not ours and not theirs and not result:
+            return "deleted"
+        if not ours and result:
+            return "added"
+        if not result:
+            return "deleted"
+        if result == ours:
+            return "ours"
+        if result == theirs:
+            return "theirs"
+        if ours and theirs and ours.strip() in result and theirs.strip() in result:
+            return "combined"
+        if result and "<<<<<<<" not in result and "=======" not in result and ">>>>>>>" not in result:
+            return "manual"
+        return "unknown"
+
     @staticmethod
     def _resolve_base_ref(checkout: Path, base_branch: str) -> str:
         candidates = [f"refs/remotes/origin/{base_branch}", f"refs/heads/{base_branch}", base_branch]
@@ -583,6 +778,11 @@ class RunWorkspace:
             if RunWorkspace._git_optional(checkout, "rev-parse", "--verify", candidate):
                 return candidate.removeprefix("refs/remotes/").removeprefix("refs/heads/") if candidate.startswith("refs/") else candidate
         raise RuntimeError(f"base branch does not exist in the isolated repository: {base_branch}")
+
+    @staticmethod
+    def _git_optional_value(cwd: Path, *args: str) -> str | None:
+        result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=False, timeout=30)
+        return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
 
     @staticmethod
     def _git(cwd: Path, *args: str, token: str | None = None) -> str:

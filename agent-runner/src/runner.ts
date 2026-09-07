@@ -18,6 +18,7 @@ type RunnerInput = {
   action: AgentAction;
   repositoryLocalPath: string;
   baseBranch?: string | null;
+  baseRef?: string | null;
   sourceBranch?: string | null;
   runnerTimeoutSeconds?: number;
   conflictFiles?: string[];
@@ -260,9 +261,9 @@ function buildPrompt(input: RunnerInput) {
     ? "Do not manually create commits. It is required to stage resolved conflict files and run git rebase --continue; that command creates the rebased commit. Do not push, merge, or open a pull request. Leave the workspace for human approval."
     : "Do not stage, commit, push, merge, or open a pull request. Leave the workspace for human approval.";
   const scope = input.action === "fix_conflicts"
-    ? `This is a deterministic conflict-resolution task, not a repository investigation. Your first shell command MUST be: git status --short && git diff --name-only --diff-filter=U. Do not run git log, git show, revision-to-revision diff, or inspect unrelated source before the first conflict file is edited and staged. MergeOps has already started git rebase onto the base branch. Resolve only the current conflict hunks using the files and markers Git reports, remove every conflict marker, stage only those resolved files, and immediately run GIT_EDITOR=true git rebase --continue. The rebase may stop more than once across multiple commits, so repeat the same status, edit, stage, continue loop until it completes. Initial unmerged files: ${(input.conflictFiles ?? []).join(", ") || "the files reported by Git"}. Prioritize completing the rebase with the smallest conflict resolution that preserves the incoming PR change. NEVER run git merge or start a second rebase. Verify git diff --name-only --diff-filter=U is empty and stop immediately. Do not touch any unrelated file.`
+    ? `This is a deterministic conflict-resolution task, not a repository investigation. Your first shell command MUST be: git status --short && git diff --name-only --diff-filter=U. Do not run git log, git show, revision-to-revision diff, or inspect unrelated source before starting the requested rebase. Start the complete lifecycle with git rebase ${input.baseRef ?? `origin/${input.baseBranch ?? "the base branch"}`}. Resolve only the current conflict hunks using the files and markers Git reports, remove every conflict marker, stage only those resolved files, and immediately run GIT_EDITOR=true git rebase --continue. The rebase may stop more than once across multiple commits, so repeat the same status, edit, stage, continue loop until it completes. Prioritize completing the rebase with the smallest conflict resolution that preserves the incoming PR change. NEVER run git merge or start a second rebase. Verify git status --short and git diff --name-only --diff-filter=U are clean and stop immediately. Do not touch any unrelated file.`
     : input.action === "rebase"
-      ? "MergeOps has already started git rebase onto the base branch. If the rebase is paused on conflicts, resolve only those conflicts and run git rebase --continue until it completes. NEVER run git merge or start a second rebase. Keep the change narrowly scoped to the rebase and checks, then stop."
+      ? `Run the complete agent-owned lifecycle: git rebase ${input.baseRef ?? `origin/${input.baseBranch ?? "the base branch"}`}, resolve every conflict, stage resolved files, and run GIT_EDITOR=true git rebase --continue until the rebase completes. NEVER run git merge or start a second rebase. Keep the change narrowly scoped to the rebase and checks, then stop.`
       : input.action === "review_patch"
         ? "Review the prepared patch for correctness, risk, missing tests, accidental broad changes, unresolved conflict markers, and whether it matches the PR intent. Return concise findings first, ordered by severity, then a short approval recommendation. Do not modify the workspace."
       : "Keep the change narrowly scoped to the requested task and stop after the smallest patch and checks are complete.";
@@ -274,7 +275,7 @@ function buildPrompt(input: RunnerInput) {
     input.action === "review_patch"
       ? "Inspect the supplied patch context and produce a review. Do not make changes."
       : input.action === "fix_conflicts"
-        ? "Resolve the active rebase now. Do not perform broad repository research or inspect unrelated history."
+        ? "Start and complete the rebase now. Do not perform broad repository research or inspect unrelated history."
         : "Inspect the repo and prepare the smallest patch and checks summary.",
     input.previousAgentOutput ? `Previous agent output:\n${input.previousAgentOutput.slice(-12000)}` : "",
     input.reviewDiff ? `Prepared diff to review:\n${input.reviewDiff.slice(-40000)}` : "",

@@ -6,12 +6,16 @@ from tempfile import NamedTemporaryFile
 from threading import Event, Lock
 from uuid import uuid4
 
+from pydantic import Field
+
 from .adapters import AgentRunRequest, AgentRunResult, RunWorkspace, adapter_registry, inspect_workspace, utc_now
 from .fixtures import agent_backends, agent_runs, github_settings, pull_requests, team_members
-from .models import ActionRecord, ActivityEvent, AgentRun, AgentRunEvent, AgentSettings, AppData, ApprovalRecord, CheckResult, CheckoutResult, CreateTeamMemberRequest, GitHubSettings, GitHubSettingsPublic, PullRequest, RepositoryConfig, TeamMember, UpdateAgentSettingsRequest, UpdateGitHubSettingsRequest, UpdateTeamMemberRequest
+from .models import ActionRecord, ActionSummary, ActivityEvent, AgentRun, AgentRunEvent, AgentRunSummary, AgentSettings, AppData, ApprovalRecord, BoundedText, CheckResult, CheckoutResult, CreateTeamMemberRequest, GitHubSettings, GitHubSettingsPublic, PullRequest, RebaseEvidence, RepositoryConfig, TeamMember, UpdateAgentSettingsRequest, UpdateGitHubSettingsRequest, UpdateTeamMemberRequest
 
 
 class PersistedAppData(AppData):
+    agentRuns: list[AgentRun]
+    actions: list[ActionRecord] = Field(default_factory=list)
     githubPrivate: GitHubSettings
 
 
@@ -234,31 +238,47 @@ class LocalJsonStore:
         diff = None
         checks: list[CheckResult] = []
         risk_summary = None
-        if result.workspace_path and result.status not in {"cancelled", "failed"}:
+        rebase_evidence = RebaseEvidence.model_validate(result.rebase_evidence) if result.rebase_evidence else None
+        if result.workspace_path and result.status != "cancelled":
             self.append_agent_event(run_id, {"type": "checks_started", "message": "Running required checks against the prepared workspace."})
             review_base = None
             if action in {"fix_conflicts", "rebase"} and pull_request.baseBranch:
                 review_base = f"origin/{pull_request.baseBranch}...HEAD"
-            patch_summary, diff, raw_checks, risk_summary = inspect_workspace(
+            patch_summary, raw_diff, raw_checks, risk_summary = inspect_workspace(
                 Path(result.workspace_path),
                 repository.requiredChecks if repository else None,
                 review_base,
             )
+            diff = raw_diff[:50000] if raw_diff else raw_diff
+            if rebase_evidence is not None and raw_diff is not None:
+                rebase_evidence.diff = BoundedText(text=diff or "", truncated=len(raw_diff) > 50000, originalLength=len(raw_diff))
             checks = [CheckResult.model_validate(check) for check in raw_checks]
+            if rebase_evidence is not None:
+                rebase_evidence.stages.append({"sequence": len(rebase_evidence.stages) + 1, "type": "checks_completed", "message": f"Completed {len(checks)} required check(s).", "createdAt": utc_now()})
             self.append_agent_event(run_id, {"type": "checks_completed", "message": f"Completed {len(checks)} required check(s)."})
+        if rebase_evidence is not None:
+            if result.status == "cancelled":
+                rebase_evidence.state = "cancelled"
+            if result.output:
+                rebase_evidence.transcript = BoundedText(text=result.output[-20000:], truncated=len(result.output) > 20000, originalLength=len(result.output))
         with self._write_lock:
             data = self._load()
             current = next((item for item in data.agentRuns if item.id == run_id), running)
             has_patch = bool(diff and diff.strip())
-            final_status = "cancelled" if cancel_event.is_set() else ("patch_ready" if result.status == "awaiting_approval" and has_patch else ("failed" if result.status == "awaiting_approval" and not has_patch else result.status))
+            checks_passed = bool(checks) and all(check.status == "passed" for check in checks)
+            final_status = "cancelled" if cancel_event.is_set() else ("patch_ready" if result.status == "awaiting_approval" and has_patch and checks_passed else ("failed" if result.status == "awaiting_approval" else result.status))
             final_events = current.events
             if final_status == "patch_ready" and not any(event.type == "patch_ready" for event in final_events):
                 final_events = [*final_events, AgentRunEvent(sequence=len(final_events) + 1, type="patch_ready", message="Patch and check results are ready for human approval.", createdAt=utc_now())]
             if final_status == "failed" and result.status == "awaiting_approval" and not has_patch:
                 final_events = [*final_events, AgentRunEvent(sequence=len(final_events) + 1, type="no_patch", message="Agent completed without producing a working-tree patch.", createdAt=utc_now())]
+            if final_status == "failed" and result.status == "awaiting_approval" and has_patch and not checks_passed:
+                final_events = [*final_events, AgentRunEvent(sequence=len(final_events) + 1, type="checks_failed", message="One or more required checks failed; approval is unavailable.", createdAt=utc_now())]
             final_summary = result.summary
             if result.status == "awaiting_approval" and not has_patch:
                 final_summary = "Agent completed without producing a working-tree patch. No approval is available."
+            elif result.status == "awaiting_approval" and has_patch and not checks_passed:
+                final_summary = "Agent produced a patch, but one or more required checks failed. No approval is available."
             updated = current.model_copy(update={
                 "status": final_status,
                 "summary": (f"Patch prepared for review. {patch_summary}" if final_status == "patch_ready" and patch_summary else final_summary),
@@ -271,9 +291,10 @@ class LocalJsonStore:
                 "diff": diff,
                 "checks": checks,
                 "riskSummary": risk_summary,
+                "rebaseEvidence": rebase_evidence,
             })
             data.agentRuns = [updated if item.id == run_id else item for item in data.agentRuns]
-            data.actions = [item.model_copy(update={"status": updated.status, "summary": updated.summary, "agentOutput": updated.agentOutput, "workspacePath": updated.workspacePath, "baseCommit": updated.baseCommit, "events": updated.events, "patchSummary": updated.patchSummary, "diff": updated.diff, "checks": updated.checks, "riskSummary": updated.riskSummary}) if item.id == run_id else item for item in data.actions]
+            data.actions = [item.model_copy(update={"status": updated.status, "summary": updated.summary, "agentOutput": updated.agentOutput, "workspacePath": updated.workspacePath, "baseCommit": updated.baseCommit, "events": updated.events, "patchSummary": updated.patchSummary, "diff": updated.diff, "checks": updated.checks, "riskSummary": updated.riskSummary, "rebaseEvidence": updated.rebaseEvidence}) if item.id == run_id else item for item in data.actions]
             if checks:
                 data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="checks", message=f"Required checks completed for {updated.repository}#{updated.pullRequestNumber}.", actionId=updated.id, createdAt=utc_now()))
             data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="agent_run", message=f"Agent run {updated.action} for {updated.repository}#{updated.pullRequestNumber} is {updated.status}.", actionId=updated.id, createdAt=utc_now()))
@@ -367,6 +388,17 @@ class LocalJsonStore:
             data.agentRuns = [updated if item.id == run_id else item for item in data.agentRuns]
             data.actions = [item.model_copy(update={"events": updated.events}) if item.id == run_id else item for item in data.actions]
             self._save(data)
+
+    def action_details(self, action_id: str) -> AgentRun | ActionRecord:
+        data = self._load()
+        action = next((item for item in data.actions if item.id == action_id), None)
+        if action is None:
+            raise ValueError("Unknown action")
+        if action.kind == "agent_run":
+            run = next((item for item in data.agentRuns if item.id == action_id), None)
+            if run is not None:
+                return run
+        return action
 
     def create_checkout(self, pull_request_id: str) -> CheckoutResult:
         data = self._load()
@@ -603,11 +635,61 @@ class LocalJsonStore:
             pullRequests=data.pullRequests,
             agentBackends=data.agentBackends,
             agentSettings=data.agentSettings,
-            agentRuns=data.agentRuns,
-            actions=data.actions,
+            agentRuns=[self._run_summary(run) for run in data.agentRuns],
+            actions=[self._action_summary(action) for action in data.actions],
             activity=data.activity,
             approvals=data.approvals,
             github=self._public_github(data.githubPrivate),
+        )
+
+    @staticmethod
+    def _run_summary(run: AgentRun) -> AgentRunSummary:
+        evidence = run.rebaseEvidence
+        return AgentRunSummary(
+            id=run.id,
+            backendId=run.backendId,
+            repository=run.repository,
+            pullRequestId=run.pullRequestId,
+            pullRequestNumber=run.pullRequestNumber,
+            action=run.action,
+            status=run.status,
+            requester=run.requester,
+            summary=run.summary,
+            parentRunId=run.parentRunId,
+            workspacePath=run.workspacePath,
+            baseCommit=run.baseCommit,
+            createdAt=run.createdAt,
+            eventCount=len(run.events),
+            checkCount=len(run.checks),
+            conflictCount=len(evidence.conflicts) if evidence else 0,
+            resolvedConflictCount=sum(1 for item in evidence.conflicts if item.validationState == "passed") if evidence else 0,
+            blockedCommandCount=len(evidence.blockedCommands) if evidence else 0,
+            hasRebaseEvidence=evidence is not None,
+        )
+
+    @staticmethod
+    def _action_summary(action: ActionRecord) -> ActionSummary:
+        evidence = action.rebaseEvidence
+        return ActionSummary(
+            id=action.id,
+            kind=action.kind,
+            repository=action.repository,
+            pullRequestId=action.pullRequestId,
+            pullRequestNumber=action.pullRequestNumber,
+            action=action.action,
+            status=action.status,
+            summary=action.summary,
+            parentRunId=action.parentRunId,
+            workspacePath=action.workspacePath,
+            baseCommit=action.baseCommit,
+            createdAt=action.createdAt,
+            eventCount=len(action.events),
+            checkCount=len(action.checks),
+            conflictCount=len(evidence.conflicts) if evidence else 0,
+            resolvedConflictCount=sum(1 for item in evidence.conflicts if item.validationState == "passed") if evidence else 0,
+            blockedCommandCount=len(evidence.blockedCommands) if evidence else 0,
+            hasRebaseEvidence=evidence is not None,
+            pushRef=action.pushRef,
         )
 
     def _normalize_pull_request(self, pull_request: PullRequest, data: PersistedAppData) -> PullRequest:

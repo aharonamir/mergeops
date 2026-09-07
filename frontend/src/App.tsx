@@ -18,8 +18,8 @@ import {
   FileSearch,
   GitCompare
 } from "lucide-react";
-import { approveAgentRun, cancelAgentRun, checkBackendHealth, clearAction, createAgentRun, createCheckout, createTeamMember, deleteTeamMember, loadAppData, pushAgentRun, reviewPatch, syncGitHub, updateAgentSettings, updateGitHubSettings, updateTeamMember } from "./api";
-import type { ActionRecord, ActivityEvent, AgentBackend, AgentRun, AgentSettings, AppData, GitHubSettings, GitHubSyncResult, PullRequest, QueueFilter, RepositoryConfig, TeamMember, ThemePreference, View } from "./types";
+import { approveAgentRun, cancelAgentRun, checkBackendHealth, clearAction, createAgentRun, createCheckout, createTeamMember, deleteTeamMember, loadActionDetails, loadAppData, pushAgentRun, reviewPatch, syncGitHub, updateAgentSettings, updateGitHubSettings, updateTeamMember } from "./api";
+import type { ActionRecord, ActivityEvent, AgentBackend, AgentRun, AgentRunSummary, AgentSettings, AppData, ConflictEvidence, GitHubSettings, GitHubSyncResult, PullRequest, QueueFilter, RepositoryConfig, TeamMember, ThemePreference, View } from "./types";
 
 const themeIcons = {
   system: Monitor,
@@ -109,6 +109,10 @@ function actionFromRun(run: AgentRun): ActionRecord {
   return { id: run.id, kind: "agent_run", repository: run.repository, pullRequestId: run.pullRequestId, pullRequestNumber: run.pullRequestNumber, action: run.action, status: run.status, summary: run.summary, parentRunId: run.parentRunId, agentOutput: run.agentOutput, workspacePath: run.workspacePath, baseCommit: run.baseCommit, events: run.events, patchSummary: run.patchSummary, diff: run.diff, checks: run.checks, riskSummary: run.riskSummary, approval: run.approval, pushRef: run.pushRef, createdAt: run.createdAt };
 }
 
+function actionFromSummary(run: AgentRunSummary): ActionRecord {
+  return { id: run.id, kind: "agent_run", repository: run.repository, pullRequestId: run.pullRequestId, pullRequestNumber: run.pullRequestNumber, action: run.action, status: run.status, summary: run.summary, parentRunId: run.parentRunId, workspacePath: run.workspacePath, baseCommit: run.baseCommit, eventCount: run.eventCount, checkCount: run.checkCount, conflictCount: run.conflictCount, resolvedConflictCount: run.resolvedConflictCount, blockedCommandCount: run.blockedCommandCount, hasRebaseEvidence: run.hasRebaseEvidence, createdAt: run.createdAt };
+}
+
 export function App() {
   const [data, setData] = useState<AppData | null>(null);
   const [activeView, setActiveView] = useState<View>("cockpit");
@@ -120,11 +124,14 @@ export function App() {
   const [dateRange, setDateRange] = useState<number | "all">(60);
   const [query, setQuery] = useState("");
   const [selectedPr, setSelectedPr] = useState<PullRequest | null>(null);
-  const [runs, setRuns] = useState<AgentRun[]>([]);
+  const [runs, setRuns] = useState<Array<AgentRun | AgentRunSummary>>([]);
   const [actions, setActions] = useState<ActionRecord[]>([]);
   const [activity, setActivity] = useState<ActivityEvent[]>([]);
   const [checkoutMessage, setCheckoutMessage] = useState("");
   const [diffAction, setDiffAction] = useState<ActionRecord | null>(null);
+  const [detailsAction, setDetailsAction] = useState<ActionRecord | null>(null);
+  const [details, setDetails] = useState<AgentRun | ActionRecord | null>(null);
+  const [detailsLoading, setDetailsLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [syncMessage, setSyncMessage] = useState("");
   const [backendStatus, setBackendStatus] = useState<"checking" | "online" | "offline">("checking");
@@ -133,7 +140,7 @@ export function App() {
     loadAppData().then((payload) => {
       setData(payload);
       setRuns(payload.agentRuns);
-      setActions(payload.actions ?? payload.agentRuns.map(actionFromRun));
+      setActions(payload.actions ?? payload.agentRuns.map(actionFromSummary));
       setActivity(payload.activity ?? []);
     });
   }, []);
@@ -159,7 +166,7 @@ export function App() {
       loadAppData().then((payload) => {
         setData(payload);
         setRuns(payload.agentRuns);
-        setActions(payload.actions ?? payload.agentRuns.map(actionFromRun));
+        setActions(payload.actions ?? payload.agentRuns.map(actionFromSummary));
         setActivity(payload.activity ?? []);
       });
     }, 750);
@@ -280,7 +287,7 @@ export function App() {
     const payload = await loadAppData();
     setData(payload);
     setRuns(payload.agentRuns);
-    setActions(payload.actions ?? payload.agentRuns.map(actionFromRun));
+    setActions(payload.actions ?? payload.agentRuns.map(actionFromSummary));
     setActivity(payload.activity ?? []);
     return result;
   }
@@ -329,6 +336,19 @@ export function App() {
     setActions((current) => [actionFromRun(run), ...current]);
     const refreshed = await loadAppData();
     setActivity(refreshed.activity ?? []);
+  }
+
+  async function showRunDetails(action: ActionRecord) {
+    setDetailsAction(action);
+    setDetails(null);
+    setDetailsLoading(true);
+    try {
+      setDetails(await loadActionDetails(action.id));
+    } catch {
+      setDetails(null);
+    } finally {
+      setDetailsLoading(false);
+    }
   }
 
   return (
@@ -407,7 +427,7 @@ export function App() {
           />
         )}
         {activeView === "team" && <TeamWorkspace members={data.teamMembers} onSaveMember={saveTeamMember} onAddMember={addTeamMember} onDeleteMember={removeTeamMember} />}
-        {activeView === "agents" && <ActionsView actions={actions} onClear={removeAction} onStop={stopRun} onApprove={approveRun} onPush={pushRun} onReviewPatch={reviewRunPatch} onShowDiff={setDiffAction} />}
+        {activeView === "agents" && <ActionsView actions={actions} onClear={removeAction} onStop={stopRun} onApprove={approveRun} onPush={pushRun} onReviewPatch={reviewRunPatch} onShowDetails={showRunDetails} />}
         {activeView === "activity" && <ActivityView events={activity} />}
         {activeView === "settings" && (
           <SettingsView
@@ -446,6 +466,7 @@ export function App() {
         />
       )}
       {diffAction ? <DiffDialog action={diffAction} onClose={() => setDiffAction(null)} onReviewPatch={reviewRunPatch} /> : null}
+      {detailsAction ? <RunDetailsDrawer action={detailsAction} details={details} loading={detailsLoading} onClose={() => { setDetailsAction(null); setDetails(null); }} onShowDiff={setDiffAction} /> : null}
     </div>
   );
 }
@@ -769,7 +790,7 @@ function draftToNewMember(draft: TeamMemberDraft): Omit<TeamMember, "id"> {
   };
 }
 
-function ActionsView({ actions, onClear, onStop, onApprove, onPush, onReviewPatch, onShowDiff }: { actions: ActionRecord[]; onClear: (actionId: string) => Promise<void>; onStop: (runId: string) => Promise<void>; onApprove: (runId: string) => Promise<void>; onPush: (runId: string) => Promise<void>; onReviewPatch: (runId: string) => Promise<void>; onShowDiff: (action: ActionRecord) => void }) {
+function ActionsView({ actions, onClear, onStop, onApprove, onPush, onReviewPatch, onShowDetails }: { actions: ActionRecord[]; onClear: (actionId: string) => Promise<void>; onStop: (runId: string) => Promise<void>; onApprove: (runId: string) => Promise<void>; onPush: (runId: string) => Promise<void>; onReviewPatch: (runId: string) => Promise<void>; onShowDetails: (action: ActionRecord) => Promise<void> }) {
   const terminalStatuses = new Set(["ready", "failed", "cancelled", "pushed", "approved", "awaiting_approval", "patch_ready", "review_ready"]);
   return (
     <section className="view is-visible" aria-labelledby="agentsTitle">
@@ -787,16 +808,43 @@ function ActionsView({ actions, onClear, onStop, onApprove, onPush, onReviewPatc
               <p>{action.summary}</p>
               {action.workspacePath ? <span className="action-meta">Workspace: {action.workspacePath} · base {action.baseCommit?.slice(0, 12) ?? "unknown"}</span> : null}
               {action.parentRunId ? <span className="action-meta">Review of {action.parentRunId}</span> : null}
-              {action.patchSummary ? <div className="review-material"><strong>Patch</strong><span>{action.patchSummary}</span>{action.riskSummary ? <span>Risk: {action.riskSummary}</span> : null}{action.checks?.map((check) => <span className={`check-result ${check.status}`} key={`${action.id}-${check.name}`}>{check.name}: {check.status}</span>)}</div> : null}
-              {action.agentOutput ? <details className="agent-output"><summary>Agent output</summary><pre>{action.agentOutput}</pre></details> : null}
-              {action.events?.length ? <details className="run-events"><summary>{action.events.length} recorded events</summary><ol>{action.events.map((event) => <li key={`${action.id}-${event.sequence}`}><span>{event.type}</span><p>{event.message}</p><time dateTime={event.createdAt}>{new Date(event.createdAt).toLocaleTimeString()}</time></li>)}</ol></details> : null}
+              {(action.eventCount || action.checkCount || action.hasRebaseEvidence) ? <span className="action-meta">{action.eventCount ?? 0} events · {action.checkCount ?? 0} checks{action.hasRebaseEvidence ? ` · ${action.resolvedConflictCount ?? 0}/${action.conflictCount ?? 0} conflicts resolved` : ""}</span> : null}
             </div>
-            <div className="action-controls"><span className="status agent">{action.status.replace("_", " ")}</span>{action.diff ? <button className="secondary-btn" type="button" onClick={() => onShowDiff(action)}><GitCompare size={16} /><span>Show changes</span></button> : null}{action.status === "patch_ready" ? <button className="secondary-btn" type="button" onClick={() => onReviewPatch(action.id)}><FileSearch size={16} /><span>Review patch</span></button> : null}{action.status === "patch_ready" ? <button className="primary-btn" type="button" onClick={() => onApprove(action.id)}>Approve</button> : null}{action.status === "approved" ? <button className="primary-btn" type="button" onClick={() => onPush(action.id)}>Push</button> : null}{terminalStatuses.has(action.status) ? <button className="icon-btn" type="button" onClick={() => onClear(action.id)} aria-label={`Clear ${action.kind} action`} title="Clear action and workspace"><Trash2 size={16} /></button> : <button className="secondary-btn" type="button" onClick={() => onStop(action.id)}>Stop</button>}</div>
+            <div className="action-controls"><span className="status agent">{action.status.replace("_", " ")}</span><button className="secondary-btn" type="button" onClick={() => void onShowDetails(action)}><FileSearch size={16} /><span>Run details</span></button>{action.status === "patch_ready" ? <button className="secondary-btn" type="button" onClick={() => onReviewPatch(action.id)}><FileSearch size={16} /><span>Review patch</span></button> : null}{action.status === "patch_ready" ? <button className="primary-btn" type="button" onClick={() => onApprove(action.id)}>Approve</button> : null}{action.status === "approved" ? <button className="primary-btn" type="button" onClick={() => onPush(action.id)}>Push</button> : null}{terminalStatuses.has(action.status) ? <button className="icon-btn" type="button" onClick={() => onClear(action.id)} aria-label={`Clear ${action.kind} action`} title="Clear action and workspace"><Trash2 size={16} /></button> : <button className="secondary-btn" type="button" onClick={() => onStop(action.id)}>Stop</button>}</div>
           </article>
         ))}
       </div>
     </section>
   );
+}
+
+function RunDetailsDrawer({ action, details, loading, onClose, onShowDiff }: { action: ActionRecord; details: AgentRun | ActionRecord | null; loading: boolean; onClose: () => void; onShowDiff: (action: ActionRecord) => void }) {
+  const run = details && "backendId" in details ? details : null;
+  const evidence = run?.rebaseEvidence;
+  const detailAction: ActionRecord = run ? actionFromRun(run) : action;
+  const transcript = evidence?.transcript.text || run?.agentOutput;
+  return (
+    <div className="drawer-layer" role="presentation">
+      <aside className="run-details-drawer" role="dialog" aria-modal="true" aria-labelledby="runDetailsTitle">
+        <header className="drawer-head"><div><span className="eyebrow">Run details</span><h2 id="runDetailsTitle">{action.repository} #{action.pullRequestNumber}</h2><span>{action.id} · {action.action.replace(/_/g, " ")}</span></div><button className="icon-btn" onClick={onClose} aria-label="Close run details"><X size={18} /></button></header>
+        {loading ? <div className="drawer-loading">Loading evidence…</div> : !run ? (details ? <div className="run-details-body"><section className="detail-overview"><span className="status agent">{details.status.replace(/_/g, " ")}</span><p>{details.summary}</p><div className="detail-facts"><span>Workspace <strong>{details.workspacePath ?? "not created"}</strong></span><span>Base commit <strong>{details.baseCommit?.slice(0, 12) ?? "unknown"}</strong></span><span>Events <strong>{details.events?.length ?? 0}</strong></span></div></section><p className="empty-state">This action has no agent-owned rebase evidence.</p></div> : <div className="drawer-loading">Details are unavailable for this run.</div>) : <div className="run-details-body">
+          <section className="detail-overview"><span className={`status agent ${run.status === "failed" ? "is-failed" : ""}`}>{run.status.replace(/_/g, " ")}</span><p>{run.summary}</p><div className="detail-facts"><span>Base commit <strong>{run.baseCommit?.slice(0, 12) ?? "unknown"}</strong></span><span>Workspace <strong>{run.workspacePath ?? "not created"}</strong></span><span>Checks <strong>{run.checks?.filter((check) => check.status === "passed").length ?? 0}/{run.checks?.length ?? 0} passed</strong></span></div></section>
+          {evidence ? <>
+            <section className="detail-section"><div className="section-title"><h3>Agent-owned rebase timeline</h3><span>{evidence.baseRef ?? "base ref unavailable"} · {evidence.state}</span></div><ol className="timeline">{evidence.stages.map((stage) => <li key={`${stage.sequence}-${stage.type}`}><span className="timeline-dot" /><div><strong>{stage.type.replace(/_/g, " ")}</strong><p>{stage.message}</p><time>{new Date(stage.createdAt).toLocaleString()}</time></div></li>)}</ol></section>
+            <section className="detail-section"><div className="section-title"><h3>Conflict resolutions</h3><span>{evidence.conflicts.length} captured</span></div>{evidence.conflicts.length ? evidence.conflicts.map((conflict) => <ConflictRow key={conflict.id} conflict={conflict} />) : <p className="empty-state compact">No conflicts were encountered.</p>}</section>
+            {evidence.validation.length ? <section className="detail-section"><div className="section-title"><h3>Validation</h3></div><ul className="validation-list">{evidence.validation.map((message, index) => <li key={`${message}-${index}`}>{message}</li>)}</ul></section> : null}
+            {evidence.blockedCommands.length ? <section className="detail-section"><div className="section-title"><h3>Blocked commands</h3></div><p className="blocked-note">{evidence.blockedCommands.map((command) => `git ${command}`).join(" · ")}</p></section> : null}
+          </> : null}
+          <section className="detail-section"><div className="section-title"><h3>Patch, checks, risk, and approval</h3>{detailAction.diff ? <button className="secondary-btn" type="button" onClick={() => onShowDiff(detailAction)}><GitCompare size={15} /> Show patch</button> : null}</div>{run.patchSummary ? <p>{run.patchSummary}</p> : null}{run.riskSummary ? <p className="risk-copy">Risk: {run.riskSummary}</p> : null}{run.approval ? <p>Approved by <strong>{run.approval.reviewer}</strong> on {new Date(run.approval.createdAt).toLocaleString()}.</p> : <p className="drawer-meta">No approval recorded.</p>}{run.pushRef ? <p>Pushed to <code>{run.pushRef}</code>.</p> : null}<div className="check-list">{run.checks?.map((check) => <div className="check-row" key={check.name}><span className={`check-result ${check.status}`}>{check.status}</span><strong>{check.name}</strong><span>{check.summary}</span></div>)}</div></section>
+          {transcript ? <section className="detail-section"><details className="agent-output"><summary>Raw agent transcript</summary><pre>{transcript}</pre>{evidence?.transcript.truncated ? <small>Transcript truncated · {evidence.transcript.originalLength.toLocaleString()} chars</small> : null}</details></section> : null}
+        </div>}
+      </aside><button className="drawer-scrim" type="button" aria-label="Close run details" onClick={onClose} />
+    </div>
+  );
+}
+
+function ConflictRow({ conflict }: { conflict: ConflictEvidence }) {
+  return <details className="conflict-row"><summary><span>{conflict.filePath}</span><span className={`classification ${conflict.classification}`}>{conflict.classification}</span><span className={`validation-state ${conflict.validationState}`}>{conflict.validationState}</span></summary><div className="conflict-meta">{conflict.commitSubject ?? "Commit unavailable"} {conflict.commitSha ? `· ${conflict.commitSha.slice(0, 12)}` : ""}</div><div className="comparison-grid">{(["ours", "theirs", "result"] as const).map((key) => <div className="comparison-pane" key={key}><strong>{key[0].toUpperCase() + key.slice(1)}</strong><pre>{conflict[key].text || (key === "result" ? "(deleted)" : "(empty)")}</pre>{conflict[key].truncated ? <small>Snapshot truncated · {conflict[key].originalLength.toLocaleString()} chars</small> : null}</div>)}</div>{conflict.agentExplanation ? <p className="agent-explanation">{conflict.agentExplanation}</p> : null}</details>;
 }
 
 function DiffDialog({ action, onClose, onReviewPatch }: { action: ActionRecord; onClose: () => void; onReviewPatch: (runId: string) => Promise<void> }) {

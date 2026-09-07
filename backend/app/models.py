@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class TeamMember(BaseModel):
@@ -117,13 +119,14 @@ class AgentRun(BaseModel):
     backendSessionId: str | None = None
     workspacePath: str | None = None
     baseCommit: str | None = None
-    events: list["AgentRunEvent"] = []
+    events: list["AgentRunEvent"] = Field(default_factory=list)
     patchSummary: str | None = None
     diff: str | None = None
-    checks: list["CheckResult"] = []
+    checks: list["CheckResult"] = Field(default_factory=list)
     riskSummary: str | None = None
     approval: ApprovalRecord | None = None
     pushRef: str | None = None
+    rebaseEvidence: "RebaseEvidence | None" = None
     createdAt: str
 
 
@@ -143,6 +146,47 @@ class CheckResult(BaseModel):
     finishedAt: str
 
 
+class BoundedText(BaseModel):
+    text: str = ""
+    truncated: bool = False
+    originalLength: int = 0
+
+
+class ConflictEvidence(BaseModel):
+    id: str
+    commitSha: str | None = None
+    commitSubject: str | None = None
+    filePath: str
+    ours: BoundedText = Field(default_factory=BoundedText)
+    theirs: BoundedText = Field(default_factory=BoundedText)
+    result: BoundedText = Field(default_factory=BoundedText)
+    classification: Literal["ours", "theirs", "combined", "manual", "added", "deleted", "unknown"] = "unknown"
+    validationState: Literal["passed", "failed", "unknown"] = "unknown"
+    agentExplanation: str | None = None
+    createdAt: str
+
+
+class RebaseStage(BaseModel):
+    sequence: int
+    type: str
+    message: str
+    createdAt: str
+    commitSha: str | None = None
+
+
+class RebaseEvidence(BaseModel):
+    baseRef: str | None = None
+    initialHead: str | None = None
+    finalHead: str | None = None
+    state: Literal["not_applicable", "running", "completed", "failed", "cancelled"] = "not_applicable"
+    stages: list[RebaseStage] = Field(default_factory=list)
+    conflicts: list[ConflictEvidence] = Field(default_factory=list)
+    blockedCommands: list[str] = Field(default_factory=list)
+    validation: list[str] = Field(default_factory=list)
+    diff: BoundedText = Field(default_factory=BoundedText)
+    transcript: BoundedText = Field(default_factory=BoundedText)
+
+
 class ActionRecord(BaseModel):
     id: str
     kind: Literal["checkout", "agent_run"]
@@ -156,14 +200,59 @@ class ActionRecord(BaseModel):
     agentOutput: str | None = None
     workspacePath: str | None = None
     baseCommit: str | None = None
-    events: list[AgentRunEvent] = []
+    events: list[AgentRunEvent] = Field(default_factory=list)
     patchSummary: str | None = None
     diff: str | None = None
-    checks: list[CheckResult] = []
+    checks: list[CheckResult] = Field(default_factory=list)
     riskSummary: str | None = None
     approval: ApprovalRecord | None = None
     pushRef: str | None = None
+    rebaseEvidence: RebaseEvidence | None = None
     createdAt: str
+
+
+class AgentRunSummary(BaseModel):
+    id: str
+    backendId: str
+    repository: str
+    pullRequestId: str
+    pullRequestNumber: int
+    action: str
+    status: str
+    requester: str
+    summary: str
+    parentRunId: str | None = None
+    workspacePath: str | None = None
+    baseCommit: str | None = None
+    createdAt: str
+    eventCount: int = 0
+    checkCount: int = 0
+    conflictCount: int = 0
+    resolvedConflictCount: int = 0
+    blockedCommandCount: int = 0
+    hasRebaseEvidence: bool = False
+
+
+class ActionSummary(BaseModel):
+    id: str
+    kind: Literal["checkout", "agent_run"]
+    repository: str
+    pullRequestId: str
+    pullRequestNumber: int
+    action: str
+    status: str
+    summary: str
+    parentRunId: str | None = None
+    workspacePath: str | None = None
+    baseCommit: str | None = None
+    createdAt: str
+    eventCount: int = 0
+    checkCount: int = 0
+    conflictCount: int = 0
+    resolvedConflictCount: int = 0
+    blockedCommandCount: int = 0
+    hasRebaseEvidence: bool = False
+    pushRef: str | None = None
 
 
 class ActivityEvent(BaseModel):
@@ -179,8 +268,8 @@ class AppData(BaseModel):
     pullRequests: list[PullRequest]
     agentBackends: list[AgentBackend]
     agentSettings: AgentSettings = AgentSettings()
-    agentRuns: list[AgentRun]
-    actions: list[ActionRecord] = []
+    agentRuns: list[AgentRunSummary]
+    actions: list[ActionSummary] = []
     activity: list[ActivityEvent] = []
     approvals: list[ApprovalRecord] = []
     github: GitHubSettingsPublic | None = None

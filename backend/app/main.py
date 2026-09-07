@@ -33,6 +33,14 @@ async def get_app_data() -> AppData:
     return store.app_data()
 
 
+@app.get("/api/actions/{action_id}/details")
+async def get_action_details(action_id: str):
+    try:
+        return store.action_details(action_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @app.post("/api/agent-runs")
 async def post_agent_run(payload: CreateAgentRunRequest) -> AgentRun:
     try:
