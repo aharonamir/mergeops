@@ -2,6 +2,7 @@ declare const process: {
   stdin: AsyncIterable<Uint8Array>;
   stdout: { write(chunk: string): void };
   stderr: { write(chunk: string): void };
+  env: Record<string, string | undefined>;
   exitCode?: number;
 };
 
@@ -48,6 +49,10 @@ async function main() {
 }
 
 async function runOpenCode(input: RunnerInput) {
+  if (input.action === "fix_conflicts") {
+    await runOpenCodeCli(input);
+    return;
+  }
   let server: { close(): void } | undefined;
   try {
     emit({ type: "log", message: "Loading OpenCode SDK" });
@@ -96,6 +101,54 @@ async function runOpenCode(input: RunnerInput) {
     emitFinal("failed", runnerFailureSummary("OpenCode", error));
   } finally {
     server?.close();
+  }
+}
+
+async function runOpenCodeCli(input: RunnerInput) {
+  try {
+    emit({ type: "log", message: "Starting OpenCode CLI in execution mode" });
+    const { spawn } = await dynamicImport<{ spawn: (command: string, args: string[], options: Record<string, unknown>) => any }>("node:child_process");
+    const child = spawn(
+      "opencode",
+      [
+        "run",
+        "--auto",
+        "--model",
+        "deepseek/deepseek-v4-flash",
+        "--variant",
+        "minimal",
+        "--format",
+        "json",
+        "--dir",
+        input.repositoryLocalPath,
+        buildPrompt(input),
+      ],
+      {
+        cwd: input.repositoryLocalPath,
+        env: process.env,
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Uint8Array) => { stdout += new TextDecoder().decode(chunk); });
+    child.stderr.on("data", (chunk: Uint8Array) => { stderr += new TextDecoder().decode(chunk); });
+    const result = await new Promise<{ code: number | null; signal: string | null }>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code: number | null, signal: string | null) => resolve({ code, signal }));
+    });
+    if (result.code !== 0) {
+      throw new Error(stderr.trim() || `CLI exited with code ${result.code ?? "unknown"}${result.signal ? ` (${result.signal})` : ""}`);
+    }
+    emit({ type: "log", message: "OpenCode CLI completed" });
+    emitFinal(
+      "awaiting_approval",
+      `OpenCode completed for ${input.repository}#${input.pullRequestNumber}. Review the local diff before approval.`,
+      undefined,
+      stdout.trim().slice(-20000) || undefined,
+    );
+  } catch (error) {
+    emitFinal("failed", runnerFailureSummary("OpenCode", error));
   }
 }
 
@@ -207,7 +260,7 @@ function buildPrompt(input: RunnerInput) {
     ? "Do not manually create commits. It is required to stage resolved conflict files and run git rebase --continue; that command creates the rebased commit. Do not push, merge, or open a pull request. Leave the workspace for human approval."
     : "Do not stage, commit, push, merge, or open a pull request. Leave the workspace for human approval.";
   const scope = input.action === "fix_conflicts"
-    ? `Act immediately with shell commands; do not inspect the repository broadly. MergeOps has already started git rebase onto the base branch. The rebase may stop more than once across multiple commits. While the rebase is in progress, repeatedly run git status and git diff --name-only --diff-filter=U, resolve only the currently unmerged files reported by Git, remove every conflict marker, stage only those resolved files, and run GIT_EDITOR=true git rebase --continue. Initial unmerged files: ${(input.conflictFiles ?? []).join(", ") || "the files reported by Git"}. Stop only when the rebase completes. NEVER run git merge or start a second rebase. Verify git diff --name-only --diff-filter=U is empty, run the relevant checks, and stop immediately. Do not touch any unrelated file.`
+    ? `This is a deterministic conflict-resolution task, not a repository investigation. Your first shell command MUST be: git status --short && git diff --name-only --diff-filter=U. Do not run git log, git show, revision-to-revision diff, or inspect unrelated source before the first conflict file is edited and staged. MergeOps has already started git rebase onto the base branch. Resolve only the current conflict hunks using the files and markers Git reports, remove every conflict marker, stage only those resolved files, and immediately run GIT_EDITOR=true git rebase --continue. The rebase may stop more than once across multiple commits, so repeat the same status, edit, stage, continue loop until it completes. Initial unmerged files: ${(input.conflictFiles ?? []).join(", ") || "the files reported by Git"}. Prioritize completing the rebase with the smallest conflict resolution that preserves the incoming PR change. NEVER run git merge or start a second rebase. Verify git diff --name-only --diff-filter=U is empty and stop immediately. Do not touch any unrelated file.`
     : input.action === "rebase"
       ? "MergeOps has already started git rebase onto the base branch. If the rebase is paused on conflicts, resolve only those conflicts and run git rebase --continue until it completes. NEVER run git merge or start a second rebase. Keep the change narrowly scoped to the rebase and checks, then stop."
       : input.action === "review_patch"
@@ -218,7 +271,11 @@ function buildPrompt(input: RunnerInput) {
     `Repository path: ${input.repositoryLocalPath}.`,
     input.sourceBranch ? `Source branch: ${input.sourceBranch}.` : "",
     input.baseBranch ? `Base branch: ${input.baseBranch}.` : "",
-    input.action === "review_patch" ? "Inspect the supplied patch context and produce a review. Do not make changes." : "Inspect the repo and prepare the smallest patch and checks summary.",
+    input.action === "review_patch"
+      ? "Inspect the supplied patch context and produce a review. Do not make changes."
+      : input.action === "fix_conflicts"
+        ? "Resolve the active rebase now. Do not perform broad repository research or inspect unrelated history."
+        : "Inspect the repo and prepare the smallest patch and checks summary.",
     input.previousAgentOutput ? `Previous agent output:\n${input.previousAgentOutput.slice(-12000)}` : "",
     input.reviewDiff ? `Prepared diff to review:\n${input.reviewDiff.slice(-40000)}` : "",
     scope,

@@ -409,8 +409,8 @@ class SubprocessAgentAdapter:
             "    *) command=\"$arg\"; break ;;\n"
             "  esac\n"
             "done\n"
-            "if [ \"$command\" = \"merge\" ]; then\n"
-            "  echo 'MergeOps guard: git merge is disabled; use git rebase for conflict fixes.' >&2\n"
+            "if [ \"$command\" = \"merge\" ] || [ \"$command\" = \"push\" ]; then\n"
+            "  echo 'MergeOps guard: git merge and git push are disabled inside agent runs.' >&2\n"
             "  exit 64\n"
             "fi\n"
             f"exec {shlex.quote(git_path)} \"$@\"\n",
