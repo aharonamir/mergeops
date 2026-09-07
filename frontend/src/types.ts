@@ -79,10 +79,11 @@ export type AgentRun = {
   repository: string;
   pullRequestId: string;
   pullRequestNumber: number;
-  action: "analyze" | "rebase" | "fix_conflicts" | "address_review" | "fix_checks";
-  status: "queued" | "running" | "patch_ready" | "checks_running" | "awaiting_approval" | "approved" | "pushed" | "failed" | "cancelled";
+  action: "analyze" | "rebase" | "fix_conflicts" | "address_review" | "fix_checks" | "review_patch";
+  status: "queued" | "running" | "patch_ready" | "review_ready" | "checks_running" | "awaiting_approval" | "approved" | "pushed" | "failed" | "cancelled";
   requester: string;
   summary: string;
+  parentRunId?: string | null;
   agentOutput?: string | null;
   backendSessionId?: string | null;
   workspacePath?: string | null;
@@ -131,6 +132,7 @@ export type ActionRecord = {
   action: string;
   status: string;
   summary: string;
+  parentRunId?: string | null;
   agentOutput?: string | null;
   workspacePath?: string | null;
   baseCommit?: string | null;

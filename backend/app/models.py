@@ -97,11 +97,12 @@ class AgentRun(BaseModel):
     repository: str
     pullRequestId: str
     pullRequestNumber: int
-    action: Literal["analyze", "rebase", "fix_conflicts", "address_review", "fix_checks"]
+    action: Literal["analyze", "rebase", "fix_conflicts", "address_review", "fix_checks", "review_patch"]
     status: Literal[
         "queued",
         "running",
         "patch_ready",
+        "review_ready",
         "checks_running",
         "awaiting_approval",
         "approved",
@@ -111,6 +112,7 @@ class AgentRun(BaseModel):
     ]
     requester: str
     summary: str
+    parentRunId: str | None = None
     agentOutput: str | None = None
     backendSessionId: str | None = None
     workspacePath: str | None = None
@@ -150,6 +152,7 @@ class ActionRecord(BaseModel):
     action: str
     status: str
     summary: str
+    parentRunId: str | None = None
     agentOutput: str | None = None
     workspacePath: str | None = None
     baseCommit: str | None = None
@@ -186,7 +189,11 @@ class AppData(BaseModel):
 class CreateAgentRunRequest(BaseModel):
     backendId: str
     pullRequestId: str
-    action: Literal["analyze", "rebase", "fix_conflicts", "address_review", "fix_checks"]
+    action: Literal["analyze", "rebase", "fix_conflicts", "address_review", "fix_checks", "review_patch"]
+
+
+class CreatePatchReviewRequest(BaseModel):
+    backendId: str
 
 
 class UpdateAgentSettingsRequest(BaseModel):

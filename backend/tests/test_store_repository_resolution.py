@@ -35,6 +35,22 @@ class CapturingAdapter:
         )
 
 
+class ReviewCapturingAdapter(CapturingAdapter):
+    def create_run(self, request: AgentRunRequest, on_event=None, cancel_event=None) -> AgentRunResult:
+        self.requests.append(request)
+        event = {"type": "log", "message": "reviewed patch", "createdAt": "2026-01-01T00:00:00+00:00"}
+        if on_event:
+            on_event(event)
+        return AgentRunResult(
+            status="review_ready",
+            summary="Patch review is ready.",
+            output="Review finding: patch is acceptable.",
+            backend_session_id="session-review",
+            workspace_path=request.existing_workspace_path,
+            events=[event],
+        )
+
+
 class StoreRepositoryResolutionTest(unittest.TestCase):
     def test_legacy_check_command_is_not_loaded_as_repository_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -231,6 +247,40 @@ class StoreRepositoryResolutionTest(unittest.TestCase):
             self.assertEqual(result.status, "cancelled")
             self.assertEqual([event["type"] for event in seen], ["log", "cancelled"])
 
+    def test_review_patch_fails_if_runner_changes_existing_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            workspace = root / "runs" / "run-parent" / "checkout"
+            workspace.mkdir(parents=True)
+            self._git(workspace, "init", "-b", "main")
+            self._git(workspace, "config", "user.email", "test@example.com")
+            self._git(workspace, "config", "user.name", "MergeOps Test")
+            (workspace / "README.md").write_text("original\n", encoding="utf-8")
+            self._git(workspace, "add", "README.md")
+            self._git(workspace, "commit", "-m", "initial")
+            (workspace / "README.md").write_text("patch\n", encoding="utf-8")
+            runner = root / "runner.js"
+            runner.write_text(
+                "process.stdin.resume(); process.stdin.on('end', () => { require('fs').writeFileSync('README.md', 'review changed it\\n'); console.log(JSON.stringify({type: 'final', status: 'review_ready', summary: 'reviewed'})); });\n",
+                encoding="utf-8",
+            )
+            request = AgentRunRequest(
+                run_id="review-readonly",
+                pull_request_id="pr-1",
+                repository="owner/service",
+                pull_request_number=1,
+                action="review_patch",
+                backend_id="opencode",
+                existing_workspace_path=str(workspace),
+                review_diff="diff --git a/README.md b/README.md\n",
+            )
+
+            with patch.object(RunWorkspace, "root", root / "runs"):
+                result = SubprocessAgentAdapter("opencode", runner).create_run(request)
+
+            self.assertEqual(result.status, "failed")
+            self.assertIn("review-only", result.summary)
+
     def test_agent_run_uses_repository_full_name_for_duplicate_repo_names(self) -> None:
         data = self._data(
             PullRequest(
@@ -426,6 +476,64 @@ class StoreRepositoryResolutionTest(unittest.TestCase):
             self.assertEqual(pushed.pushRef, "mergeops/run-push")
             self.assertEqual(store.persisted_data().actions[0].pushRef, "mergeops/run-push")
             self.assertIn("mergeops/run-push", self._git(remote, "for-each-ref", "--format=%(refname:short)").splitlines())
+
+    def test_patch_review_reuses_parent_workspace_and_keeps_it_until_all_actions_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            workspace = root / "runs" / "run-parent" / "checkout"
+            workspace.mkdir(parents=True)
+            self._git(workspace, "init", "-b", "main")
+            self._git(workspace, "config", "user.email", "test@example.com")
+            self._git(workspace, "config", "user.name", "MergeOps Test")
+            (workspace / "README.md").write_text("original\n", encoding="utf-8")
+            self._git(workspace, "add", "README.md")
+            self._git(workspace, "commit", "-m", "initial")
+            parent = AgentRun(
+                id="run-parent",
+                backendId="opencode",
+                repository="owner/service",
+                pullRequestId="pr-review",
+                pullRequestNumber=12,
+                action="fix_conflicts",
+                status="patch_ready",
+                requester="test",
+                summary="Patch ready",
+                agentOutput="Resolved the conflict.",
+                workspacePath=str(workspace),
+                baseCommit="abc123",
+                diff="diff --git a/README.md b/README.md\n",
+                checks=[CheckResult(name="git diff --check", status="passed", summary="ok", startedAt="2026-01-01T00:00:00Z", finishedAt="2026-01-01T00:00:01Z")],
+                patchSummary="README.md | 2 +-",
+                riskSummary="Medium risk: patch requires human review.",
+                createdAt="2026-01-01T00:00:00Z",
+            )
+            data = self._data(PullRequest(
+                id="pr-review", repository="service", repositoryFullName="owner/service", number=12,
+                title="Fix service", author="dev", ownerMemberId="dev", sourceBranch="feature/service", baseBranch="main",
+                state="open", mergeable="conflicting", reviewState="approved", unresolvedCommentCount=0,
+                requestedReviewers=[], checkState="passing", linkedIssueIds=[], changedFilesCount=1, ageDays=1,
+                summary="Ready", searchText="ready",
+            ))
+            data.agentRuns = [parent]
+            data.actions = [ActionRecord(id=parent.id, kind="agent_run", repository=parent.repository, pullRequestId=parent.pullRequestId, pullRequestNumber=parent.pullRequestNumber, action=parent.action, status=parent.status, summary=parent.summary, workspacePath=parent.workspacePath, diff=parent.diff, createdAt=parent.createdAt)]
+            adapter = ReviewCapturingAdapter()
+            store = LocalJsonStore(root / "mergeops.local.json")
+            store._save(data)
+
+            with patch.object(RunWorkspace, "root", root / "runs"):
+                with patch("app.store.adapter_registry", return_value={"opencode": adapter}):
+                    review = store.queue_patch_review("opencode", parent.id)
+                    completed = store.execute_patch_review(review.id, "opencode", parent.id)
+                    store.clear_action(completed.id)
+                    self.assertTrue(workspace.exists())
+                    store.clear_action(parent.id)
+                    self.assertFalse(workspace.exists())
+
+            self.assertEqual(completed.status, "review_ready")
+            self.assertEqual(completed.parentRunId, parent.id)
+            self.assertEqual(adapter.requests[0].existing_workspace_path, str(workspace))
+            self.assertEqual(adapter.requests[0].review_diff, parent.diff)
+            self.assertEqual(adapter.requests[0].previous_agent_output, parent.agentOutput)
 
     def _data(self, pull_request: PullRequest) -> PersistedAppData:
         repositories = [

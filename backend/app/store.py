@@ -74,6 +74,124 @@ class LocalJsonStore:
         run = self.queue_agent_run(backend_id, pull_request_id, action)
         return self.execute_agent_run(run.id, backend_id, pull_request_id, action)
 
+    def queue_patch_review(self, backend_id: str, parent_run_id: str) -> AgentRun:
+        data = self._load()
+        parent = next((item for item in data.agentRuns if item.id == parent_run_id), None)
+        if parent is None:
+            raise ValueError("Unknown agent run")
+        if not parent.workspacePath:
+            raise ValueError("Run has no isolated workspace to review")
+        if not parent.diff or not parent.diff.strip():
+            raise ValueError("Run has no patch diff to review")
+        enabled_backends = adapter_registry(
+            [(backend.id, backend.endpoint) for backend in data.agentBackends if backend.enabled]
+        )
+        if backend_id not in enabled_backends:
+            raise ValueError("Unknown agent backend")
+        run_id = f"review-{uuid4().hex[:12]}"
+        created_at = utc_now()
+        run = AgentRun(
+            id=run_id,
+            backendId=backend_id,
+            repository=parent.repository,
+            pullRequestId=parent.pullRequestId,
+            pullRequestNumber=parent.pullRequestNumber,
+            action="review_patch",
+            status="queued",
+            requester="local user",
+            summary=f"Queued patch review for {parent.repository}#{parent.pullRequestNumber}.",
+            parentRunId=parent.id,
+            workspacePath=parent.workspacePath,
+            baseCommit=parent.baseCommit,
+            events=[AgentRunEvent(sequence=1, type="queued", message="Patch review queued; waiting for an available worker.", createdAt=created_at)],
+            patchSummary=parent.patchSummary,
+            diff=parent.diff,
+            checks=parent.checks,
+            riskSummary=parent.riskSummary,
+            createdAt=created_at,
+        )
+        data.agentRuns.insert(0, run)
+        data.actions.insert(0, ActionRecord(
+            id=run.id,
+            kind="agent_run",
+            repository=run.repository,
+            pullRequestId=run.pullRequestId,
+            pullRequestNumber=run.pullRequestNumber,
+            action=run.action,
+            status=run.status,
+            summary=run.summary,
+            parentRunId=run.parentRunId,
+            workspacePath=run.workspacePath,
+            baseCommit=run.baseCommit,
+            events=run.events,
+            patchSummary=run.patchSummary,
+            diff=run.diff,
+            checks=run.checks,
+            riskSummary=run.riskSummary,
+            createdAt=run.createdAt,
+        ))
+        data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="agent_run", message=f"Patch review for {parent.repository}#{parent.pullRequestNumber} was queued.", actionId=run.id, createdAt=run.createdAt))
+        self._cancel_events[run.id] = Event()
+        self._save(data)
+        return run
+
+    def execute_patch_review(self, run_id: str, backend_id: str, parent_run_id: str) -> AgentRun:
+        data = self._load()
+        parent = next((item for item in data.agentRuns if item.id == parent_run_id), None)
+        run = next((item for item in data.agentRuns if item.id == run_id), None)
+        if parent is None or run is None:
+            raise ValueError("Unknown patch review run")
+        pull_request = next((item for item in data.pullRequests if item.id == parent.pullRequestId), None)
+        if pull_request is None:
+            raise ValueError("Unknown pull request")
+        adapter = adapter_registry([(backend.id, backend.endpoint) for backend in data.agentBackends if backend.enabled]).get(backend_id)
+        if adapter is None:
+            raise ValueError("Unknown agent backend")
+        cancel_event = self._cancel_events.setdefault(run_id, Event())
+        started_at = utc_now()
+        running = run.model_copy(update={
+            "status": "running",
+            "summary": "Worker started; reviewing the prepared patch.",
+            "events": [*run.events, AgentRunEvent(sequence=len(run.events) + 1, type="running", message="Worker started; reviewing the prepared patch.", createdAt=started_at)],
+        })
+        data.agentRuns = [running if item.id == run_id else item for item in data.agentRuns]
+        data.actions = [item.model_copy(update={"status": running.status, "summary": running.summary, "events": running.events}) if item.id == run_id else item for item in data.actions]
+        self._save(data)
+        try:
+            result = adapter.create_run(AgentRunRequest(
+                run_id=run_id,
+                pull_request_id=parent.pullRequestId,
+                repository=pull_request.repositoryFullName or parent.repository,
+                pull_request_number=parent.pullRequestNumber,
+                action="review_patch",
+                backend_id=backend_id,
+                existing_workspace_path=parent.workspacePath,
+                base_branch=pull_request.baseBranch,
+                source_branch=pull_request.sourceBranch,
+                review_diff=parent.diff,
+                previous_agent_output=parent.agentOutput,
+                runner_timeout_seconds=data.agentSettings.runnerTimeoutSeconds,
+            ), on_event=lambda event: self.append_agent_event(run_id, event), cancel_event=cancel_event)
+        except Exception as exc:
+            result = AgentRunResult(status="failed", summary=f"Patch review failed: {exc}", events=[{"type": "error", "message": f"Patch review failed: {exc}", "createdAt": utc_now()}])
+        with self._write_lock:
+            data = self._load()
+            current = next((item for item in data.agentRuns if item.id == run_id), running)
+            final_status = "cancelled" if cancel_event.is_set() else result.status
+            updated = current.model_copy(update={
+                "status": final_status,
+                "summary": result.summary,
+                "agentOutput": result.output,
+                "backendSessionId": result.backend_session_id,
+                "workspacePath": parent.workspacePath,
+                "baseCommit": parent.baseCommit,
+            })
+            data.agentRuns = [updated if item.id == run_id else item for item in data.agentRuns]
+            data.actions = [item.model_copy(update={"status": updated.status, "summary": updated.summary, "agentOutput": updated.agentOutput, "workspacePath": updated.workspacePath, "baseCommit": updated.baseCommit, "events": updated.events}) if item.id == run_id else item for item in data.actions]
+            data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="agent_run", message=f"Patch review for {updated.repository}#{updated.pullRequestNumber} is {updated.status}.", actionId=updated.id, createdAt=utc_now()))
+            self._save(data)
+        return updated
+
     def execute_agent_run(self, run_id: str, backend_id: str, pull_request_id: str, action: str) -> AgentRun:
         data = self._load()
         pull_request = next((item for item in data.pullRequests if item.id == pull_request_id), None)
@@ -308,7 +426,7 @@ class LocalJsonStore:
         action = next((item for item in data.actions if item.id == action_id), None)
         if action is None:
             raise ValueError("Unknown action")
-        if action.workspacePath:
+        if action.workspacePath and not any(item.id != action.id and item.workspacePath == action.workspacePath for item in data.actions):
             workspace = Path(action.workspacePath).resolve()
             root = RunWorkspace.root.resolve()
             if root not in workspace.parents:

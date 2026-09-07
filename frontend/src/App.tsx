@@ -14,9 +14,11 @@ import {
   Users,
   X,
   RefreshCw,
-  FolderGit2
+  FolderGit2,
+  FileSearch,
+  GitCompare
 } from "lucide-react";
-import { approveAgentRun, cancelAgentRun, checkBackendHealth, clearAction, createAgentRun, createCheckout, createTeamMember, deleteTeamMember, loadAppData, pushAgentRun, syncGitHub, updateAgentSettings, updateGitHubSettings, updateTeamMember } from "./api";
+import { approveAgentRun, cancelAgentRun, checkBackendHealth, clearAction, createAgentRun, createCheckout, createTeamMember, deleteTeamMember, loadAppData, pushAgentRun, reviewPatch, syncGitHub, updateAgentSettings, updateGitHubSettings, updateTeamMember } from "./api";
 import type { ActionRecord, ActivityEvent, AgentBackend, AgentRun, AgentSettings, AppData, GitHubSettings, GitHubSyncResult, PullRequest, QueueFilter, RepositoryConfig, TeamMember, ThemePreference, View } from "./types";
 
 const themeIcons = {
@@ -104,7 +106,7 @@ function drawerPlan(status: string) {
 }
 
 function actionFromRun(run: AgentRun): ActionRecord {
-  return { id: run.id, kind: "agent_run", repository: run.repository, pullRequestId: run.pullRequestId, pullRequestNumber: run.pullRequestNumber, action: run.action, status: run.status, summary: run.summary, agentOutput: run.agentOutput, workspacePath: run.workspacePath, baseCommit: run.baseCommit, events: run.events, patchSummary: run.patchSummary, diff: run.diff, checks: run.checks, riskSummary: run.riskSummary, approval: run.approval, pushRef: run.pushRef, createdAt: run.createdAt };
+  return { id: run.id, kind: "agent_run", repository: run.repository, pullRequestId: run.pullRequestId, pullRequestNumber: run.pullRequestNumber, action: run.action, status: run.status, summary: run.summary, parentRunId: run.parentRunId, agentOutput: run.agentOutput, workspacePath: run.workspacePath, baseCommit: run.baseCommit, events: run.events, patchSummary: run.patchSummary, diff: run.diff, checks: run.checks, riskSummary: run.riskSummary, approval: run.approval, pushRef: run.pushRef, createdAt: run.createdAt };
 }
 
 export function App() {
@@ -122,6 +124,7 @@ export function App() {
   const [actions, setActions] = useState<ActionRecord[]>([]);
   const [activity, setActivity] = useState<ActivityEvent[]>([]);
   const [checkoutMessage, setCheckoutMessage] = useState("");
+  const [diffAction, setDiffAction] = useState<ActionRecord | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [syncMessage, setSyncMessage] = useState("");
   const [backendStatus, setBackendStatus] = useState<"checking" | "online" | "offline">("checking");
@@ -320,6 +323,14 @@ export function App() {
     setActions((current) => current.map((item) => item.id === run.id ? actionFromRun(run) : item));
   }
 
+  async function reviewRunPatch(runId: string) {
+    const run = await reviewPatch(runId, backendId);
+    setRuns((current) => [run, ...current]);
+    setActions((current) => [actionFromRun(run), ...current]);
+    const refreshed = await loadAppData();
+    setActivity(refreshed.activity ?? []);
+  }
+
   return (
     <div className="app-shell">
       <aside className="side-nav" aria-label="Primary">
@@ -396,7 +407,7 @@ export function App() {
           />
         )}
         {activeView === "team" && <TeamWorkspace members={data.teamMembers} onSaveMember={saveTeamMember} onAddMember={addTeamMember} onDeleteMember={removeTeamMember} />}
-        {activeView === "agents" && <ActionsView actions={actions} onClear={removeAction} onStop={stopRun} onApprove={approveRun} onPush={pushRun} />}
+        {activeView === "agents" && <ActionsView actions={actions} onClear={removeAction} onStop={stopRun} onApprove={approveRun} onPush={pushRun} onReviewPatch={reviewRunPatch} onShowDiff={setDiffAction} />}
         {activeView === "activity" && <ActivityView events={activity} />}
         {activeView === "settings" && (
           <SettingsView
@@ -434,6 +445,7 @@ export function App() {
           checkoutMessage={checkoutMessage}
         />
       )}
+      {diffAction ? <DiffDialog action={diffAction} onClose={() => setDiffAction(null)} onReviewPatch={reviewRunPatch} /> : null}
     </div>
   );
 }
@@ -757,8 +769,8 @@ function draftToNewMember(draft: TeamMemberDraft): Omit<TeamMember, "id"> {
   };
 }
 
-function ActionsView({ actions, onClear, onStop, onApprove, onPush }: { actions: ActionRecord[]; onClear: (actionId: string) => Promise<void>; onStop: (runId: string) => Promise<void>; onApprove: (runId: string) => Promise<void>; onPush: (runId: string) => Promise<void> }) {
-  const terminalStatuses = new Set(["ready", "failed", "cancelled", "pushed", "approved", "awaiting_approval", "patch_ready"]);
+function ActionsView({ actions, onClear, onStop, onApprove, onPush, onReviewPatch, onShowDiff }: { actions: ActionRecord[]; onClear: (actionId: string) => Promise<void>; onStop: (runId: string) => Promise<void>; onApprove: (runId: string) => Promise<void>; onPush: (runId: string) => Promise<void>; onReviewPatch: (runId: string) => Promise<void>; onShowDiff: (action: ActionRecord) => void }) {
+  const terminalStatuses = new Set(["ready", "failed", "cancelled", "pushed", "approved", "awaiting_approval", "patch_ready", "review_ready"]);
   return (
     <section className="view is-visible" aria-labelledby="agentsTitle">
       <div className="view-head">
@@ -774,16 +786,53 @@ function ActionsView({ actions, onClear, onStop, onApprove, onPush }: { actions:
               <strong>{action.kind === "checkout" ? "Checkout" : "Agent run"} · {action.repository} #{action.pullRequestNumber}</strong>
               <p>{action.summary}</p>
               {action.workspacePath ? <span className="action-meta">Workspace: {action.workspacePath} · base {action.baseCommit?.slice(0, 12) ?? "unknown"}</span> : null}
-              {action.patchSummary ? <div className="review-material"><strong>Patch</strong><span>{action.patchSummary}</span>{action.riskSummary ? <span>Risk: {action.riskSummary}</span> : null}{action.checks?.map((check) => <span className={`check-result ${check.status}`} key={`${action.id}-${check.name}`}>{check.name}: {check.status}</span>)}{action.diff ? <details><summary>View diff</summary><pre>{action.diff}</pre></details> : null}</div> : null}
+              {action.parentRunId ? <span className="action-meta">Review of {action.parentRunId}</span> : null}
+              {action.patchSummary ? <div className="review-material"><strong>Patch</strong><span>{action.patchSummary}</span>{action.riskSummary ? <span>Risk: {action.riskSummary}</span> : null}{action.checks?.map((check) => <span className={`check-result ${check.status}`} key={`${action.id}-${check.name}`}>{check.name}: {check.status}</span>)}</div> : null}
               {action.agentOutput ? <details className="agent-output"><summary>Agent output</summary><pre>{action.agentOutput}</pre></details> : null}
               {action.events?.length ? <details className="run-events"><summary>{action.events.length} recorded events</summary><ol>{action.events.map((event) => <li key={`${action.id}-${event.sequence}`}><span>{event.type}</span><p>{event.message}</p><time dateTime={event.createdAt}>{new Date(event.createdAt).toLocaleTimeString()}</time></li>)}</ol></details> : null}
             </div>
-            <div className="action-controls"><span className="status agent">{action.status.replace("_", " ")}</span>{action.status === "patch_ready" ? <button className="primary-btn" type="button" onClick={() => onApprove(action.id)}>Approve</button> : null}{action.status === "approved" ? <button className="primary-btn" type="button" onClick={() => onPush(action.id)}>Push</button> : null}{terminalStatuses.has(action.status) ? <button className="icon-btn" type="button" onClick={() => onClear(action.id)} aria-label={`Clear ${action.kind} action`} title="Clear action and workspace"><Trash2 size={16} /></button> : <button className="secondary-btn" type="button" onClick={() => onStop(action.id)}>Stop</button>}</div>
+            <div className="action-controls"><span className="status agent">{action.status.replace("_", " ")}</span>{action.diff ? <button className="secondary-btn" type="button" onClick={() => onShowDiff(action)}><GitCompare size={16} /><span>Show changes</span></button> : null}{action.status === "patch_ready" ? <button className="secondary-btn" type="button" onClick={() => onReviewPatch(action.id)}><FileSearch size={16} /><span>Review patch</span></button> : null}{action.status === "patch_ready" ? <button className="primary-btn" type="button" onClick={() => onApprove(action.id)}>Approve</button> : null}{action.status === "approved" ? <button className="primary-btn" type="button" onClick={() => onPush(action.id)}>Push</button> : null}{terminalStatuses.has(action.status) ? <button className="icon-btn" type="button" onClick={() => onClear(action.id)} aria-label={`Clear ${action.kind} action`} title="Clear action and workspace"><Trash2 size={16} /></button> : <button className="secondary-btn" type="button" onClick={() => onStop(action.id)}>Stop</button>}</div>
           </article>
         ))}
       </div>
     </section>
   );
+}
+
+function DiffDialog({ action, onClose, onReviewPatch }: { action: ActionRecord; onClose: () => void; onReviewPatch: (runId: string) => Promise<void> }) {
+  const changedFiles = parseDiffFiles(action.diff ?? "");
+  return (
+    <div className="modal-layer" role="presentation">
+      <section className="diff-dialog" role="dialog" aria-modal="true" aria-labelledby="diffTitle">
+        <header className="diff-dialog-head">
+          <div>
+            <h2 id="diffTitle">Changes for {action.repository} #{action.pullRequestNumber}</h2>
+            <span>{changedFiles.length} file{changedFiles.length === 1 ? "" : "s"} · {action.id}</span>
+          </div>
+          <button className="icon-btn" onClick={onClose} aria-label="Close changes dialog"><X size={18} /></button>
+        </header>
+        <div className="diff-dialog-body">
+          <aside className="diff-file-list" aria-label="Changed files">
+            {changedFiles.length ? changedFiles.map((file) => <span key={file}>{file}</span>) : <span>No file list available</span>}
+          </aside>
+          <pre className="diff-view">{action.diff || "No diff captured."}</pre>
+        </div>
+        <footer className="diff-dialog-foot">
+          <button className="secondary-btn" type="button" onClick={onClose}>Close</button>
+          {action.status === "patch_ready" ? <button className="primary-btn" type="button" onClick={() => { void onReviewPatch(action.id); onClose(); }}><FileSearch size={16} /><span>Review patch</span></button> : null}
+        </footer>
+      </section>
+      <button className="modal-scrim" type="button" aria-label="Close changes dialog" onClick={onClose} />
+    </div>
+  );
+}
+
+function parseDiffFiles(diff: string) {
+  return [...new Set(diff.split("\n").flatMap((line) => {
+    if (!line.startsWith("diff --git ")) return [];
+    const match = line.match(/^diff --git a\/(.+?) b\/(.+)$/);
+    return match ? [match[2]] : [];
+  }))];
 }
 
 function ActivityView({ events }: { events: ActivityEvent[] }) {

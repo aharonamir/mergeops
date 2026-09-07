@@ -6,8 +6,8 @@ declare const process: {
 };
 
 type AgentBackendId = "opencode" | "codex" | "anthropic";
-type AgentAction = "analyze" | "rebase" | "fix_conflicts" | "address_review" | "fix_checks";
-type RunStatus = "running" | "patch_ready" | "awaiting_approval" | "failed";
+type AgentAction = "analyze" | "rebase" | "fix_conflicts" | "address_review" | "fix_checks" | "review_patch";
+type RunStatus = "running" | "patch_ready" | "review_ready" | "awaiting_approval" | "failed";
 
 type RunnerInput = {
   backendId: AgentBackendId;
@@ -20,6 +20,8 @@ type RunnerInput = {
   sourceBranch?: string | null;
   runnerTimeoutSeconds?: number;
   conflictFiles?: string[];
+  reviewDiff?: string | null;
+  previousAgentOutput?: string | null;
 };
 
 type RunnerEvent =
@@ -83,8 +85,10 @@ async function runOpenCode(input: RunnerInput) {
     emit({ type: "log", message: `OpenCode returned ${readMessageCount(messages)} session message(s)` });
     emit({ type: "log", message: "OpenCode agent completed" });
     emitFinal(
-      "awaiting_approval",
-      `OpenCode completed for ${input.repository}#${input.pullRequestNumber}. Review the local diff before approval.`,
+      input.action === "review_patch" ? "review_ready" : "awaiting_approval",
+      input.action === "review_patch"
+        ? `OpenCode reviewed the prepared patch for ${input.repository}#${input.pullRequestNumber}.`
+        : `OpenCode completed for ${input.repository}#${input.pullRequestNumber}. Review the local diff before approval.`,
       sessionId,
       readAgentOutput(messages)
     );
@@ -197,20 +201,26 @@ async function runAnthropic(input: RunnerInput) {
 }
 
 function buildPrompt(input: RunnerInput) {
-  const completionRules = input.action === "fix_conflicts" || input.action === "rebase"
+  const completionRules = input.action === "review_patch"
+    ? "Review only. Do not edit files, stage, commit, push, merge, rebase, or open a pull request. Leave the workspace unchanged."
+    : input.action === "fix_conflicts" || input.action === "rebase"
     ? "Do not manually create commits. It is required to stage resolved conflict files and run git rebase --continue; that command creates the rebased commit. Do not push, merge, or open a pull request. Leave the workspace for human approval."
     : "Do not stage, commit, push, merge, or open a pull request. Leave the workspace for human approval.";
   const scope = input.action === "fix_conflicts"
-    ? `Act immediately with shell commands; do not inspect the repository broadly. The only conflict files are: ${(input.conflictFiles ?? []).join(", ") || "the files reported by git"}. Resolve only those files, remove every conflict marker, stage those files, and run GIT_EDITOR=true git rebase --continue. Repeat status, resolve, stage, and rebase --continue until the rebase completes. NEVER run git merge or start a second rebase. Verify git diff --name-only --diff-filter=U is empty, run the relevant checks, and stop immediately. Do not touch any unrelated file.`
+    ? `Act immediately with shell commands; do not inspect the repository broadly. MergeOps has already started git rebase onto the base branch. The rebase may stop more than once across multiple commits. While the rebase is in progress, repeatedly run git status and git diff --name-only --diff-filter=U, resolve only the currently unmerged files reported by Git, remove every conflict marker, stage only those resolved files, and run GIT_EDITOR=true git rebase --continue. Initial unmerged files: ${(input.conflictFiles ?? []).join(", ") || "the files reported by Git"}. Stop only when the rebase completes. NEVER run git merge or start a second rebase. Verify git diff --name-only --diff-filter=U is empty, run the relevant checks, and stop immediately. Do not touch any unrelated file.`
     : input.action === "rebase"
       ? "MergeOps has already started git rebase onto the base branch. If the rebase is paused on conflicts, resolve only those conflicts and run git rebase --continue until it completes. NEVER run git merge or start a second rebase. Keep the change narrowly scoped to the rebase and checks, then stop."
+      : input.action === "review_patch"
+        ? "Review the prepared patch for correctness, risk, missing tests, accidental broad changes, unresolved conflict markers, and whether it matches the PR intent. Return concise findings first, ordered by severity, then a short approval recommendation. Do not modify the workspace."
       : "Keep the change narrowly scoped to the requested task and stop after the smallest patch and checks are complete.";
   return [
     `Prepare ${input.action.replaceAll("_", " ")} for PR #${input.pullRequestNumber} in ${input.repository}.`,
     `Repository path: ${input.repositoryLocalPath}.`,
     input.sourceBranch ? `Source branch: ${input.sourceBranch}.` : "",
     input.baseBranch ? `Base branch: ${input.baseBranch}.` : "",
-    "Inspect the repo and prepare the smallest patch and checks summary.",
+    input.action === "review_patch" ? "Inspect the supplied patch context and produce a review. Do not make changes." : "Inspect the repo and prepare the smallest patch and checks summary.",
+    input.previousAgentOutput ? `Previous agent output:\n${input.previousAgentOutput.slice(-12000)}` : "",
+    input.reviewDiff ? `Prepared diff to review:\n${input.reviewDiff.slice(-40000)}` : "",
     scope,
     completionRules
   ].filter(Boolean).join(" ");

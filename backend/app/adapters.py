@@ -28,10 +28,13 @@ class AgentRunRequest:
     backend_id: str
     repository_local_path: str | None = None
     repository_remote_url: str | None = None
+    existing_workspace_path: str | None = None
     repository_token: str | None = None
     pull_request_ref: str | None = None
     base_branch: str | None = None
     source_branch: str | None = None
+    review_diff: str | None = None
+    previous_agent_output: str | None = None
     runner_timeout_seconds: int = 600
 
 
@@ -104,7 +107,7 @@ class SubprocessAgentAdapter:
             if on_event:
                 on_event(result.events[0])
             return result
-        if request.repository_local_path is None and request.repository_remote_url is None:
+        if request.existing_workspace_path is None and request.repository_local_path is None and request.repository_remote_url is None:
             result = AgentRunResult(
                 status="failed",
                 summary=(
@@ -117,17 +120,30 @@ class SubprocessAgentAdapter:
                 on_event(result.events[0])
             return result
 
-        try:
-            workspace = RunWorkspace.create(request)
-        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-            result = AgentRunResult(
-                status="failed",
-                summary=f"Could not prepare isolated run workspace: {exc}",
-                events=[self._event("error", f"Could not prepare isolated run workspace: {exc}")],
-            )
-            if on_event:
-                on_event(result.events[0])
-            return result
+        if request.existing_workspace_path:
+            try:
+                workspace = RunWorkspace.from_existing(request.existing_workspace_path)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                result = AgentRunResult(
+                    status="failed",
+                    summary=f"Could not reuse isolated run workspace: {exc}",
+                    events=[self._event("error", f"Could not reuse isolated run workspace: {exc}")],
+                )
+                if on_event:
+                    on_event(result.events[0])
+                return result
+        else:
+            try:
+                workspace = RunWorkspace.create(request)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                result = AgentRunResult(
+                    status="failed",
+                    summary=f"Could not prepare isolated run workspace: {exc}",
+                    events=[self._event("error", f"Could not prepare isolated run workspace: {exc}")],
+                )
+                if on_event:
+                    on_event(result.events[0])
+                return result
 
         if request.action in {"fix_conflicts", "rebase"}:
             try:
@@ -156,6 +172,7 @@ class SubprocessAgentAdapter:
             conflict_files = []
 
         opencode_profile_files = self._prepare_opencode_profile(workspace.path)
+        review_baseline = self._workspace_fingerprint(workspace.path) if request.action == "review_patch" else None
         git_guard = self._prepare_git_guard(workspace.path.parent)
         payload = {
             "backendId": request.backend_id,
@@ -168,6 +185,8 @@ class SubprocessAgentAdapter:
             "sourceBranch": request.source_branch,
             "runnerTimeoutSeconds": request.runner_timeout_seconds,
             "conflictFiles": conflict_files,
+            "reviewDiff": request.review_diff,
+            "previousAgentOutput": request.previous_agent_output,
         }
         try:
             inherited_path = os.environ.get("PATH", "")
@@ -282,6 +301,18 @@ class SubprocessAgentAdapter:
             return result
         finally:
             self._cleanup_opencode_profile(opencode_profile_files)
+
+        if review_baseline is not None and self._workspace_fingerprint(workspace.path) != review_baseline:
+            event = self._event("error", "Patch review changed the workspace; review-only runs must leave files untouched.")
+            if on_event:
+                on_event(event)
+            return AgentRunResult(
+                status="failed",
+                summary="Patch review changed the workspace; review-only runs must leave files untouched.",
+                workspace_path=str(workspace.path),
+                base_commit=workspace.base_commit,
+                events=[event],
+            )
 
         result, events = self._parse_result(stdout)
         if result is not None:
@@ -422,6 +453,15 @@ class SubprocessAgentAdapter:
             backend_session_id=session_id if isinstance(session_id, str) else None,
         ), events
 
+    @staticmethod
+    def _workspace_fingerprint(path: Path) -> tuple[str, str, str, str]:
+        pathspec = ["--", ".", ":(exclude).local", ":(exclude).config/opencode", ":(exclude).opencode"]
+        status = subprocess.run(["git", "status", "--porcelain=v1", *pathspec], cwd=path, capture_output=True, text=True, check=False, timeout=30)
+        diff = subprocess.run(["git", "diff", "--no-ext-diff", *pathspec], cwd=path, capture_output=True, text=True, check=False, timeout=30)
+        cached = subprocess.run(["git", "diff", "--cached", "--no-ext-diff", *pathspec], cwd=path, capture_output=True, text=True, check=False, timeout=30)
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=path, capture_output=True, text=True, check=False, timeout=30)
+        return status.stdout, diff.stdout, cached.stdout, head.stdout
+
 
 class RunWorkspace:
     """Creates an independent, detached clone for one agent run."""
@@ -480,6 +520,20 @@ class RunWorkspace:
             raise ValueError("Run workspace is outside the MergeOps workspace root")
         if run_root.exists():
             shutil.rmtree(run_root)
+
+    @classmethod
+    def from_existing(cls, workspace_path: str) -> "RunWorkspace":
+        workspace = Path(workspace_path).expanduser().resolve()
+        root = cls.root.resolve()
+        if root not in workspace.parents:
+            raise RuntimeError("Existing workspace is outside the MergeOps workspace root")
+        if not workspace.is_dir():
+            raise RuntimeError(f"Existing workspace does not exist: {workspace}")
+        source_root = cls._git(workspace, "rev-parse", "--show-toplevel").strip()
+        if Path(source_root).resolve() != workspace:
+            raise RuntimeError(f"Existing workspace is not a repository root: {workspace}")
+        base_commit = cls._git(workspace, "rev-parse", "HEAD").strip()
+        return cls(workspace, base_commit)
 
     @classmethod
     def prepare_rebase(cls, workspace: "RunWorkspace", base_branch: str | None) -> bool:
@@ -561,7 +615,6 @@ class RunWorkspace:
 
 def inspect_workspace(path: Path, required_checks: list[str] | None = None, committed_base: str | None = None) -> tuple[str, str, list[dict[str, object]], str]:
     """Capture the review material produced in an isolated workspace."""
-    started = utc_now()
     stat = subprocess.run(["git", "diff", "--stat"], cwd=path, capture_output=True, text=True, check=False, timeout=30)
     diff = subprocess.run(["git", "diff", "--no-ext-diff", "--unified=3"], cwd=path, capture_output=True, text=True, check=False, timeout=30)
     if not diff.stdout.strip() and committed_base:

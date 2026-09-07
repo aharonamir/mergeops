@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from .github_sync import sync_github_pull_requests
-from .models import AgentRun, AgentSettings, AppData, CheckoutResult, CreateAgentRunRequest, CreateCheckoutRequest, CreateTeamMemberRequest, GitHubSettingsPublic, GitHubSyncResult, TeamMember, UpdateAgentSettingsRequest, UpdateGitHubSettingsRequest, UpdateTeamMemberRequest
+from .models import AgentRun, AgentSettings, AppData, CheckoutResult, CreateAgentRunRequest, CreateCheckoutRequest, CreatePatchReviewRequest, CreateTeamMemberRequest, GitHubSettingsPublic, GitHubSyncResult, TeamMember, UpdateAgentSettingsRequest, UpdateGitHubSettingsRequest, UpdateTeamMemberRequest
 from .store import store
 
 agent_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mergeops-agent")
@@ -49,6 +49,16 @@ async def post_agent_run_cancel(run_id: str) -> AgentRun:
         return store.cancel_agent_run(run_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/agent-runs/{run_id}/review")
+async def post_agent_run_review(run_id: str, payload: CreatePatchReviewRequest) -> AgentRun:
+    try:
+        run = store.queue_patch_review(payload.backendId, run_id)
+        agent_executor.submit(store.execute_patch_review, run.id, payload.backendId, run_id)
+        return run
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/agent-runs/{run_id}/approve")
