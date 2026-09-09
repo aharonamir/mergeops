@@ -1,6 +1,6 @@
 export type ThemePreference = "system" | "light" | "dark";
 export type View = "cockpit" | "team" | "agents" | "activity" | "settings";
-export type QueueFilter = "all" | "conflict" | "review" | "merged" | "closed";
+export type QueueFilter = "all" | "open" | "conflict" | "review" | "ready" | "merged" | "closed";
 
 export type TeamMember = {
   id: string;
