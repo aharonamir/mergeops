@@ -82,6 +82,12 @@ export async function cancelAgentRun(runId: string): Promise<AgentRun> {
   return await response.json();
 }
 
+export async function selectRebaseDecision(runId: string, optionId: "drop_base_sync_merge" | "manual"): Promise<AgentRun> {
+  const response = await fetch(`${API_BASE}/api/agent-runs/${runId}/rebase-decision`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ optionId }) });
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
+  return await response.json();
+}
+
 export async function reviewPatch(runId: string, backendId: string): Promise<AgentRun> {
   const response = await fetch(`${API_BASE}/api/agent-runs/${runId}/review`, {
     method: "POST",

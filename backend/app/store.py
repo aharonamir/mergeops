@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from threading import Event, Lock
@@ -216,8 +217,47 @@ class LocalJsonStore:
         data.agentRuns = [running if item.id == run_id else item for item in data.agentRuns]
         data.actions = [item.model_copy(update={"status": running.status, "summary": running.summary, "events": running.events}) if item.id == run_id else item for item in data.actions]
         self._save(data)
+        existing_workspace_path = None
+        rebase_plan = None
+        if action in {"fix_conflicts", "rebase"}:
+            try:
+                if run.workspacePath and run.rebaseEvidence and run.rebaseEvidence.plan and run.rebaseEvidence.decision and run.rebaseEvidence.decision.selectedOption:
+                    if not run.workspacePath or not run.rebaseEvidence or not run.rebaseEvidence.plan:
+                        raise ValueError("Rebase decision has no prepared workspace or plan")
+                    existing_workspace_path = run.workspacePath
+                    rebase_plan = run.rebaseEvidence.plan.model_dump(mode="json")
+                else:
+                    workspace = RunWorkspace.create(AgentRunRequest(
+                        run_id=run_id, pull_request_id=pull_request.id, repository=pull_request.repositoryFullName or pull_request.repository,
+                        pull_request_number=pull_request.number, action=action, backend_id=backend_id,
+                        repository_local_path=repository.localPath if repository else None, repository_remote_url=self._repository_remote_url(pull_request, data),
+                        repository_token=data.githubPrivate.token, pull_request_ref=f"refs/pull/{pull_request.number}/head" if repository is None or repository.localPath is None else None,
+                        base_branch=pull_request.baseBranch, source_branch=pull_request.sourceBranch,
+                    ))
+                    base_ref = RunWorkspace.resolve_base_ref(workspace.path, pull_request.baseBranch)
+                    preflight = RunWorkspace.rebase_plan(workspace, base_ref)
+                    rebase_plan = preflight["plan"]
+                    if preflight["decision"]:
+                        evidence = RebaseEvidence(baseRef=base_ref, initialHead=workspace.base_commit, state="running", plan=preflight["plan"], decision=preflight["decision"])
+                        decision_run = running.model_copy(update={
+                            "status": "awaiting_decision", "summary": "Rebase strategy needs a human decision before OpenCode can make changes.",
+                            "workspacePath": str(workspace.path), "baseCommit": workspace.base_commit, "rebaseEvidence": evidence,
+                            "events": [*running.events, AgentRunEvent(sequence=len(running.events) + 1, type="decision_required", message=evidence.decision.question, createdAt=utc_now())],
+                        })
+                        data.agentRuns = [decision_run if item.id == run_id else item for item in data.agentRuns]
+                        data.actions = [item.model_copy(update={"status": decision_run.status, "summary": decision_run.summary, "workspacePath": decision_run.workspacePath, "baseCommit": decision_run.baseCommit, "events": decision_run.events, "rebaseEvidence": decision_run.rebaseEvidence}) if item.id == run_id else item for item in data.actions]
+                        self._save(data)
+                        return decision_run
+                    existing_workspace_path = str(workspace.path)
+            except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as exc:
+                result = AgentRunResult(status="failed", summary=f"Could not prepare rebase strategy: {exc}", events=[{"type": "error", "message": f"Could not prepare rebase strategy: {exc}", "createdAt": utc_now()}])
+            else:
+                result = None
+        else:
+            result = None
         try:
-            result = adapter.create_run(AgentRunRequest(
+            if result is None:
+                result = adapter.create_run(AgentRunRequest(
                 run_id=run_id,
                 pull_request_id=pull_request.id,
                 repository=pull_request.repositoryFullName or pull_request.repository,
@@ -231,6 +271,8 @@ class LocalJsonStore:
                 base_branch=pull_request.baseBranch,
                 source_branch=pull_request.sourceBranch,
                 runner_timeout_seconds=data.agentSettings.runnerTimeoutSeconds,
+                existing_workspace_path=existing_workspace_path,
+                rebase_plan=rebase_plan,
             ), on_event=lambda event: self.append_agent_event(run_id, event), cancel_event=cancel_event)
         except Exception as exc:
             result = AgentRunResult(status="failed", summary=f"Agent worker failed: {exc}", events=[{"type": "error", "message": f"Agent worker failed: {exc}", "createdAt": utc_now()}])
@@ -239,23 +281,33 @@ class LocalJsonStore:
         checks: list[CheckResult] = []
         risk_summary = None
         rebase_evidence = RebaseEvidence.model_validate(result.rebase_evidence) if result.rebase_evidence else None
-        if result.workspace_path and result.status != "cancelled":
+        if result.workspace_path and result.status == "awaiting_approval":
             self.append_agent_event(run_id, {"type": "checks_started", "message": "Running required checks against the prepared workspace."})
             review_base = None
             if action in {"fix_conflicts", "rebase"} and pull_request.baseBranch:
                 review_base = f"origin/{pull_request.baseBranch}...HEAD"
-            patch_summary, raw_diff, raw_checks, risk_summary = inspect_workspace(
-                Path(result.workspace_path),
-                repository.requiredChecks if repository else None,
-                review_base,
-            )
-            diff = raw_diff[:50000] if raw_diff else raw_diff
-            if rebase_evidence is not None and raw_diff is not None:
-                rebase_evidence.diff = BoundedText(text=diff or "", truncated=len(raw_diff) > 50000, originalLength=len(raw_diff))
-            checks = [CheckResult.model_validate(check) for check in raw_checks]
-            if rebase_evidence is not None:
-                rebase_evidence.stages.append({"sequence": len(rebase_evidence.stages) + 1, "type": "checks_completed", "message": f"Completed {len(checks)} required check(s).", "createdAt": utc_now()})
-            self.append_agent_event(run_id, {"type": "checks_completed", "message": f"Completed {len(checks)} required check(s)."})
+            try:
+                patch_summary, raw_diff, raw_checks, risk_summary = inspect_workspace(
+                    Path(result.workspace_path),
+                    repository.requiredChecks if repository else None,
+                    review_base,
+                )
+                diff = raw_diff[:50000] if raw_diff else raw_diff
+                if rebase_evidence is not None and raw_diff is not None:
+                    rebase_evidence.diff = BoundedText(text=diff or "", truncated=len(raw_diff) > 50000, originalLength=len(raw_diff))
+                checks = [CheckResult.model_validate(check) for check in raw_checks]
+                if rebase_evidence is not None:
+                    rebase_evidence.stages.append({"sequence": len(rebase_evidence.stages) + 1, "type": "checks_completed", "message": f"Completed {len(checks)} required check(s).", "createdAt": utc_now()})
+                self.append_agent_event(run_id, {"type": "checks_completed", "message": f"Completed {len(checks)} required check(s)."})
+            except (OSError, subprocess.SubprocessError) as exc:
+                message = f"Could not inspect the completed workspace: {exc}"
+                failure = {"type": "checks_failed", "message": message, "createdAt": utc_now()}
+                self.append_agent_event(run_id, failure)
+                result = AgentRunResult(
+                    status="failed", summary=message, output=result.output, backend_session_id=result.backend_session_id,
+                    workspace_path=result.workspace_path, base_commit=result.base_commit,
+                    events=[*(result.events or []), failure], rebase_evidence=result.rebase_evidence,
+                )
         if rebase_evidence is not None:
             if result.status == "cancelled":
                 rebase_evidence.state = "cancelled"
@@ -320,6 +372,25 @@ class LocalJsonStore:
             data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="agent_run", message=f"Cancellation requested for {run.repository}#{run.pullRequestNumber}.", actionId=run.id, createdAt=utc_now()))
             self._save(data)
             return cancelled
+
+    def select_rebase_decision(self, run_id: str, option_id: str) -> AgentRun:
+        with self._write_lock:
+            data = self._load()
+            run = next((item for item in data.agentRuns if item.id == run_id), None)
+            if run is None or run.status != "awaiting_decision" or run.rebaseEvidence is None or run.rebaseEvidence.decision is None:
+                raise ValueError("Run is not awaiting a rebase decision")
+            valid = {option.id for option in run.rebaseEvidence.decision.options}
+            if option_id not in valid:
+                raise ValueError("Unsupported rebase decision")
+            if option_id == "manual":
+                updated = run.model_copy(update={"status": "cancelled", "summary": "Rebase left for manual handling.", "events": [*run.events, AgentRunEvent(sequence=len(run.events) + 1, type="decision_selected", message="Manual handling selected; no Git changes were made.", createdAt=utc_now())]})
+            else:
+                evidence = run.rebaseEvidence.model_copy(update={"decision": run.rebaseEvidence.decision.model_copy(update={"selectedOption": option_id})})
+                updated = run.model_copy(update={"status": "queued", "summary": "Rebase strategy approved; launching OpenCode.", "rebaseEvidence": evidence, "events": [*run.events, AgentRunEvent(sequence=len(run.events) + 1, type="decision_selected", message="Drop old base sync merge selected.", createdAt=utc_now())]})
+            data.agentRuns = [updated if item.id == run_id else item for item in data.agentRuns]
+            data.actions = [item.model_copy(update={"status": updated.status, "summary": updated.summary, "events": updated.events, "rebaseEvidence": updated.rebaseEvidence}) if item.id == run_id else item for item in data.actions]
+            self._save(data)
+            return updated
 
     def approve_agent_run(self, run_id: str, reviewer: str = "local user") -> AgentRun:
         with self._write_lock:

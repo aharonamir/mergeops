@@ -35,6 +35,7 @@ class AgentRunRequest:
     source_branch: str | None = None
     review_diff: str | None = None
     previous_agent_output: str | None = None
+    rebase_plan: dict[str, object] | None = None
     runner_timeout_seconds: int = 600
 
 
@@ -85,6 +86,8 @@ class LocalAgentAdapter:
 
 class SubprocessAgentAdapter:
     """Runs TypeScript-first agent SDKs behind a local Node process."""
+
+    rebase_no_progress_seconds = 120
 
     def __init__(self, backend_id: str, runner_path: Path) -> None:
         self.backend_id = backend_id
@@ -175,6 +178,7 @@ class SubprocessAgentAdapter:
             "sourceBranch": request.source_branch,
             "runnerTimeoutSeconds": request.runner_timeout_seconds,
             "baseRef": base_ref,
+            "rebasePlan": request.rebase_plan,
             "conflictFiles": [],
             "reviewDiff": request.review_diff,
             "previousAgentOutput": request.previous_agent_output,
@@ -231,12 +235,30 @@ class SubprocessAgentAdapter:
                 "conflicts": [],
                 "blockedCommands": [],
                 "validation": [],
+                "plan": request.rebase_plan,
             } if rebase_mode else None
             seen_conflict_keys: set[str] = set()
             guard_cursor = 0
+            rebase_progress = self._rebase_progress_fingerprint(workspace) if rebase_mode else None
+            rebase_progress_at = time.monotonic()
             while streams_closed < 2:
                 if rebase_mode:
                     self._record_rebase_state(workspace, evidence, seen_conflict_keys, on_event)
+                    current_progress = self._rebase_progress_fingerprint(workspace)
+                    if current_progress != rebase_progress:
+                        rebase_progress = current_progress
+                        rebase_progress_at = time.monotonic()
+                    elif current_progress[0] and current_progress[1] and time.monotonic() - rebase_progress_at > self.rebase_no_progress_seconds:
+                        self._terminate_process_group(process)
+                        message = f"Agent made no rebase progress for {self.rebase_no_progress_seconds} seconds while {len(current_progress[1])} conflict file(s) remained; its process group was terminated."
+                        failure = self._event("no_rebase_progress", message)
+                        if on_event:
+                            on_event(failure)
+                        if evidence is not None:
+                            evidence["state"] = "failed"
+                            evidence.setdefault("validation", []).append(message)
+                            self._append_stage(evidence, "rebase_failed", message, on_event, workspace)
+                        return AgentRunResult(status="failed", summary=message, workspace_path=str(workspace.path), base_commit=workspace.base_commit, events=[failure], rebase_evidence=evidence)
                 guard_events, guard_cursor = self._read_guard_events(git_guard.parent / "git-guard.log", guard_cursor)
                 if guard_events:
                     for command in guard_events:
@@ -248,8 +270,7 @@ class SubprocessAgentAdapter:
                         if on_event:
                             on_event(event)
                         if process.poll() is None:
-                            os.killpg(process.pid, signal.SIGTERM)
-                            process.wait(timeout=5)
+                            self._terminate_process_group(process)
                         message = f"Agent attempted blocked git {command}; the workspace does not permit merge or push."
                         failure = self._event("error", message)
                         if on_event:
@@ -259,8 +280,7 @@ class SubprocessAgentAdapter:
                             evidence.setdefault("validation", []).append(f"blocked git {command}")
                         return AgentRunResult(status="failed", summary=message, workspace_path=str(workspace.path), base_commit=workspace.base_commit, events=[event, failure], rebase_evidence=evidence)
                 if cancel_event and cancel_event.is_set() and process.poll() is None:
-                    os.killpg(process.pid, signal.SIGTERM)
-                    process.wait(timeout=5)
+                    self._terminate_process_group(process)
                     result = AgentRunResult(
                         status="cancelled",
                         summary="Agent run cancelled; its process group was terminated.",
@@ -273,8 +293,7 @@ class SubprocessAgentAdapter:
                         on_event(result.events[0])
                     return result
                 if time.monotonic() > deadline and process.poll() is None:
-                    os.killpg(process.pid, signal.SIGTERM)
-                    process.wait(timeout=5)
+                    self._terminate_process_group(process)
                     result = AgentRunResult(
                         status="failed",
                         summary=f"Agent runner timed out after {request.runner_timeout_seconds} seconds; its process group was terminated.",
@@ -565,6 +584,23 @@ class SubprocessAgentAdapter:
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=path, capture_output=True, text=True, check=False, timeout=30)
         return status.stdout, diff.stdout, cached.stdout, head.stdout
 
+    @staticmethod
+    def _terminate_process_group(process: subprocess.Popen[str]) -> None:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+
+    @staticmethod
+    def _rebase_progress_fingerprint(workspace: "RunWorkspace") -> tuple[bool, tuple[str, ...], str, str]:
+        active = RunWorkspace.rebase_in_progress(workspace)
+        unresolved = tuple(RunWorkspace.unmerged_files(workspace)) if active else ()
+        head = RunWorkspace._git_optional_value(workspace.path, "rev-parse", "HEAD") or ""
+        staged = RunWorkspace._git_optional_value(workspace.path, "diff", "--cached", "--name-only") or ""
+        return active, unresolved, head, staged
+
 
 class RunWorkspace:
     """Creates an independent, detached clone for one agent run."""
@@ -674,6 +710,49 @@ class RunWorkspace:
         if not base_branch:
             raise RuntimeError("the pull request has no base branch")
         return cls._resolve_base_ref(checkout, base_branch)
+
+    @classmethod
+    def rebase_plan(cls, workspace: "RunWorkspace", base_ref: str) -> dict[str, object]:
+        """Return a safe automatic plan or a user decision for an old base-sync merge."""
+        merge_lines = cls._git(workspace.path, "rev-list", "--merges", f"{base_ref}..HEAD").splitlines()
+        candidates: list[tuple[str, str]] = []
+        for merge_sha in merge_lines:
+            parents = cls._git(workspace.path, "rev-list", "--parents", "-n", "1", merge_sha).split()
+            if len(parents) != 3:
+                continue
+            old_base = parents[2]
+            if cls._git_optional(workspace.path, "merge-base", "--is-ancestor", old_base, base_ref):
+                candidates.append((merge_sha, old_base))
+        if not merge_lines:
+            return {
+                "plan": {"strategy": "standard", "targetRef": base_ref, "command": f"git rebase {base_ref}", "summary": f"Rebase directly onto {base_ref}."},
+                "decision": None,
+            }
+        if len(merge_lines) == 1 and len(candidates) == 1:
+            merge_sha, old_base = candidates[0]
+            feature_count = len(cls._git(workspace.path, "rev-list", "--no-merges", "--count", f"{old_base}..HEAD").strip() or "0")
+            plan = {
+                "strategy": "drop_base_sync_merge", "targetRef": base_ref, "upstreamRef": old_base,
+                "command": f"git rebase --onto {base_ref} {old_base}", "mergeCommit": merge_sha,
+                "summary": f"Drop old base-sync merge {merge_sha[:12]} and replay {feature_count} feature commit(s) onto {base_ref}.",
+            }
+            return {
+                "plan": plan,
+                "decision": {
+                    "question": f"This branch contains an older base sync merge ({merge_sha[:12]}). How should it be rebased onto {base_ref}?",
+                    "options": [
+                        {"id": "drop_base_sync_merge", "label": "Drop old base sync merge", "description": plan["summary"], "recommended": True},
+                        {"id": "manual", "label": "Stop for manual handling", "description": "Preserve the isolated workspace without making Git changes.", "recommended": False},
+                    ],
+                },
+            }
+        return {
+            "plan": None,
+            "decision": {
+                "question": f"This branch contains {len(merge_lines)} merge commit(s) that cannot be safely replayed automatically.",
+                "options": [{"id": "manual", "label": "Stop for manual handling", "description": "Preserve the isolated workspace without making Git changes.", "recommended": True}],
+            },
+        }
 
     @staticmethod
     def rebase_in_progress(workspace: "RunWorkspace") -> bool:

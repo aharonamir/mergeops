@@ -19,6 +19,7 @@ type RunnerInput = {
   repositoryLocalPath: string;
   baseBranch?: string | null;
   baseRef?: string | null;
+  rebasePlan?: { command?: string; summary?: string } | null;
   sourceBranch?: string | null;
   runnerTimeoutSeconds?: number;
   conflictFiles?: string[];
@@ -260,10 +261,8 @@ function buildPrompt(input: RunnerInput) {
     : input.action === "fix_conflicts" || input.action === "rebase"
     ? "Do not manually create commits. It is required to stage resolved conflict files and run git rebase --continue; that command creates the rebased commit. Do not push, merge, or open a pull request. Leave the workspace for human approval."
     : "Do not stage, commit, push, merge, or open a pull request. Leave the workspace for human approval.";
-  const scope = input.action === "fix_conflicts"
-    ? `This is a deterministic conflict-resolution task, not a repository investigation. Your first shell command MUST be: git status --short && git diff --name-only --diff-filter=U. Do not run git log, git show, revision-to-revision diff, or inspect unrelated source before starting the requested rebase. Start the complete lifecycle with git rebase ${input.baseRef ?? `origin/${input.baseBranch ?? "the base branch"}`}. Resolve only the current conflict hunks using the files and markers Git reports, remove every conflict marker, stage only those resolved files, and immediately run GIT_EDITOR=true git rebase --continue. The rebase may stop more than once across multiple commits, so repeat the same status, edit, stage, continue loop until it completes. Prioritize completing the rebase with the smallest conflict resolution that preserves the incoming PR change. NEVER run git merge or start a second rebase. Verify git status --short and git diff --name-only --diff-filter=U are clean and stop immediately. Do not touch any unrelated file.`
-    : input.action === "rebase"
-      ? `Run the complete agent-owned lifecycle: git rebase ${input.baseRef ?? `origin/${input.baseBranch ?? "the base branch"}`}, resolve every conflict, stage resolved files, and run GIT_EDITOR=true git rebase --continue until the rebase completes. NEVER run git merge or start a second rebase. Keep the change narrowly scoped to the rebase and checks, then stop.`
+  const scope = input.action === "fix_conflicts" || input.action === "rebase"
+    ? `Execute this approved rebase plan exactly: ${input.rebasePlan?.command ?? `git rebase ${input.baseRef ?? `origin/${input.baseBranch ?? "the base branch"}`}`}. ${input.rebasePlan?.summary ?? ""} Resolve every conflict, stage each resolved file, and run GIT_EDITOR=true git rebase --continue. Repeat until the rebase completes. Do not merge, push, or inspect unrelated files. Finish by confirming git status --short and git diff --name-only --diff-filter=U are clean.`
       : input.action === "review_patch"
         ? "Review the prepared patch for correctness, risk, missing tests, accidental broad changes, unresolved conflict markers, and whether it matches the PR intent. Return concise findings first, ordered by severity, then a short approval recommendation. Do not modify the workspace."
       : "Keep the change narrowly scoped to the requested task and stop after the smallest patch and checks are complete.";

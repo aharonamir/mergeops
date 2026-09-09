@@ -106,6 +106,7 @@ class AgentRun(BaseModel):
         "patch_ready",
         "review_ready",
         "checks_running",
+        "awaiting_decision",
         "awaiting_approval",
         "approved",
         "pushed",
@@ -174,6 +175,28 @@ class RebaseStage(BaseModel):
     commitSha: str | None = None
 
 
+class RebasePlan(BaseModel):
+    strategy: Literal["standard", "drop_base_sync_merge"]
+    targetRef: str
+    upstreamRef: str | None = None
+    command: str
+    mergeCommit: str | None = None
+    summary: str
+
+
+class RebaseDecisionOption(BaseModel):
+    id: Literal["drop_base_sync_merge", "manual"]
+    label: str
+    description: str
+    recommended: bool = False
+
+
+class RebaseDecision(BaseModel):
+    question: str
+    options: list[RebaseDecisionOption]
+    selectedOption: Literal["drop_base_sync_merge", "manual"] | None = None
+
+
 class RebaseEvidence(BaseModel):
     baseRef: str | None = None
     initialHead: str | None = None
@@ -183,6 +206,8 @@ class RebaseEvidence(BaseModel):
     conflicts: list[ConflictEvidence] = Field(default_factory=list)
     blockedCommands: list[str] = Field(default_factory=list)
     validation: list[str] = Field(default_factory=list)
+    plan: RebasePlan | None = None
+    decision: RebaseDecision | None = None
     diff: BoundedText = Field(default_factory=BoundedText)
     transcript: BoundedText = Field(default_factory=BoundedText)
 
@@ -283,6 +308,10 @@ class CreateAgentRunRequest(BaseModel):
 
 class CreatePatchReviewRequest(BaseModel):
     backendId: str
+
+
+class SelectRebaseDecisionRequest(BaseModel):
+    optionId: Literal["drop_base_sync_merge", "manual"]
 
 
 class UpdateAgentSettingsRequest(BaseModel):

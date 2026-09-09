@@ -13,7 +13,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.adapters import AgentRunRequest, AgentRunResult, RunWorkspace, SubprocessAgentAdapter, inspect_workspace
-from app.models import ActionRecord, AgentBackend, AgentRun, AgentRunEvent, ApprovalRecord, CheckResult, GitHubSettings, GitHubSettingsPublic, PullRequest, RepositoryConfig, TeamMember
+from app.models import ActionRecord, AgentBackend, AgentRun, AgentRunEvent, ApprovalRecord, CheckResult, GitHubSettings, GitHubSettingsPublic, PullRequest, RebaseDecision, RebaseDecisionOption, RebaseEvidence, RebasePlan, RepositoryConfig, TeamMember
 from app.store import LocalJsonStore, PersistedAppData
 
 
@@ -51,7 +51,76 @@ class ReviewCapturingAdapter(CapturingAdapter):
         )
 
 
+class FailedWorkspaceAdapter(CapturingAdapter):
+    def __init__(self, workspace_path: str) -> None:
+        super().__init__()
+        self.workspace_path = workspace_path
+
+    def create_run(self, request: AgentRunRequest, on_event=None, cancel_event=None) -> AgentRunResult:
+        self.requests.append(request)
+        return AgentRunResult(
+            status="failed",
+            summary="Agent timed out.",
+            workspace_path=self.workspace_path,
+            base_commit="abc123",
+        )
+
+
 class StoreRepositoryResolutionTest(unittest.TestCase):
+    def test_selected_rebase_decision_reuses_prepared_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            workspace = root / "prepared-workspace"
+            workspace.mkdir()
+            pull_request = PullRequest(
+                id="pr-decision", repository="service", repositoryFullName="owner-a/service", number=1,
+                title="Decision", author="dev", ownerMemberId="dev", sourceBranch="feature", baseBranch="main",
+                state="open", mergeable="conflicting", reviewState="review_required", unresolvedCommentCount=0,
+                requestedReviewers=[], checkState="passing", linkedIssueIds=[], changedFilesCount=1, ageDays=1,
+                summary="Decision", searchText="decision",
+            )
+            plan = RebasePlan(strategy="drop_base_sync_merge", targetRef="origin/main", upstreamRef="old-base", command="git rebase --onto origin/main old-base", summary="Replay feature commits.")
+            evidence = RebaseEvidence(baseRef="origin/main", initialHead="abc123", state="running", plan=plan, decision=RebaseDecision(question="Choose", selectedOption="drop_base_sync_merge", options=[RebaseDecisionOption(id="drop_base_sync_merge", label="Drop", description="Replay", recommended=True)]))
+            run = AgentRun(id="run-decision", backendId="opencode", repository="service", pullRequestId=pull_request.id, pullRequestNumber=1, action="fix_conflicts", status="queued", requester="test", summary="Selected", workspacePath=str(workspace), baseCommit="abc123", rebaseEvidence=evidence, createdAt="2026-01-01T00:00:00Z")
+            data = self._data(pull_request)
+            data.agentRuns = [run]
+            data.actions = [ActionRecord(id=run.id, kind="agent_run", repository=run.repository, pullRequestId=run.pullRequestId, pullRequestNumber=run.pullRequestNumber, action=run.action, status=run.status, summary=run.summary, workspacePath=run.workspacePath, baseCommit=run.baseCommit, rebaseEvidence=evidence, createdAt=run.createdAt)]
+            store = LocalJsonStore(root / "mergeops.local.json")
+            store._save(data)
+            adapter = CapturingAdapter()
+
+            with patch("app.store.adapter_registry", return_value={"opencode": adapter}):
+                store.execute_agent_run(run.id, "opencode", pull_request.id, "fix_conflicts")
+
+            self.assertEqual(adapter.requests[0].existing_workspace_path, str(workspace))
+            self.assertEqual(adapter.requests[0].rebase_plan["command"], plan.command)
+
+    def test_failed_agent_run_skips_workspace_checks_and_finalizes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            pull_request = PullRequest(
+                id="pr-failed", repository="service", repositoryFullName="owner-a/service", number=1,
+                title="Failed", author="dev", ownerMemberId="dev", sourceBranch="feature", baseBranch="main",
+                state="open", mergeable="conflicting", reviewState="review_required", unresolvedCommentCount=0,
+                requestedReviewers=[], checkState="passing", linkedIssueIds=[], changedFilesCount=1, ageDays=1,
+                summary="Failed", searchText="failed",
+            )
+            store = LocalJsonStore(root / "mergeops.local.json")
+            store._save(self._data(pull_request))
+            adapter = FailedWorkspaceAdapter(str(workspace))
+
+            with patch("app.store.adapter_registry", return_value={"opencode": adapter}), patch("app.store.inspect_workspace") as inspect:
+                run = store.create_agent_run("opencode", pull_request.id, "analyze")
+
+            self.assertEqual(run.status, "failed")
+            self.assertEqual(run.summary, "Agent timed out.")
+            self.assertFalse(inspect.called)
+            persisted = store.persisted_data().agentRuns[0]
+            self.assertEqual(persisted.status, "failed")
+            self.assertFalse(any(event.type == "checks_started" for event in persisted.events))
+
     def test_legacy_check_command_is_not_loaded_as_repository_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "mergeops.local.json"
@@ -246,6 +315,42 @@ class StoreRepositoryResolutionTest(unittest.TestCase):
 
             self.assertEqual(result.status, "cancelled")
             self.assertEqual([event["type"] for event in seen], ["log", "cancelled"])
+
+    def test_rebase_no_progress_terminates_stalled_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "source"
+            source.mkdir()
+            self._git(source, "init", "-b", "main")
+            self._git(source, "config", "user.email", "test@example.com")
+            self._git(source, "config", "user.name", "MergeOps Test")
+            (source / "README.md").write_text("base\n", encoding="utf-8")
+            self._git(source, "add", "README.md")
+            self._git(source, "commit", "-m", "base")
+            self._git(source, "checkout", "-b", "feature")
+            (source / "README.md").write_text("feature\n", encoding="utf-8")
+            self._git(source, "commit", "-am", "feature change")
+            self._git(source, "checkout", "main")
+            (source / "README.md").write_text("main\n", encoding="utf-8")
+            self._git(source, "commit", "-am", "main change")
+            self._git(source, "checkout", "feature")
+            runner = root / "runner.js"
+            runner.write_text("process.stdin.resume(); process.stdin.on('end', () => setTimeout(() => {}, 5000));\n", encoding="utf-8")
+            request = AgentRunRequest(
+                run_id="run-no-progress", pull_request_id="pr-1", repository="owner/service", pull_request_number=1,
+                action="fix_conflicts", backend_id="opencode", repository_local_path=str(source), base_branch="main", runner_timeout_seconds=10,
+            )
+            adapter = SubprocessAgentAdapter("opencode", runner)
+            adapter.rebase_no_progress_seconds = 0.2
+
+            with patch.object(RunWorkspace, "root", root / "runs"), patch.object(RunWorkspace, "rebase_in_progress", return_value=True), patch.object(RunWorkspace, "unmerged_files", return_value=["README.md"]):
+                result = adapter.create_run(request)
+
+            self.assertEqual(result.status, "failed")
+            self.assertIn("no rebase progress", result.summary)
+            self.assertTrue(result.rebase_evidence)
+            self.assertEqual(result.rebase_evidence["state"], "failed")
+            self.assertIn("no_rebase_progress", [event["type"] for event in result.events or []])
 
     def test_review_patch_fails_if_runner_changes_existing_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -80,7 +80,7 @@ export type AgentRun = {
   pullRequestId: string;
   pullRequestNumber: number;
   action: "analyze" | "rebase" | "fix_conflicts" | "address_review" | "fix_checks" | "review_patch";
-  status: "queued" | "running" | "patch_ready" | "review_ready" | "checks_running" | "awaiting_approval" | "approved" | "pushed" | "failed" | "cancelled";
+  status: "queued" | "running" | "patch_ready" | "review_ready" | "checks_running" | "awaiting_decision" | "awaiting_approval" | "approved" | "pushed" | "failed" | "cancelled";
   requester: string;
   summary: string;
   parentRunId?: string | null;
@@ -174,9 +174,15 @@ export type RebaseEvidence = {
   conflicts: ConflictEvidence[];
   blockedCommands: string[];
   validation: string[];
+  plan?: RebasePlan | null;
+  decision?: RebaseDecision | null;
   diff: BoundedText;
   transcript: BoundedText;
 };
+
+export type RebasePlan = { strategy: "standard" | "drop_base_sync_merge"; targetRef: string; upstreamRef?: string | null; command: string; mergeCommit?: string | null; summary: string };
+export type RebaseDecisionOption = { id: "drop_base_sync_merge" | "manual"; label: string; description: string; recommended: boolean };
+export type RebaseDecision = { question: string; options: RebaseDecisionOption[]; selectedOption?: "drop_base_sync_merge" | "manual" | null };
 
 export type ApprovalRecord = {
   id: string;

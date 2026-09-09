@@ -18,8 +18,8 @@ import {
   FileSearch,
   GitCompare
 } from "lucide-react";
-import { approveAgentRun, cancelAgentRun, checkBackendHealth, clearAction, createAgentRun, createCheckout, createTeamMember, deleteTeamMember, loadActionDetails, loadAppData, pushAgentRun, reviewPatch, syncGitHub, updateAgentSettings, updateGitHubSettings, updateTeamMember } from "./api";
-import type { ActionRecord, ActivityEvent, AgentBackend, AgentRun, AgentRunSummary, AgentSettings, AppData, ConflictEvidence, GitHubSettings, GitHubSyncResult, PullRequest, QueueFilter, RepositoryConfig, TeamMember, ThemePreference, View } from "./types";
+import { approveAgentRun, cancelAgentRun, checkBackendHealth, clearAction, createAgentRun, createCheckout, createTeamMember, deleteTeamMember, loadActionDetails, loadAppData, pushAgentRun, reviewPatch, selectRebaseDecision, syncGitHub, updateAgentSettings, updateGitHubSettings, updateTeamMember } from "./api";
+import type { ActionRecord, ActivityEvent, AgentBackend, AgentRun, AgentRunEvent, AgentRunSummary, AgentSettings, AppData, ConflictEvidence, GitHubSettings, GitHubSyncResult, PullRequest, QueueFilter, RepositoryConfig, TeamMember, ThemePreference, View } from "./types";
 
 const themeIcons = {
   system: Monitor,
@@ -351,6 +351,13 @@ export function App() {
     }
   }
 
+  async function chooseRebaseDecision(runId: string, optionId: "drop_base_sync_merge" | "manual") {
+    const run = await selectRebaseDecision(runId, optionId);
+    setRuns((current) => current.map((item) => item.id === run.id ? run : item));
+    setActions((current) => current.map((item) => item.id === run.id ? actionFromRun(run) : item));
+    setDetails(run);
+  }
+
   return (
     <div className="app-shell">
       <aside className="side-nav" aria-label="Primary">
@@ -427,7 +434,7 @@ export function App() {
           />
         )}
         {activeView === "team" && <TeamWorkspace members={data.teamMembers} onSaveMember={saveTeamMember} onAddMember={addTeamMember} onDeleteMember={removeTeamMember} />}
-        {activeView === "agents" && <ActionsView actions={actions} onClear={removeAction} onStop={stopRun} onApprove={approveRun} onPush={pushRun} onReviewPatch={reviewRunPatch} onShowDetails={showRunDetails} />}
+        {activeView === "agents" && <ActionsView actions={actions} onClear={removeAction} onStop={stopRun} onApprove={approveRun} onPush={pushRun} onReviewPatch={reviewRunPatch} onShowDetails={showRunDetails} onLoadEvents={loadActionDetails} />}
         {activeView === "activity" && <ActivityView events={activity} />}
         {activeView === "settings" && (
           <SettingsView
@@ -466,7 +473,7 @@ export function App() {
         />
       )}
       {diffAction ? <DiffDialog action={diffAction} onClose={() => setDiffAction(null)} onReviewPatch={reviewRunPatch} /> : null}
-      {detailsAction ? <RunDetailsDrawer action={detailsAction} details={details} loading={detailsLoading} onClose={() => { setDetailsAction(null); setDetails(null); }} onShowDiff={setDiffAction} /> : null}
+      {detailsAction ? <RunDetailsDrawer action={detailsAction} details={details} loading={detailsLoading} onClose={() => { setDetailsAction(null); setDetails(null); }} onShowDiff={setDiffAction} onChooseRebaseDecision={chooseRebaseDecision} /> : null}
     </div>
   );
 }
@@ -790,8 +797,21 @@ function draftToNewMember(draft: TeamMemberDraft): Omit<TeamMember, "id"> {
   };
 }
 
-function ActionsView({ actions, onClear, onStop, onApprove, onPush, onReviewPatch, onShowDetails }: { actions: ActionRecord[]; onClear: (actionId: string) => Promise<void>; onStop: (runId: string) => Promise<void>; onApprove: (runId: string) => Promise<void>; onPush: (runId: string) => Promise<void>; onReviewPatch: (runId: string) => Promise<void>; onShowDetails: (action: ActionRecord) => Promise<void> }) {
+function ActionsView({ actions, onClear, onStop, onApprove, onPush, onReviewPatch, onShowDetails, onLoadEvents }: { actions: ActionRecord[]; onClear: (actionId: string) => Promise<void>; onStop: (runId: string) => Promise<void>; onApprove: (runId: string) => Promise<void>; onPush: (runId: string) => Promise<void>; onReviewPatch: (runId: string) => Promise<void>; onShowDetails: (action: ActionRecord) => Promise<void>; onLoadEvents: (actionId: string) => Promise<AgentRun | ActionRecord> }) {
   const terminalStatuses = new Set(["ready", "failed", "cancelled", "pushed", "approved", "awaiting_approval", "patch_ready", "review_ready"]);
+  const [eventPanels, setEventPanels] = useState<Record<string, { events?: AgentRunEvent[]; loading: boolean }>>({});
+
+  async function loadEvents(actionId: string) {
+    if (eventPanels[actionId]) return;
+    setEventPanels((current) => ({ ...current, [actionId]: { loading: true } }));
+    try {
+      const detail = await onLoadEvents(actionId);
+      setEventPanels((current) => ({ ...current, [actionId]: { events: detail.events ?? [], loading: false } }));
+    } catch {
+      setEventPanels((current) => ({ ...current, [actionId]: { events: [], loading: false } }));
+    }
+  }
+
   return (
     <section className="view is-visible" aria-labelledby="agentsTitle">
       <div className="view-head">
@@ -801,34 +821,42 @@ function ActionsView({ actions, onClear, onStop, onApprove, onPush, onReviewPatc
         </div>
       </div>
       <div className="runs-list">
-        {actions.length === 0 ? <p className="empty-state">No actions yet.</p> : actions.map((action) => (
-          <article className="run-item" key={action.id}>
+        {actions.length === 0 ? <p className="empty-state">No actions yet.</p> : actions.map((action) => {
+          const eventCount = action.eventCount ?? action.events?.length ?? 0;
+          const eventPanel = eventPanels[action.id];
+          const events = action.events ?? eventPanel?.events;
+          return <article className="run-item" key={action.id}>
             <div>
               <strong>{action.kind === "checkout" ? "Checkout" : "Agent run"} · {action.repository} #{action.pullRequestNumber}</strong>
               <p>{action.summary}</p>
               {action.workspacePath ? <span className="action-meta">Workspace: {action.workspacePath} · base {action.baseCommit?.slice(0, 12) ?? "unknown"}</span> : null}
               {action.parentRunId ? <span className="action-meta">Review of {action.parentRunId}</span> : null}
-              {(action.eventCount || action.checkCount || action.hasRebaseEvidence) ? <span className="action-meta">{action.eventCount ?? 0} events · {action.checkCount ?? 0} checks{action.hasRebaseEvidence ? ` · ${action.resolvedConflictCount ?? 0}/${action.conflictCount ?? 0} conflicts resolved` : ""}</span> : null}
+              {(eventCount || action.checkCount || action.hasRebaseEvidence) ? <span className="action-meta">{eventCount} events · {action.checkCount ?? 0} checks{action.hasRebaseEvidence ? ` · ${action.resolvedConflictCount ?? 0}/${action.conflictCount ?? 0} conflicts resolved` : ""}</span> : null}
+              {eventCount ? <details className="run-events" onToggle={(event) => { if (event.currentTarget.open) void loadEvents(action.id); }}><summary>{eventCount} recorded events</summary>{eventPanel?.loading ? <p className="event-loading">Loading events…</p> : events ? <RunEventList events={events} /> : <p className="event-loading">Events are unavailable.</p>}</details> : null}
             </div>
             <div className="action-controls"><span className="status agent">{action.status.replace("_", " ")}</span><button className="secondary-btn" type="button" onClick={() => void onShowDetails(action)}><FileSearch size={16} /><span>Run details</span></button>{action.status === "patch_ready" ? <button className="secondary-btn" type="button" onClick={() => onReviewPatch(action.id)}><FileSearch size={16} /><span>Review patch</span></button> : null}{action.status === "patch_ready" ? <button className="primary-btn" type="button" onClick={() => onApprove(action.id)}>Approve</button> : null}{action.status === "approved" ? <button className="primary-btn" type="button" onClick={() => onPush(action.id)}>Push</button> : null}{terminalStatuses.has(action.status) ? <button className="icon-btn" type="button" onClick={() => onClear(action.id)} aria-label={`Clear ${action.kind} action`} title="Clear action and workspace"><Trash2 size={16} /></button> : <button className="secondary-btn" type="button" onClick={() => onStop(action.id)}>Stop</button>}</div>
           </article>
-        ))}
+        })}
       </div>
     </section>
   );
 }
 
-function RunDetailsDrawer({ action, details, loading, onClose, onShowDiff }: { action: ActionRecord; details: AgentRun | ActionRecord | null; loading: boolean; onClose: () => void; onShowDiff: (action: ActionRecord) => void }) {
+function RunDetailsDrawer({ action, details, loading, onClose, onShowDiff, onChooseRebaseDecision }: { action: ActionRecord; details: AgentRun | ActionRecord | null; loading: boolean; onClose: () => void; onShowDiff: (action: ActionRecord) => void; onChooseRebaseDecision: (runId: string, optionId: "drop_base_sync_merge" | "manual") => Promise<void> }) {
   const run = details && "backendId" in details ? details : null;
   const evidence = run?.rebaseEvidence;
   const detailAction: ActionRecord = run ? actionFromRun(run) : action;
   const transcript = evidence?.transcript.text || run?.agentOutput;
+  const events = details?.events ?? [];
   return (
     <div className="drawer-layer" role="presentation">
       <aside className="run-details-drawer" role="dialog" aria-modal="true" aria-labelledby="runDetailsTitle">
         <header className="drawer-head"><div><span className="eyebrow">Run details</span><h2 id="runDetailsTitle">{action.repository} #{action.pullRequestNumber}</h2><span>{action.id} · {action.action.replace(/_/g, " ")}</span></div><button className="icon-btn" onClick={onClose} aria-label="Close run details"><X size={18} /></button></header>
-        {loading ? <div className="drawer-loading">Loading evidence…</div> : !run ? (details ? <div className="run-details-body"><section className="detail-overview"><span className="status agent">{details.status.replace(/_/g, " ")}</span><p>{details.summary}</p><div className="detail-facts"><span>Workspace <strong>{details.workspacePath ?? "not created"}</strong></span><span>Base commit <strong>{details.baseCommit?.slice(0, 12) ?? "unknown"}</strong></span><span>Events <strong>{details.events?.length ?? 0}</strong></span></div></section><p className="empty-state">This action has no agent-owned rebase evidence.</p></div> : <div className="drawer-loading">Details are unavailable for this run.</div>) : <div className="run-details-body">
-          <section className="detail-overview"><span className={`status agent ${run.status === "failed" ? "is-failed" : ""}`}>{run.status.replace(/_/g, " ")}</span><p>{run.summary}</p><div className="detail-facts"><span>Base commit <strong>{run.baseCommit?.slice(0, 12) ?? "unknown"}</strong></span><span>Workspace <strong>{run.workspacePath ?? "not created"}</strong></span><span>Checks <strong>{run.checks?.filter((check) => check.status === "passed").length ?? 0}/{run.checks?.length ?? 0} passed</strong></span></div></section>
+        {loading ? <div className="drawer-loading">Loading evidence…</div> : !run ? (details ? <div className="run-details-body"><section className="detail-overview"><span className="status agent detail-status">{details.status.replace(/_/g, " ")}</span><p>{details.summary}</p><div className="detail-facts"><span>Workspace <strong>{details.workspacePath ?? "not created"}</strong></span><span>Base commit <strong>{details.baseCommit?.slice(0, 12) ?? "unknown"}</strong></span><span>Events <strong>{events.length}</strong></span></div></section><RunEventsSection events={events} /><p className="empty-state">This action has no agent-owned rebase evidence.</p></div> : <div className="drawer-loading">Details are unavailable for this run.</div>) : <div className="run-details-body">
+          <section className="detail-overview"><span className={`status agent detail-status ${run.status === "failed" ? "is-failed" : ""}`}>{run.status.replace(/_/g, " ")}</span><p>{run.summary}</p><div className="detail-facts"><span>Base commit <strong>{run.baseCommit?.slice(0, 12) ?? "unknown"}</strong></span><span>Workspace <strong>{run.workspacePath ?? "not created"}</strong></span><span>Checks <strong>{run.checks?.filter((check) => check.status === "passed").length ?? 0}/{run.checks?.length ?? 0} passed</strong></span></div></section>
+          <RunEventsSection events={events} />
+          {evidence?.plan ? <section className="detail-section"><div className="section-title"><h3>Rebase strategy</h3><span>{evidence.plan.strategy.replace(/_/g, " ")}</span></div><p>{evidence.plan.summary}</p><code>{evidence.plan.command}</code></section> : null}
+          {evidence?.decision ? <section className="detail-section"><div className="section-title"><h3>Rebase decision</h3><span>{evidence.decision.selectedOption ? "selected" : "required"}</span></div><p>{evidence.decision.question}</p>{!evidence.decision.selectedOption ? <div className="decision-options">{evidence.decision.options.map((option) => <button className={option.recommended ? "primary-btn" : "secondary-btn"} type="button" key={option.id} onClick={() => void onChooseRebaseDecision(run.id, option.id)}><span>{option.label}</span><small>{option.description}</small></button>)}</div> : null}</section> : null}
           {evidence ? <>
             <section className="detail-section"><div className="section-title"><h3>Agent-owned rebase timeline</h3><span>{evidence.baseRef ?? "base ref unavailable"} · {evidence.state}</span></div><ol className="timeline">{evidence.stages.map((stage) => <li key={`${stage.sequence}-${stage.type}`}><span className="timeline-dot" /><div><strong>{stage.type.replace(/_/g, " ")}</strong><p>{stage.message}</p><time>{new Date(stage.createdAt).toLocaleString()}</time></div></li>)}</ol></section>
             <section className="detail-section"><div className="section-title"><h3>Conflict resolutions</h3><span>{evidence.conflicts.length} captured</span></div>{evidence.conflicts.length ? evidence.conflicts.map((conflict) => <ConflictRow key={conflict.id} conflict={conflict} />) : <p className="empty-state compact">No conflicts were encountered.</p>}</section>
@@ -841,6 +869,14 @@ function RunDetailsDrawer({ action, details, loading, onClose, onShowDiff }: { a
       </aside><button className="drawer-scrim" type="button" aria-label="Close run details" onClick={onClose} />
     </div>
   );
+}
+
+function RunEventsSection({ events }: { events: AgentRunEvent[] }) {
+  return <section className="detail-section run-events-section"><div className="section-title"><h3>Run events</h3><span>{events.length} recorded</span></div>{events.length ? <RunEventList events={events} /> : <p className="empty-state compact">No events were recorded for this run.</p>}</section>;
+}
+
+function RunEventList({ events }: { events: AgentRunEvent[] }) {
+  return <ol className="run-event-list">{events.map((event) => <li key={`${event.sequence}-${event.createdAt}`}><div><strong>{event.type.replace(/_/g, " ")}</strong><p>{event.message}</p></div><time dateTime={event.createdAt}>{new Date(event.createdAt).toLocaleString()}</time></li>)}</ol>;
 }
 
 function ConflictRow({ conflict }: { conflict: ConflictEvidence }) {

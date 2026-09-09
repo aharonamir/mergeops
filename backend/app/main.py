@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from .github_sync import sync_github_pull_requests
-from .models import AgentRun, AgentSettings, AppData, CheckoutResult, CreateAgentRunRequest, CreateCheckoutRequest, CreatePatchReviewRequest, CreateTeamMemberRequest, GitHubSettingsPublic, GitHubSyncResult, TeamMember, UpdateAgentSettingsRequest, UpdateGitHubSettingsRequest, UpdateTeamMemberRequest
+from .models import AgentRun, AgentSettings, AppData, CheckoutResult, CreateAgentRunRequest, CreateCheckoutRequest, CreatePatchReviewRequest, CreateTeamMemberRequest, GitHubSettingsPublic, GitHubSyncResult, SelectRebaseDecisionRequest, TeamMember, UpdateAgentSettingsRequest, UpdateGitHubSettingsRequest, UpdateTeamMemberRequest
 from .store import store
 
 agent_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mergeops-agent")
@@ -57,6 +57,17 @@ async def post_agent_run_cancel(run_id: str) -> AgentRun:
         return store.cancel_agent_run(run_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/agent-runs/{run_id}/rebase-decision")
+async def post_rebase_decision(run_id: str, payload: SelectRebaseDecisionRequest) -> AgentRun:
+    try:
+        run = store.select_rebase_decision(run_id, payload.optionId)
+        if run.status == "queued":
+            agent_executor.submit(store.execute_agent_run, run.id, run.backendId, run.pullRequestId, run.action)
+        return run
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/agent-runs/{run_id}/review")
