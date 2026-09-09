@@ -1,3 +1,4 @@
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, HTTPException
@@ -8,6 +9,7 @@ from .models import AgentRun, AgentSettings, AppData, CheckoutResult, CreateAgen
 from .store import store
 
 agent_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mergeops-agent")
+github_sync_lock = asyncio.Lock()
 
 app = FastAPI(title="MergeOps API", version="0.1.0")
 
@@ -145,10 +147,13 @@ async def patch_agent_settings(payload: UpdateAgentSettingsRequest) -> AgentSett
 
 @app.post("/api/sync/github")
 async def post_github_sync() -> GitHubSyncResult:
-    try:
-        return sync_github_pull_requests(store)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    async with github_sync_lock:
+        try:
+            # GitHub sync uses blocking urllib calls and may make many requests.
+            # Keep that work off the event loop so health and other API calls stay responsive.
+            return await asyncio.to_thread(sync_github_pull_requests, store)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 def run() -> None:

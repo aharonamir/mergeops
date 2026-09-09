@@ -61,6 +61,82 @@ function statusLabel(status: string) {
   }[status] ?? status;
 }
 
+function matchesQueue(pr: PullRequest, queue: QueueFilter) {
+  const status = statusFor(pr);
+  return queue === "all"
+    || (queue === "conflict" && status === "conflict")
+    || (queue === "review" && status === "review")
+    || (queue === "merged" && pr.state === "merged")
+    || (queue === "closed" && pr.state === "closed");
+}
+
+const memberStatusFilters = ["conflict", "review", "merged", "closed"] as const;
+type MemberStatusFilter = (typeof memberStatusFilters)[number];
+
+const memberStatusLabels: Record<MemberStatusFilter, string> = {
+  conflict: "Conflict",
+  review: "Review",
+  merged: "Merged",
+  closed: "Closed"
+};
+
+function piePoint(angle: number, radius: number) {
+  const radians = (angle - 90) * Math.PI / 180;
+  return { x: 50 + radius * Math.cos(radians), y: 50 + radius * Math.sin(radians) };
+}
+
+function piePath(start: number, end: number) {
+  const startPoint = piePoint(start, 44);
+  const endPoint = piePoint(end, 44);
+  const largeArc = end - start > 180 ? 1 : 0;
+  return `M 50 50 L ${startPoint.x} ${startPoint.y} A 44 44 0 ${largeArc} 1 ${endPoint.x} ${endPoint.y} Z`;
+}
+
+function MemberStatusChart(props: {
+  counts: Record<MemberStatusFilter, number>;
+  memberName: string;
+  activeFilter: QueueFilter;
+  onFilter: (filter: MemberStatusFilter) => void;
+}) {
+  const total = memberStatusFilters.reduce((sum, filter) => sum + props.counts[filter], 0);
+  let angle = 0;
+  return (
+    <div className="member-status-chart">
+      <div className={`status-pie ${total ? "" : "is-empty"}`} role="img" aria-label={`${props.memberName}: ${memberStatusFilters.map((filter) => `${memberStatusLabels[filter]} ${props.counts[filter]}`).join(", ")}`}>
+        <svg viewBox="0 0 100 100" aria-hidden="true">
+          <circle className="status-pie-track" cx="50" cy="50" r="44" />
+          {total > 0 && memberStatusFilters.map((filter) => {
+            const sliceStart = angle;
+            const sliceEnd = angle + (props.counts[filter] / total) * 360;
+            angle = sliceEnd;
+            if (props.counts[filter] === 0) return null;
+            return props.counts[filter] === total ? (
+              <circle className={`status-pie-slice ${filter}`} cx="50" cy="50" r="44" key={filter}>
+                <title>{`${memberStatusLabels[filter]}: ${props.counts[filter]}`}</title>
+              </circle>
+            ) : (
+              <path className={`status-pie-slice ${filter}`} d={piePath(sliceStart, sliceEnd)} key={filter}>
+                <title>{`${memberStatusLabels[filter]}: ${props.counts[filter]}`}</title>
+              </path>
+            );
+          })}
+          <circle className="status-pie-hole" cx="50" cy="50" r="25" />
+          <text className="status-pie-total" x="50" y="53" textAnchor="middle">{total}</text>
+        </svg>
+      </div>
+      <div className="status-pie-legend" aria-label={`${props.memberName} PR status breakdown`}>
+        {memberStatusFilters.map((filter) => (
+          <button className={`status-pie-key ${filter} ${props.activeFilter === filter ? "is-active" : ""}`} key={filter} type="button" onClick={() => props.onFilter(filter)} title={`Show ${memberStatusLabels[filter]} PRs for ${props.memberName}`}>
+            <span className={`status-pie-dot ${filter}`} aria-hidden="true" />
+            <span>{memberStatusLabels[filter]}</span>
+            <strong>{props.counts[filter]}</strong>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function drawerPlan(status: string) {
   if (status === "conflict") {
     return {
@@ -206,12 +282,7 @@ export function App() {
     const needle = query.trim().toLowerCase();
     return scopedPrs.filter((pr) => {
       const status = statusFor(pr);
-      const queueMatch =
-        queue === "all" ||
-        (queue === "blocked" && ["conflict", "checks"].includes(status)) ||
-        (queue === "review" && status === "review") ||
-        (queue === "ready" && status === "ready") ||
-        (queue === "merged" && pr.state === "merged");
+      const queueMatch = matchesQueue(pr, queue);
       const repoMatch = repo === "all" || pr.repository === repo;
       const searchTarget = `${pr.title} ${pr.repository} ${pr.sourceBranch} ${pr.linkedIssueIds.join(" ")} ${pr.summary} ${pr.searchText}`.toLowerCase();
       return queueMatch && repoMatch && (!needle || searchTarget.includes(needle));
@@ -427,7 +498,11 @@ export function App() {
             teamById={teamById}
             github={data.github}
             queue={queue}
-            onQueueChange={setQueue}
+            onQueueChange={(nextQueue) => {
+              setQueue(nextQueue);
+              setOwner("all");
+            }}
+            onMemberFilter={setOwner}
             onSelectPr={setSelectedPr}
             dateRange={dateRange}
             onDateRangeChange={setDateRange}
@@ -486,6 +561,7 @@ function Cockpit(props: {
   github?: GitHubSettings | null;
   queue: QueueFilter;
   onQueueChange: (queue: QueueFilter) => void;
+  onMemberFilter: (memberId: string) => void;
   onSelectPr: (pr: PullRequest) => void;
   dateRange: number | "all";
   onDateRangeChange: (range: number | "all") => void;
@@ -518,9 +594,9 @@ function Cockpit(props: {
       </div>
       <div className="cockpit-filters">
         <div className="saved-views" role="group" aria-label="Saved views">
-          {(["all", "blocked", "review", "ready", "merged"] as QueueFilter[]).map((item) => (
+          {(["all", "conflict", "review", "merged", "closed"] as QueueFilter[]).map((item) => (
             <button key={item} className={`seg ${props.queue === item ? "is-active" : ""}`} onClick={() => props.onQueueChange(item)}>
-              {item === "all" ? "All" : item === "blocked" ? "Blocked" : item === "review" ? "Needs review" : item === "ready" ? "Ready" : "Merged"}
+              {item === "all" ? "All" : item === "conflict" ? "Conflict" : item === "review" ? "Review" : item === "merged" ? "Merged" : "Closed"}
             </button>
           ))}
         </div>
@@ -531,7 +607,12 @@ function Cockpit(props: {
       <div className="team-strip">
         {props.teamMembers.map((member) => {
           const owned = props.allPrs.filter((pr) => pr.ownerMemberId === member.id);
-          const blocked = owned.filter((pr) => ["conflict", "checks"].includes(statusFor(pr))).length;
+          const counts: Record<MemberStatusFilter, number> = {
+            conflict: owned.filter((pr) => matchesQueue(pr, "conflict")).length,
+            review: owned.filter((pr) => matchesQueue(pr, "review")).length,
+            merged: owned.filter((pr) => matchesQueue(pr, "merged")).length,
+            closed: owned.filter((pr) => matchesQueue(pr, "closed")).length
+          };
           return (
             <article className="member-tile" key={member.id}>
               <div className="member-top">
@@ -541,8 +622,16 @@ function Cockpit(props: {
               </div>
               <div className="tag-row">
                 <span className="tag">{member.currentFocus}</span>
-                <span className={`status ${blocked ? "conflict" : "ready"}`}>{blocked ? `${blocked} blocked` : "clear"}</span>
               </div>
+              <MemberStatusChart
+                counts={counts}
+                memberName={member.displayName}
+                activeFilter={props.queue}
+                onFilter={(filter) => {
+                  props.onQueueChange(filter);
+                  props.onMemberFilter(member.id);
+                }}
+              />
             </article>
           );
         })}
