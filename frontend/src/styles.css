@@ -852,6 +852,11 @@ label span {
 .status.ready { color: var(--green); border-color: color-mix(in srgb, var(--green) 42%, var(--line)); }
 .status.checks { color: var(--blue); border-color: color-mix(in srgb, var(--blue) 42%, var(--line)); }
 .status.agent { color: var(--violet); border-color: color-mix(in srgb, var(--violet) 42%, var(--line)); }
+.status.is-failed { color: var(--red); border-color: color-mix(in srgb, var(--red) 48%, var(--line)); background: color-mix(in srgb, var(--red) 10%, var(--surface)); }
+
+.failure-copy {
+  color: var(--red);
+}
 
 .table-shell {
   overflow: hidden;
