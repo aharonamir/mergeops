@@ -1,6 +1,7 @@
 # MergeOps
 
 Local-first PR-first SDLC cockpit.
+<img width="1822" height="915" alt="image" src="https://github.com/user-attachments/assets/ca8bb079-9ede-40c4-801b-538722500b2e" />
 
 The original static prototype is still available at `index.html`. The real app scaffold now lives in `frontend/` and `backend/`.
 
