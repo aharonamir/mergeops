@@ -11,13 +11,14 @@ from pydantic import Field
 
 from .adapters import AgentRunRequest, AgentRunResult, RunWorkspace, adapter_registry, inspect_workspace, utc_now
 from .fixtures import agent_backends, agent_runs, github_settings, pull_requests, team_members
-from .models import ActionRecord, ActionSummary, ActivityEvent, AgentRun, AgentRunEvent, AgentRunSummary, AgentSettings, AppData, ApprovalRecord, BoundedText, CheckResult, CheckoutResult, CreateTeamMemberRequest, GitHubSettings, GitHubSettingsPublic, PullRequest, RebaseEvidence, RepositoryConfig, TeamMember, UpdateAgentSettingsRequest, UpdateGitHubSettingsRequest, UpdateTeamMemberRequest
+from .models import ActionRecord, ActionSummary, ActivityEvent, AgentFeedback, AgentRun, AgentRunEvent, AgentRunSummary, AgentSettings, AppData, ApprovalRecord, BoundedText, CheckResult, CheckoutResult, CreatePrNoteRequest, CreateRevisionRequest, CreateTeamMemberRequest, GitHubSettings, GitHubSettingsPublic, PrAnnotations, PrNote, PullRequest, RebaseEvidence, RepositoryConfig, TeamMember, UpdateAgentSettingsRequest, UpdateGitHubSettingsRequest, UpdatePrNoteRequest, UpdateTeamMemberRequest
 
 
 class PersistedAppData(AppData):
     agentRuns: list[AgentRun]
     actions: list[ActionRecord] = Field(default_factory=list)
     githubPrivate: GitHubSettings
+    prAnnotations: list[PrAnnotations] = Field(default_factory=list)
 
 
 class LocalJsonStore:
@@ -78,6 +79,39 @@ class LocalJsonStore:
     def create_agent_run(self, backend_id: str, pull_request_id: str, action: str) -> AgentRun:
         run = self.queue_agent_run(backend_id, pull_request_id, action)
         return self.execute_agent_run(run.id, backend_id, pull_request_id, action)
+
+    def queue_revision(self, backend_id: str, parent_run_id: str, payload: CreateRevisionRequest) -> AgentRun:
+        data = self._load()
+        parent = next((item for item in data.agentRuns if item.id == parent_run_id), None)
+        if parent is None:
+            raise ValueError("Unknown agent run")
+        if parent.status in {"queued", "running", "awaiting_decision", "pushed", "cancelled"}:
+            raise ValueError(f"Run cannot be revised in its current state: {parent.status}")
+        if not parent.workspacePath or not parent.diff or not parent.diff.strip():
+            raise ValueError("Run has no retained prepared patch to revise")
+        if not Path(parent.workspacePath).is_dir():
+            raise ValueError("Run workspace is no longer available")
+        enabled_backends = adapter_registry([(backend.id, backend.endpoint) for backend in data.agentBackends if backend.enabled])
+        if backend_id not in enabled_backends:
+            raise ValueError("Unknown agent backend")
+        created_at = utc_now()
+        feedback = AgentFeedback(instruction=payload.instruction.strip(), reason=payload.reason.strip() if payload.reason else None, createdAt=created_at)
+        run = AgentRun(
+            id=f"run-{uuid4().hex[:12]}", backendId=backend_id, repository=parent.repository,
+            pullRequestId=parent.pullRequestId, pullRequestNumber=parent.pullRequestNumber,
+            action="revise_with_feedback", status="queued", requester="local user",
+            summary=f"Queued revision from feedback for {parent.repository}#{parent.pullRequestNumber}.",
+            parentRunId=parent.id, feedback=feedback, workspacePath=parent.workspacePath,
+            baseCommit=parent.baseCommit,
+            events=[AgentRunEvent(sequence=1, type="queued", message="Feedback revision queued; waiting for an available worker.", createdAt=created_at)],
+            createdAt=created_at,
+        )
+        data.agentRuns.insert(0, run)
+        data.actions.insert(0, ActionRecord(id=run.id, kind="agent_run", repository=run.repository, pullRequestId=run.pullRequestId, pullRequestNumber=run.pullRequestNumber, action=run.action, status=run.status, summary=run.summary, parentRunId=run.parentRunId, feedback=run.feedback, workspacePath=run.workspacePath, baseCommit=run.baseCommit, events=run.events, createdAt=run.createdAt))
+        data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="agent_feedback", message=f"Feedback revision queued for {run.repository}#{run.pullRequestNumber}.", actionId=run.id, createdAt=created_at))
+        self._cancel_events[run.id] = Event()
+        self._save(data)
+        return run
 
     def queue_patch_review(self, backend_id: str, parent_run_id: str) -> AgentRun:
         data = self._load()
@@ -203,6 +237,7 @@ class LocalJsonStore:
         run = next((item for item in data.agentRuns if item.id == run_id), None)
         if pull_request is None or run is None:
             raise ValueError("Unknown agent run")
+        parent_run = next((item for item in data.agentRuns if item.id == run.parentRunId), None) if run.parentRunId else None
         repository = self._repository_config(data, self._pull_request_repository_key(pull_request, data))
         adapter = adapter_registry([(backend.id, backend.endpoint) for backend in data.agentBackends if backend.enabled]).get(backend_id)
         if adapter is None:
@@ -255,6 +290,11 @@ class LocalJsonStore:
                 result = None
         else:
             result = None
+        if action == "revise_with_feedback":
+            if not run.workspacePath:
+                result = AgentRunResult(status="failed", summary="Feedback revision has no retained workspace.")
+            else:
+                existing_workspace_path = run.workspacePath
         try:
             if result is None:
                 result = adapter.create_run(AgentRunRequest(
@@ -273,6 +313,9 @@ class LocalJsonStore:
                 runner_timeout_seconds=data.agentSettings.runnerTimeoutSeconds,
                 existing_workspace_path=existing_workspace_path,
                 rebase_plan=rebase_plan,
+                previous_agent_output=parent_run.agentOutput if parent_run else None,
+                feedback_instruction=run.feedback.instruction if run.feedback else None,
+                feedback_reason=run.feedback.reason if run.feedback else None,
             ), on_event=lambda event: self.append_agent_event(run_id, event), cancel_event=cancel_event)
         except Exception as exc:
             result = AgentRunResult(status="failed", summary=f"Agent worker failed: {exc}", events=[{"type": "error", "message": f"Agent worker failed: {exc}", "createdAt": utc_now()}])
@@ -284,7 +327,7 @@ class LocalJsonStore:
         if result.workspace_path and result.status == "awaiting_approval":
             self.append_agent_event(run_id, {"type": "checks_started", "message": "Running required checks against the prepared workspace."})
             review_base = None
-            if action in {"fix_conflicts", "rebase"} and pull_request.baseBranch:
+            if (action in {"fix_conflicts", "rebase"} or (action == "revise_with_feedback" and parent_run and parent_run.action in {"fix_conflicts", "rebase"})) and pull_request.baseBranch:
                 review_base = f"origin/{pull_request.baseBranch}...HEAD"
             try:
                 patch_summary, raw_diff, raw_checks, risk_summary = inspect_workspace(
@@ -413,7 +456,7 @@ class LocalJsonStore:
             self._save(data)
             return approved
 
-    def push_agent_run(self, run_id: str) -> AgentRun:
+    def push_agent_run(self, run_id: str, target: str = "mergeops_branch") -> AgentRun:
         data = self._load()
         run = next((item for item in data.agentRuns if item.id == run_id), None)
         if run is None:
@@ -424,19 +467,37 @@ class LocalJsonStore:
             raise ValueError("Run has no isolated workspace to push")
         if run.baseCommit != run.approval.baseCommit:
             raise ValueError("Run base commit changed after approval")
-        push_ref = f"mergeops/{run.id}"
+        if target not in {"mergeops_branch", "pr_branch"}:
+            raise ValueError("Unsupported push target")
+        pull_request = next((item for item in data.pullRequests if item.id == run.pullRequestId), None)
+        if pull_request is None:
+            raise ValueError("Pull request no longer exists")
+        push_ref = f"mergeops/{run.id}" if target == "mergeops_branch" else pull_request.sourceBranch
         try:
             workspace = Path(run.workspacePath)
             if run.diff:
                 RunWorkspace._git(workspace, "add", "-A")
                 if RunWorkspace._git_optional(workspace, "diff", "--cached", "--quiet") is False:
                     RunWorkspace._git(workspace, "commit", "-m", f"MergeOps prepare {run.repository}#{run.pullRequestNumber}")
-            RunWorkspace._git(workspace, "push", "origin", f"HEAD:refs/heads/{push_ref}", token=data.githubPrivate.token)
+            if target == "pr_branch":
+                if not pull_request.headRepositoryFullName or not pull_request.sourceBranch:
+                    raise ValueError("The PR head repository and source branch are required for a direct PR-branch push")
+                remote_url = f"https://github.com/{pull_request.headRepositoryFullName}.git"
+                RunWorkspace._git(workspace, "remote", "remove", "mergeops-pr-head") if RunWorkspace._git_optional(workspace, "remote", "get-url", "mergeops-pr-head") else None
+                RunWorkspace._git(workspace, "remote", "add", "mergeops-pr-head", remote_url)
+                RunWorkspace._git(workspace, "fetch", "--no-tags", "mergeops-pr-head", pull_request.sourceBranch, token=data.githubPrivate.token)
+                remote_ref = "FETCH_HEAD"
+                if not RunWorkspace._git_optional(workspace, "merge-base", "--is-ancestor", remote_ref, "HEAD"):
+                    raise ValueError("The PR branch changed or is not an ancestor of the prepared workspace; refresh and revise again")
+                RunWorkspace._git(workspace, "push", "--porcelain", "mergeops-pr-head", f"HEAD:refs/heads/{push_ref}", token=data.githubPrivate.token)
+            else:
+                RunWorkspace._git(workspace, "push", "origin", f"HEAD:refs/heads/{push_ref}", token=data.githubPrivate.token)
         except Exception as exc:
             data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="push", message=f"Push failed for {run.repository}#{run.pullRequestNumber}: {exc}", actionId=run.id, createdAt=utc_now()))
             self._save(data)
             raise ValueError(f"Push failed: {exc}") from exc
-        pushed = run.model_copy(update={"status": "pushed", "pushRef": push_ref, "summary": f"Pushed approved patch to {push_ref}."})
+        destination = "the PR branch" if target == "pr_branch" else f"{push_ref}"
+        pushed = run.model_copy(update={"status": "pushed", "pushRef": push_ref, "summary": f"Pushed approved patch to {destination}."})
         data.agentRuns = [pushed if item.id == run_id else item for item in data.agentRuns]
         data.actions = [item.model_copy(update={"status": pushed.status, "summary": pushed.summary, "approval": pushed.approval, "pushRef": pushed.pushRef}) if item.id == run_id else item for item in data.actions]
         data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="push", message=f"Pushed approved run for {run.repository}#{run.pullRequestNumber} to {push_ref}.", actionId=run.id, createdAt=utc_now()))
@@ -470,6 +531,61 @@ class LocalJsonStore:
             if run is not None:
                 return run
         return action
+
+    def pr_annotations(self, pull_request_id: str) -> PrAnnotations:
+        data = self._load()
+        if not any(item.id == pull_request_id for item in data.pullRequests):
+            raise ValueError("Unknown pull request")
+        return next((item for item in data.prAnnotations if item.pullRequestId == pull_request_id), PrAnnotations(pullRequestId=pull_request_id))
+
+    def update_pr_tags(self, pull_request_id: str, tags: list[str]) -> PrAnnotations:
+        with self._write_lock:
+            data = self._load()
+            if not any(item.id == pull_request_id for item in data.pullRequests):
+                raise ValueError("Unknown pull request")
+            normalized = list(dict.fromkeys(tag.strip() for tag in tags if tag.strip()))[:30]
+            existing = self.pr_annotations(pull_request_id)
+            updated = existing.model_copy(update={"tags": normalized})
+            data.prAnnotations = [updated if item.pullRequestId == pull_request_id else item for item in data.prAnnotations]
+            if not any(item.pullRequestId == pull_request_id for item in data.prAnnotations):
+                data.prAnnotations.append(updated)
+            self._save(data)
+            return updated
+
+    def create_pr_note(self, pull_request_id: str, payload: CreatePrNoteRequest) -> PrAnnotations:
+        with self._write_lock:
+            data = self._load()
+            current = self.pr_annotations(pull_request_id)
+            created_at = utc_now()
+            note = PrNote(id=f"note-{uuid4().hex[:12]}", text=payload.text.strip(), createdAt=created_at, updatedAt=created_at)
+            updated = current.model_copy(update={"notes": [note, *current.notes]})
+            data.prAnnotations = [updated if item.pullRequestId == pull_request_id else item for item in data.prAnnotations]
+            if not any(item.pullRequestId == pull_request_id for item in data.prAnnotations):
+                data.prAnnotations.append(updated)
+            self._save(data)
+            return updated
+
+    def update_pr_note(self, pull_request_id: str, note_id: str, payload: UpdatePrNoteRequest) -> PrAnnotations:
+        with self._write_lock:
+            data = self._load()
+            current = self.pr_annotations(pull_request_id)
+            if not any(note.id == note_id for note in current.notes):
+                raise ValueError("Unknown PR note")
+            updated = current.model_copy(update={"notes": [note.model_copy(update={"text": payload.text.strip(), "updatedAt": utc_now()}) if note.id == note_id else note for note in current.notes]})
+            data.prAnnotations = [updated if item.pullRequestId == pull_request_id else item for item in data.prAnnotations]
+            self._save(data)
+            return updated
+
+    def delete_pr_note(self, pull_request_id: str, note_id: str) -> PrAnnotations:
+        with self._write_lock:
+            data = self._load()
+            current = self.pr_annotations(pull_request_id)
+            if not any(note.id == note_id for note in current.notes):
+                raise ValueError("Unknown PR note")
+            updated = current.model_copy(update={"notes": [note for note in current.notes if note.id != note_id]})
+            data.prAnnotations = [updated if item.pullRequestId == pull_request_id else item for item in data.prAnnotations]
+            self._save(data)
+            return updated
 
     def create_checkout(self, pull_request_id: str) -> CheckoutResult:
         data = self._load()
@@ -683,6 +799,8 @@ class LocalJsonStore:
             payload["activity"] = [ActivityEvent(id=f"activity-{action.id}", kind=action.kind, message=action.summary, actionId=action.id, createdAt=action.createdAt).model_dump(mode="json") for raw_action in payload.get("actions", []) for action in [ActionRecord.model_validate(raw_action)]]
         if "approvals" not in payload:
             payload["approvals"] = []
+        if "prAnnotations" not in payload:
+            payload["prAnnotations"] = []
         payload["github"] = self._public_github(GitHubSettings.model_validate(payload["githubPrivate"])).model_dump(mode="json")
         data = PersistedAppData.model_validate(payload)
         normalized = [self._normalize_pull_request(pull_request, data) for pull_request in data.pullRequests]
@@ -710,6 +828,7 @@ class LocalJsonStore:
             actions=[self._action_summary(action) for action in data.actions],
             activity=data.activity,
             approvals=data.approvals,
+            prTags={item.pullRequestId: item.tags for item in data.prAnnotations if item.tags},
             github=self._public_github(data.githubPrivate),
         )
 

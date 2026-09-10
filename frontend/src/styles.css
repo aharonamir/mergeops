@@ -899,6 +899,21 @@ label span {
   gap: 3px;
 }
 
+.pr-tag-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 3px;
+  font-family: inherit !important;
+}
+
+.pr-tag-row .tag {
+  min-height: 20px;
+  padding: 0 6px;
+  color: var(--ink);
+  font-size: 11px;
+}
+
 .empty-state {
   display: grid;
   gap: 6px;
@@ -1175,7 +1190,7 @@ label span {
   background: var(--surface);
   border-left: 1px solid var(--line);
   box-shadow: var(--shadow);
-  z-index: 20;
+  z-index: 50;
   overflow-y: auto;
 }
 
@@ -1183,7 +1198,7 @@ label span {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, .28);
-  z-index: 15;
+  z-index: 45;
 }
 
 .drawer-head {
@@ -1238,6 +1253,101 @@ label span {
 .drawer-meta {
   color: var(--muted);
   font-size: 13px;
+}
+
+.panel-title,
+.push-choice,
+.tag-editor,
+.sticky-note footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.panel-title {
+  justify-content: space-between;
+}
+
+.panel-title h3 {
+  margin: 0;
+}
+
+.panel-title span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.tag-editor input,
+.feedback-form input,
+.feedback-form textarea,
+.notes-panel textarea {
+  min-width: 0;
+  width: 100%;
+}
+
+.local-tag {
+  background: color-mix(in srgb, var(--green) 12%, var(--surface-2));
+}
+
+.removable-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+}
+
+.note-list,
+.feedback-panel,
+.feedback-form {
+  display: grid;
+  gap: 10px;
+}
+
+.sticky-note {
+  display: grid;
+  gap: 10px;
+  background: var(--surface-2);
+  border-radius: var(--radius);
+  padding: 12px;
+}
+
+.sticky-note p {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.sticky-note footer {
+  justify-content: space-between;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.sticky-note button {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.feedback-form {
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.feedback-form label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.push-choice select {
+  max-width: 180px;
 }
 
 .kv {

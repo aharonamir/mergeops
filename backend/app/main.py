@@ -5,7 +5,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from .github_sync import sync_github_pull_requests
-from .models import AgentRun, AgentSettings, AppData, CheckoutResult, CreateAgentRunRequest, CreateCheckoutRequest, CreatePatchReviewRequest, CreateTeamMemberRequest, GitHubSettingsPublic, GitHubSyncResult, SelectRebaseDecisionRequest, TeamMember, UpdateAgentSettingsRequest, UpdateGitHubSettingsRequest, UpdateTeamMemberRequest
+from .models import AgentRun, AgentSettings, AppData, CheckoutResult, CreateAgentRunRequest, CreateCheckoutRequest, CreatePatchReviewRequest, CreatePrNoteRequest, CreateRevisionRequest, CreateTeamMemberRequest, GitHubSettingsPublic, GitHubSyncResult, PrAnnotations, PushAgentRunRequest, SelectRebaseDecisionRequest, TeamMember, UpdateAgentSettingsRequest, UpdateGitHubSettingsRequest, UpdatePrNoteRequest, UpdatePrTagsRequest, UpdateTeamMemberRequest
 from .store import store
 
 agent_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mergeops-agent")
@@ -82,6 +82,16 @@ async def post_agent_run_review(run_id: str, payload: CreatePatchReviewRequest) 
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+@app.post("/api/agent-runs/{run_id}/revise")
+async def post_agent_run_revision(run_id: str, payload: CreateRevisionRequest) -> AgentRun:
+    try:
+        run = store.queue_revision(payload.backendId, run_id, payload)
+        agent_executor.submit(store.execute_agent_run, run.id, run.backendId, run.pullRequestId, run.action)
+        return run
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.post("/api/agent-runs/{run_id}/approve")
 async def post_agent_run_approve(run_id: str) -> AgentRun:
     try:
@@ -91,11 +101,51 @@ async def post_agent_run_approve(run_id: str) -> AgentRun:
 
 
 @app.post("/api/agent-runs/{run_id}/push")
-async def post_agent_run_push(run_id: str) -> AgentRun:
+async def post_agent_run_push(run_id: str, payload: PushAgentRunRequest | None = None) -> AgentRun:
     try:
-        return store.push_agent_run(run_id)
+        return store.push_agent_run(run_id, payload.target if payload else "mergeops_branch")
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/api/pull-requests/{pull_request_id}/annotations", response_model=PrAnnotations)
+async def get_pr_annotations(pull_request_id: str) -> PrAnnotations:
+    try:
+        return store.pr_annotations(pull_request_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.put("/api/pull-requests/{pull_request_id}/annotations/tags", response_model=PrAnnotations)
+async def put_pr_tags(pull_request_id: str, payload: UpdatePrTagsRequest) -> PrAnnotations:
+    try:
+        return store.update_pr_tags(pull_request_id, payload.tags)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/pull-requests/{pull_request_id}/annotations/notes", response_model=PrAnnotations)
+async def post_pr_note(pull_request_id: str, payload: CreatePrNoteRequest) -> PrAnnotations:
+    try:
+        return store.create_pr_note(pull_request_id, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.patch("/api/pull-requests/{pull_request_id}/annotations/notes/{note_id}", response_model=PrAnnotations)
+async def patch_pr_note(pull_request_id: str, note_id: str, payload: UpdatePrNoteRequest) -> PrAnnotations:
+    try:
+        return store.update_pr_note(pull_request_id, note_id, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.delete("/api/pull-requests/{pull_request_id}/annotations/notes/{note_id}", response_model=PrAnnotations)
+async def delete_pr_note(pull_request_id: str, note_id: str) -> PrAnnotations:
+    try:
+        return store.delete_pr_note(pull_request_id, note_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.post("/api/checkouts")

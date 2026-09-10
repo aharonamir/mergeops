@@ -20,8 +20,8 @@ import {
   ChevronDown,
   ChevronUp
 } from "lucide-react";
-import { approveAgentRun, cancelAgentRun, checkBackendHealth, clearAction, createAgentRun, createCheckout, createTeamMember, deleteTeamMember, loadActionDetails, loadAppData, pushAgentRun, reviewPatch, selectRebaseDecision, syncGitHub, updateAgentSettings, updateGitHubSettings, updateTeamMember } from "./api";
-import type { ActionRecord, ActivityEvent, AgentBackend, AgentRun, AgentRunEvent, AgentRunSummary, AgentSettings, AppData, ConflictEvidence, GitHubSettings, GitHubSyncResult, PullRequest, QueueFilter, RepositoryConfig, TeamMember, ThemePreference, View } from "./types";
+import { approveAgentRun, cancelAgentRun, checkBackendHealth, clearAction, createAgentRun, createCheckout, createPrNote, createTeamMember, deletePrNote, deleteTeamMember, loadActionDetails, loadAppData, loadPrAnnotations, pushAgentRun, reviseAgentRun, reviewPatch, selectRebaseDecision, syncGitHub, updateAgentSettings, updateGitHubSettings, updatePrTags, updateTeamMember } from "./api";
+import type { ActionRecord, ActivityEvent, AgentBackend, AgentRun, AgentRunEvent, AgentRunSummary, AgentSettings, AppData, ConflictEvidence, GitHubSettings, GitHubSyncResult, PrAnnotations, PullRequest, QueueFilter, RepositoryConfig, TeamMember, ThemePreference, View } from "./types";
 
 const themeIcons = {
   system: Monitor,
@@ -119,7 +119,7 @@ function drawerPlan(status: string) {
 }
 
 function actionFromRun(run: AgentRun): ActionRecord {
-  return { id: run.id, kind: "agent_run", repository: run.repository, pullRequestId: run.pullRequestId, pullRequestNumber: run.pullRequestNumber, action: run.action, status: run.status, summary: run.summary, parentRunId: run.parentRunId, agentOutput: run.agentOutput, workspacePath: run.workspacePath, baseCommit: run.baseCommit, events: run.events, patchSummary: run.patchSummary, diff: run.diff, checks: run.checks, riskSummary: run.riskSummary, approval: run.approval, pushRef: run.pushRef, createdAt: run.createdAt };
+  return { id: run.id, kind: "agent_run", repository: run.repository, pullRequestId: run.pullRequestId, pullRequestNumber: run.pullRequestNumber, action: run.action, status: run.status, summary: run.summary, parentRunId: run.parentRunId, feedback: run.feedback, agentOutput: run.agentOutput, workspacePath: run.workspacePath, baseCommit: run.baseCommit, events: run.events, patchSummary: run.patchSummary, diff: run.diff, checks: run.checks, riskSummary: run.riskSummary, approval: run.approval, pushRef: run.pushRef, createdAt: run.createdAt };
 }
 
 function actionFromSummary(run: AgentRunSummary): ActionRecord {
@@ -137,6 +137,7 @@ export function App() {
   const [dateRange, setDateRange] = useState<number | "all">(60);
   const [query, setQuery] = useState("");
   const [selectedPr, setSelectedPr] = useState<PullRequest | null>(null);
+  const [annotations, setAnnotations] = useState<PrAnnotations | null>(null);
   const [runs, setRuns] = useState<Array<AgentRun | AgentRunSummary>>([]);
   const [actions, setActions] = useState<ActionRecord[]>([]);
   const [activity, setActivity] = useState<ActivityEvent[]>([]);
@@ -198,6 +199,20 @@ export function App() {
     localStorage.setItem("mergeops.agentBackend", backendId);
   }, [backendId]);
 
+  useEffect(() => {
+    if (!selectedPr) {
+      setAnnotations(null);
+      return;
+    }
+    let disposed = false;
+    void loadPrAnnotations(selectedPr.id).then((next) => {
+      if (!disposed) setAnnotations(next);
+    }).catch(() => {
+      if (!disposed) setAnnotations({ pullRequestId: selectedPr.id, tags: [], notes: [] });
+    });
+    return () => { disposed = true; };
+  }, [selectedPr]);
+
   const backend = useMemo(() => {
     return data?.agentBackends.find((item) => item.id === backendId) ?? data?.agentBackends[0];
   }, [backendId, data]);
@@ -221,7 +236,7 @@ export function App() {
       const status = statusFor(pr);
       const queueMatch = matchesQueue(pr, queue);
       const repoMatch = repo === "all" || pr.repository === repo;
-      const searchTarget = `${pr.title} ${pr.repository} ${pr.sourceBranch} ${pr.linkedIssueIds.join(" ")} ${pr.summary} ${pr.searchText}`.toLowerCase();
+      const searchTarget = `${pr.title} ${pr.repository} ${pr.sourceBranch} ${pr.linkedIssueIds.join(" ")} ${(data?.prTags?.[pr.id] ?? []).join(" ")} ${pr.summary} ${pr.searchText}`.toLowerCase();
       return queueMatch && repoMatch && (!needle || searchTarget.includes(needle));
     });
   }, [query, queue, repo, scopedPrs]);
@@ -332,10 +347,27 @@ export function App() {
     setActions((current) => current.map((item) => item.id === run.id ? actionFromRun(run) : item));
   }
 
-  async function pushRun(runId: string) {
-    const run = await pushAgentRun(runId);
+  async function pushRun(runId: string, target: "mergeops_branch" | "pr_branch" = "mergeops_branch") {
+    const run = await pushAgentRun(runId, target);
     setRuns((current) => current.map((item) => item.id === run.id ? run : item));
     setActions((current) => current.map((item) => item.id === run.id ? actionFromRun(run) : item));
+  }
+
+  async function reviseRun(runId: string, instruction: string, reason?: string) {
+    const run = await reviseAgentRun(runId, { backendId, instruction, reason });
+    setRuns((current) => [run, ...current]);
+    setActions((current) => [actionFromRun(run), ...current]);
+    const refreshed = await loadAppData();
+    setActivity(refreshed.activity ?? []);
+  }
+
+  async function savePrTags(pullRequestId: string, tags: string[]) {
+    const updated = await updatePrTags(pullRequestId, tags);
+    setAnnotations(updated);
+    setData((current) => current ? {
+      ...current,
+      prTags: { ...(current.prTags ?? {}), [pullRequestId]: updated.tags }
+    } : current);
   }
 
   async function reviewRunPatch(runId: string) {
@@ -434,6 +466,7 @@ export function App() {
             teamMembers={data.teamMembers}
             teamById={teamById}
             github={data.github}
+            prTags={data.prTags ?? {}}
             owner={owner}
             queue={queue}
             onQueueChange={(nextQueue) => {
@@ -476,12 +509,18 @@ export function App() {
           pr={selectedPr}
           member={teamById.get(selectedPr.ownerMemberId)}
           backend={backend}
-          run={actions.find((action) => action.kind === "agent_run" && action.pullRequestId === selectedPr.id)}
+          run={actions.find((action) => action.kind === "agent_run" && action.pullRequestId === selectedPr.id && action.action !== "review_patch")}
+          annotations={annotations}
+          canPushPrBranch={Boolean(data.github?.hasToken && selectedPr.headRepositoryFullName)}
           onClose={() => setSelectedPr(null)}
           onStartRun={() => startRun(selectedPr)}
           onCheckout={() => checkoutPr(selectedPr)}
           onApproveRun={approveRun}
           onPushRun={pushRun}
+          onReviseRun={reviseRun}
+          onSaveTags={(tags) => savePrTags(selectedPr.id, tags)}
+          onSaveNote={async (text) => setAnnotations(await createPrNote(selectedPr.id, text))}
+          onDeleteNote={async (noteId) => setAnnotations(await deletePrNote(selectedPr.id, noteId))}
           checkoutMessage={checkoutMessage}
         />
       )}
@@ -497,6 +536,7 @@ function Cockpit(props: {
   teamMembers: TeamMember[];
   teamById: Map<string, TeamMember>;
   github?: GitHubSettings | null;
+  prTags: Record<string, string[]>;
   owner: string;
   queue: QueueFilter;
   onQueueChange: (queue: QueueFilter) => void;
@@ -599,10 +639,11 @@ function Cockpit(props: {
           {props.prs.map((pr) => {
             const member = props.teamById.get(pr.ownerMemberId);
             const status = statusFor(pr);
+            const tags = props.prTags[pr.id] ?? [];
             return (
               <div className="pr-row" role="row" key={pr.id}>
                 <div className="pr-cell"><span className={`status ${status}`}>{statusLabel(status)}</span></div>
-                <div className="pr-cell"><span className="pr-title"><strong>{pr.title}</strong><span>{pr.repository} #{pr.number} · {pr.state} · {pr.sourceBranch}</span></span></div>
+                <div className="pr-cell"><span className="pr-title"><strong>{pr.title}</strong><span>{pr.repository} #{pr.number} · {pr.state} · {pr.sourceBranch}</span>{tags.length ? <span className="pr-tag-row">{tags.map((tag) => <span className="tag local-tag" key={tag}>{tag}</span>)}</span> : null}</span></div>
                 <div className="pr-cell">{member?.displayName ?? pr.author}</div>
                 <div className="pr-cell">{pr.reviewState.replace("_", " ")}</div>
                 <div className="pr-cell">{pr.checkState.replace("_", " ")}</div>
@@ -894,6 +935,7 @@ function RunDetailsDrawer({ action, details, loading, onClose, onShowDiff, onCho
         <header className="drawer-head"><div><span className="eyebrow">Run details</span><h2 id="runDetailsTitle">{action.repository} #{action.pullRequestNumber}</h2><span>{action.id} · {action.action.replace(/_/g, " ")}</span></div><button className="icon-btn" onClick={onClose} aria-label="Close run details"><X size={18} /></button></header>
         {loading ? <div className="drawer-loading">Loading evidence…</div> : !run ? (details ? <div className="run-details-body"><section className="detail-overview"><span className="status agent detail-status">{details.status.replace(/_/g, " ")}</span><p>{details.summary}</p><div className="detail-facts"><span>Workspace <strong>{details.workspacePath ?? "not created"}</strong></span><span>Base commit <strong>{details.baseCommit?.slice(0, 12) ?? "unknown"}</strong></span><span>Events <strong>{events.length}</strong></span></div></section><RunEventsSection events={events} /><p className="empty-state">This action has no agent-owned rebase evidence.</p></div> : <div className="drawer-loading">Details are unavailable for this run.</div>) : <div className="run-details-body">
           <section className="detail-overview"><span className={`status agent detail-status ${run.status === "failed" ? "is-failed" : ""}`}>{run.status.replace(/_/g, " ")}</span><p>{run.summary}</p><div className="detail-facts"><span>Base commit <strong>{run.baseCommit?.slice(0, 12) ?? "unknown"}</strong></span><span>Workspace <strong>{run.workspacePath ?? "not created"}</strong></span><span>Checks <strong>{run.checks?.filter((check) => check.status === "passed").length ?? 0}/{run.checks?.length ?? 0} passed</strong></span></div></section>
+          {run.feedback ? <section className="detail-section"><div className="section-title"><h3>Human feedback</h3><span>{run.feedback.reason ?? "uncategorized"}</span></div><p>{run.feedback.instruction}</p>{run.parentRunId ? <p className="drawer-meta">Revision of {run.parentRunId}</p> : null}</section> : null}
           <RunEventsSection events={events} />
           {evidence?.plan ? <section className="detail-section"><div className="section-title"><h3>Rebase strategy</h3><span>{evidence.plan.strategy.replace(/_/g, " ")}</span></div><p>{evidence.plan.summary}</p><code>{evidence.plan.command}</code></section> : null}
           {evidence?.decision ? <section className="detail-section"><div className="section-title"><h3>Rebase decision</h3><span>{evidence.decision.selectedOption ? "selected" : "required"}</span></div><p>{evidence.decision.question}</p>{!evidence.decision.selectedOption ? <div className="decision-options">{evidence.decision.options.map((option) => <button className={option.recommended ? "primary-btn" : "secondary-btn"} type="button" key={option.id} onClick={() => void onChooseRebaseDecision(run.id, option.id)}><span>{option.label}</span><small>{option.description}</small></button>)}</div> : null}</section> : null}
@@ -1139,16 +1181,51 @@ function PrDrawer(props: {
   member?: TeamMember;
   backend: AgentBackend;
   run?: ActionRecord;
+  annotations: PrAnnotations | null;
+  canPushPrBranch: boolean;
   onClose: () => void;
   onStartRun: () => void;
   onCheckout: () => void;
   onApproveRun: (runId: string) => Promise<void>;
-  onPushRun: (runId: string) => Promise<void>;
+  onPushRun: (runId: string, target?: "mergeops_branch" | "pr_branch") => Promise<void>;
+  onReviseRun: (runId: string, instruction: string, reason?: string) => Promise<void>;
+  onSaveTags: (tags: string[]) => Promise<void>;
+  onSaveNote: (text: string) => Promise<void>;
+  onDeleteNote: (noteId: string) => Promise<void>;
   checkoutMessage: string;
 }) {
   const status = statusFor(props.pr);
   const plan = drawerPlan(status);
   const isOpen = props.pr.state === "open";
+  const [feedbackOpen, setFeedbackOpen] = useState(false);
+  const [feedback, setFeedback] = useState("");
+  const [reason, setReason] = useState("");
+  const [tagDraft, setTagDraft] = useState("");
+  const [noteDraft, setNoteDraft] = useState("");
+  const [message, setMessage] = useState("");
+  const annotations = props.annotations ?? { pullRequestId: props.pr.id, tags: [], notes: [] };
+  const canRevise = isOpen && !!props.run?.workspacePath && ["patch_ready", "approved"].includes(props.run.status);
+
+  async function submitFeedback() {
+    if (!props.run || !feedback.trim()) return;
+    setMessage("");
+    try {
+      await props.onReviseRun(props.run.id, feedback.trim(), reason.trim() || undefined);
+      setFeedback("");
+      setReason("");
+      setFeedbackOpen(false);
+      setMessage("Revision queued. The agent will preserve the existing patch and apply your feedback.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not queue the revision.");
+    }
+  }
+
+  async function addTag() {
+    const tag = tagDraft.trim();
+    if (!tag || annotations.tags.includes(tag)) return;
+    await props.onSaveTags([...annotations.tags, tag]);
+    setTagDraft("");
+  }
   return (
     <>
       <aside className="drawer is-open" aria-labelledby="drawerTitle">
@@ -1165,6 +1242,7 @@ function PrDrawer(props: {
               <span className={`status ${status}`}>{statusLabel(status)}</span>
               {props.pr.linkedIssueIds.map((issue) => <span className="tag" key={issue}>{issue}</span>)}
               <span className="tag">{props.member?.displayName ?? props.pr.author}</span>
+              {annotations.tags.map((tag) => <span className="tag local-tag" key={tag}>{tag}</span>)}
             </div>
             <p>{props.pr.summary}</p>
           </section>
@@ -1203,6 +1281,17 @@ function PrDrawer(props: {
             ) : null}
             {props.checkoutMessage ? <p className="sync-status" role="status">{props.checkoutMessage}</p> : null}
           </section>
+          <section className="detail-block notes-panel">
+            <div className="panel-title"><h3>Notes & tags</h3><span>Local only</span></div>
+            <div className="tag-editor">
+              <input value={tagDraft} onChange={(event) => setTagDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); void addTag(); } }} placeholder="Add a tag" aria-label="Add local tag" />
+              <button className="secondary-btn" type="button" onClick={() => void addTag()} disabled={!tagDraft.trim()}>Add</button>
+            </div>
+            {annotations.tags.length ? <div className="tag-row">{annotations.tags.map((tag) => <button className="tag local-tag removable-tag" type="button" key={tag} onClick={() => void props.onSaveTags(annotations.tags.filter((item) => item !== tag))}>{tag}<X size={12} /></button>)}</div> : null}
+            <textarea value={noteDraft} onChange={(event) => setNoteDraft(event.target.value)} placeholder="Leave a sticky note for this PR" aria-label="PR note" rows={3} />
+            <div><button className="secondary-btn" type="button" disabled={!noteDraft.trim()} onClick={() => void props.onSaveNote(noteDraft.trim()).then(() => setNoteDraft(""))}>Save note</button></div>
+            <div className="note-list">{annotations.notes.length ? annotations.notes.map((note) => <article className="sticky-note" key={note.id}><p>{note.text}</p><footer><span>{new Date(note.updatedAt).toLocaleString()}</span><button type="button" onClick={() => void props.onDeleteNote(note.id)}>Delete</button></footer></article>) : <p className="drawer-meta">No local notes yet.</p>}</div>
+          </section>
           {props.run ? (
             <section className="detail-block review-panel">
               <div className="review-panel-head"><h3>Approval review</h3><span className={`status agent`}>{props.run.status.replace("_", " ")}</span></div>
@@ -1211,9 +1300,11 @@ function PrDrawer(props: {
               {props.run.diff ? <details className="diff-details"><summary>View patch diff</summary><pre>{props.run.diff}</pre></details> : null}
               <div className="button-row">
                 {isOpen && props.run.status === "patch_ready" ? <button className="primary-btn" type="button" onClick={() => props.onApproveRun(props.run!.id)}>Approve patch</button> : null}
-                {isOpen && props.run.status === "approved" ? <button className="primary-btn" type="button" onClick={() => props.onPushRun(props.run!.id)}>Push approved patch</button> : null}
+                {isOpen && props.run.status === "approved" ? <div className="push-choice"><select aria-label="Push target" defaultValue="mergeops_branch"><option value="mergeops_branch">New MergeOps branch</option>{props.canPushPrBranch ? <option value="pr_branch">Update PR branch</option> : null}</select><button className="primary-btn" type="button" onClick={(event) => { const select = event.currentTarget.parentElement?.querySelector("select") as HTMLSelectElement | null; void props.onPushRun(props.run!.id, select?.value === "pr_branch" ? "pr_branch" : "mergeops_branch"); }}>Push approved patch</button></div> : null}
                 {props.run.pushRef ? <span className="action-meta">Pushed to {props.run.pushRef}</span> : null}
               </div>
+              {canRevise ? <div className="feedback-panel"><button className="secondary-btn" type="button" onClick={() => setFeedbackOpen((value) => !value)}>Revise with feedback</button>{feedbackOpen ? <div className="feedback-form"><label>Instruction<textarea value={feedback} onChange={(event) => setFeedback(event.target.value)} placeholder="Tell the agent what to change or preserve" rows={4} /></label><label>Reason <input value={reason} onChange={(event) => setReason(event.target.value)} placeholder="Optional, e.g. scope correction" /></label><button className="primary-btn" type="button" disabled={!feedback.trim()} onClick={() => void submitFeedback()}>Start revision</button></div> : null}</div> : null}
+              {message ? <p className="sync-status" role="status">{message}</p> : null}
             </section>
           ) : null}
         </div>

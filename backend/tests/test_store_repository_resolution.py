@@ -13,7 +13,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.adapters import AgentRunRequest, AgentRunResult, RunWorkspace, SubprocessAgentAdapter, inspect_workspace
-from app.models import ActionRecord, AgentBackend, AgentRun, AgentRunEvent, ApprovalRecord, CheckResult, GitHubSettings, GitHubSettingsPublic, PullRequest, RebaseDecision, RebaseDecisionOption, RebaseEvidence, RebasePlan, RepositoryConfig, TeamMember
+from app.models import ActionRecord, AgentBackend, AgentRun, AgentRunEvent, ApprovalRecord, CheckResult, CreatePrNoteRequest, CreateRevisionRequest, GitHubSettings, GitHubSettingsPublic, PullRequest, RebaseDecision, RebaseDecisionOption, RebaseEvidence, RebasePlan, RepositoryConfig, TeamMember
 from app.store import LocalJsonStore, PersistedAppData
 
 
@@ -67,6 +67,43 @@ class FailedWorkspaceAdapter(CapturingAdapter):
 
 
 class StoreRepositoryResolutionTest(unittest.TestCase):
+    def test_feedback_revision_reuses_parent_workspace_and_annotations_survive_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            pull_request = PullRequest(
+                id="pr-feedback", repository="service", repositoryFullName="owner/service", number=1,
+                title="Feedback", author="dev", ownerMemberId="dev", sourceBranch="feature", baseBranch="main",
+                state="open", mergeable="mergeable", reviewState="review_required", unresolvedCommentCount=0,
+                requestedReviewers=[], checkState="passing", linkedIssueIds=[], changedFilesCount=1, ageDays=1,
+                summary="Feedback", searchText="feedback",
+            )
+            parent = AgentRun(
+                id="run-parent", backendId="opencode", repository="service", pullRequestId=pull_request.id,
+                pullRequestNumber=1, action="address_review", status="patch_ready", requester="test",
+                summary="Ready", workspacePath=str(workspace), baseCommit="abc123", diff="diff --git a/a b/a\n",
+                createdAt="2026-01-01T00:00:00Z",
+            )
+            store = LocalJsonStore(root / "mergeops.local.json")
+            data = self._data(pull_request)
+            data.agentRuns = [parent]
+            store._save(data)
+
+            child = store.queue_revision("opencode", parent.id, CreateRevisionRequest(backendId="opencode", instruction="Add a regression test", reason="test coverage"))
+            self.assertEqual(child.parentRunId, parent.id)
+            self.assertEqual(child.workspacePath, str(workspace))
+            self.assertEqual(child.feedback.instruction, "Add a regression test")
+
+            annotations = store.update_pr_tags(pull_request.id, [" waiting for reviewer ", "Before RAT", "waiting for reviewer"])
+            self.assertEqual(annotations.tags, ["waiting for reviewer", "Before RAT"])
+            annotations = store.create_pr_note(pull_request.id, CreatePrNoteRequest(text="Check the rollout notes."))
+            self.assertEqual(annotations.notes[0].text, "Check the rollout notes.")
+            reloaded = LocalJsonStore(root / "mergeops.local.json").pr_annotations(pull_request.id)
+            self.assertEqual(reloaded.tags, ["waiting for reviewer", "Before RAT"])
+            self.assertEqual(len(reloaded.notes), 1)
+            self.assertEqual(LocalJsonStore(root / "mergeops.local.json").app_data().prTags[pull_request.id], ["waiting for reviewer", "Before RAT"])
+
     def test_selected_rebase_decision_reuses_prepared_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

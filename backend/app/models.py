@@ -24,6 +24,7 @@ class PullRequest(BaseModel):
     id: str
     repository: str
     repositoryFullName: str | None = None
+    headRepositoryFullName: str | None = None
     number: int
     title: str
     author: str
@@ -93,13 +94,33 @@ class ApprovalRecord(BaseModel):
     createdAt: str
 
 
+class AgentFeedback(BaseModel):
+    instruction: str
+    reason: str | None = None
+    createdAt: str
+
+
+class PrNote(BaseModel):
+    id: str
+    text: str
+    author: str = "local user"
+    createdAt: str
+    updatedAt: str
+
+
+class PrAnnotations(BaseModel):
+    pullRequestId: str
+    tags: list[str] = Field(default_factory=list)
+    notes: list[PrNote] = Field(default_factory=list)
+
+
 class AgentRun(BaseModel):
     id: str
     backendId: str
     repository: str
     pullRequestId: str
     pullRequestNumber: int
-    action: Literal["analyze", "rebase", "fix_conflicts", "address_review", "fix_checks", "review_patch"]
+    action: Literal["analyze", "rebase", "fix_conflicts", "address_review", "fix_checks", "review_patch", "revise_with_feedback"]
     status: Literal[
         "queued",
         "running",
@@ -116,6 +137,7 @@ class AgentRun(BaseModel):
     requester: str
     summary: str
     parentRunId: str | None = None
+    feedback: AgentFeedback | None = None
     agentOutput: str | None = None
     backendSessionId: str | None = None
     workspacePath: str | None = None
@@ -222,6 +244,7 @@ class ActionRecord(BaseModel):
     status: str
     summary: str
     parentRunId: str | None = None
+    feedback: AgentFeedback | None = None
     agentOutput: str | None = None
     workspacePath: str | None = None
     baseCommit: str | None = None
@@ -297,17 +320,40 @@ class AppData(BaseModel):
     actions: list[ActionSummary] = []
     activity: list[ActivityEvent] = []
     approvals: list[ApprovalRecord] = []
+    prTags: dict[str, list[str]] = Field(default_factory=dict)
     github: GitHubSettingsPublic | None = None
 
 
 class CreateAgentRunRequest(BaseModel):
     backendId: str
     pullRequestId: str
-    action: Literal["analyze", "rebase", "fix_conflicts", "address_review", "fix_checks", "review_patch"]
+    action: Literal["analyze", "rebase", "fix_conflicts", "address_review", "fix_checks", "review_patch", "revise_with_feedback"]
 
 
 class CreatePatchReviewRequest(BaseModel):
     backendId: str
+
+
+class CreateRevisionRequest(BaseModel):
+    backendId: str
+    instruction: str = Field(min_length=1, max_length=12000)
+    reason: str | None = Field(default=None, max_length=120)
+
+
+class PushAgentRunRequest(BaseModel):
+    target: Literal["mergeops_branch", "pr_branch"] = "mergeops_branch"
+
+
+class UpdatePrTagsRequest(BaseModel):
+    tags: list[str] = Field(default_factory=list)
+
+
+class CreatePrNoteRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=12000)
+
+
+class UpdatePrNoteRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=12000)
 
 
 class SelectRebaseDecisionRequest(BaseModel):

@@ -35,6 +35,8 @@ class AgentRunRequest:
     source_branch: str | None = None
     review_diff: str | None = None
     previous_agent_output: str | None = None
+    feedback_instruction: str | None = None
+    feedback_reason: str | None = None
     rebase_plan: dict[str, object] | None = None
     runner_timeout_seconds: int = 600
 
@@ -182,6 +184,8 @@ class SubprocessAgentAdapter:
             "conflictFiles": [],
             "reviewDiff": request.review_diff,
             "previousAgentOutput": request.previous_agent_output,
+            "feedbackInstruction": request.feedback_instruction,
+            "feedbackReason": request.feedback_reason,
         }
         try:
             inherited_path = os.environ.get("PATH", "")

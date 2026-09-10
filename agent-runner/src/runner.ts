@@ -7,7 +7,7 @@ declare const process: {
 };
 
 type AgentBackendId = "opencode" | "codex" | "anthropic";
-type AgentAction = "analyze" | "rebase" | "fix_conflicts" | "address_review" | "fix_checks" | "review_patch";
+type AgentAction = "analyze" | "rebase" | "fix_conflicts" | "address_review" | "fix_checks" | "review_patch" | "revise_with_feedback";
 type RunStatus = "running" | "patch_ready" | "review_ready" | "awaiting_approval" | "failed";
 
 type RunnerInput = {
@@ -25,6 +25,8 @@ type RunnerInput = {
   conflictFiles?: string[];
   reviewDiff?: string | null;
   previousAgentOutput?: string | null;
+  feedbackInstruction?: string | null;
+  feedbackReason?: string | null;
 };
 
 type RunnerEvent =
@@ -265,7 +267,9 @@ function buildPrompt(input: RunnerInput) {
     ? `Execute this approved rebase plan exactly: ${input.rebasePlan?.command ?? `git rebase ${input.baseRef ?? `origin/${input.baseBranch ?? "the base branch"}`}`}. ${input.rebasePlan?.summary ?? ""} Resolve every conflict, stage each resolved file, and run GIT_EDITOR=true git rebase --continue. Repeat until the rebase completes. Do not merge, push, or inspect unrelated files. Finish by confirming git status --short and git diff --name-only --diff-filter=U are clean.`
       : input.action === "review_patch"
         ? "Review the prepared patch for correctness, risk, missing tests, accidental broad changes, unresolved conflict markers, and whether it matches the PR intent. Return concise findings first, ordered by severity, then a short approval recommendation. Do not modify the workspace."
-      : "Keep the change narrowly scoped to the requested task and stop after the smallest patch and checks are complete.";
+        : input.action === "revise_with_feedback"
+          ? `Revise the existing prepared patch according to this human feedback: ${input.feedbackInstruction ?? "No feedback was supplied."} ${input.feedbackReason ? `Feedback category: ${input.feedbackReason}.` : ""} Preserve correct existing work, keep the revision narrow, and run the required checks.`
+        : "Keep the change narrowly scoped to the requested task and stop after the smallest patch and checks are complete.";
   return [
     `Prepare ${input.action.replaceAll("_", " ")} for PR #${input.pullRequestNumber} in ${input.repository}.`,
     `Repository path: ${input.repositoryLocalPath}.`,
@@ -277,6 +281,7 @@ function buildPrompt(input: RunnerInput) {
         ? "Start and complete the rebase now. Do not perform broad repository research or inspect unrelated history."
         : "Inspect the repo and prepare the smallest patch and checks summary.",
     input.previousAgentOutput ? `Previous agent output:\n${input.previousAgentOutput.slice(-12000)}` : "",
+    input.feedbackInstruction ? `Human feedback to follow exactly:\n${input.feedbackInstruction.slice(0, 12000)}` : "",
     input.reviewDiff ? `Prepared diff to review:\n${input.reviewDiff.slice(-40000)}` : "",
     scope,
     completionRules

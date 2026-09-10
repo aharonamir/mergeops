@@ -96,6 +96,7 @@ def _sync_repository(
                 id=f"{repository.owner}-{repository.name}-{number}",
                 repository=repository.name,
                 repositoryFullName=f"{repository.owner}/{repository.name}",
+                headRepositoryFullName=_head_repository(detail),
                 number=number,
                 title=str(detail.get("title") or f"PR #{number}"),
                 author=author,
@@ -122,6 +123,16 @@ def _sync_repository(
 def _login(value: object) -> str | None:
     if isinstance(value, dict) and value.get("login"):
         return str(value["login"])
+    return None
+
+
+def _head_repository(detail: dict[str, object]) -> str | None:
+    head = detail.get("head")
+    if not isinstance(head, dict):
+        return None
+    repository = head.get("repo")
+    if isinstance(repository, dict) and repository.get("full_name"):
+        return str(repository["full_name"])
     return None
 
 

@@ -1,5 +1,5 @@
 import { fixtureData } from "./fixtures";
-import type { ActionRecord, AgentRun, AgentSettings, AppData, CheckoutResult, GitHubSettings, GitHubSyncResult, RepositoryConfig, TeamMember } from "./types";
+import type { ActionRecord, AgentRun, AgentSettings, AppData, CheckoutResult, GitHubSettings, GitHubSyncResult, PrAnnotations, RepositoryConfig, TeamMember } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "";
 
@@ -104,8 +104,38 @@ export async function approveAgentRun(runId: string): Promise<AgentRun> {
   return await response.json();
 }
 
-export async function pushAgentRun(runId: string): Promise<AgentRun> {
-  const response = await fetch(`${API_BASE}/api/agent-runs/${runId}/push`, { method: "POST" });
+export async function pushAgentRun(runId: string, target: "mergeops_branch" | "pr_branch" = "mergeops_branch"): Promise<AgentRun> {
+  const response = await fetch(`${API_BASE}/api/agent-runs/${runId}/push`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ target }) });
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
+  return await response.json();
+}
+
+export async function reviseAgentRun(runId: string, input: { backendId: string; instruction: string; reason?: string }): Promise<AgentRun> {
+  const response = await fetch(`${API_BASE}/api/agent-runs/${runId}/revise`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) });
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
+  return await response.json();
+}
+
+export async function loadPrAnnotations(pullRequestId: string): Promise<PrAnnotations> {
+  const response = await fetch(`${API_BASE}/api/pull-requests/${pullRequestId}/annotations`);
+  if (!response.ok) throw new Error(`API returned ${response.status}`);
+  return await response.json();
+}
+
+export async function updatePrTags(pullRequestId: string, tags: string[]): Promise<PrAnnotations> {
+  const response = await fetch(`${API_BASE}/api/pull-requests/${pullRequestId}/annotations/tags`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tags }) });
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
+  return await response.json();
+}
+
+export async function createPrNote(pullRequestId: string, text: string): Promise<PrAnnotations> {
+  const response = await fetch(`${API_BASE}/api/pull-requests/${pullRequestId}/annotations/notes`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
+  return await response.json();
+}
+
+export async function deletePrNote(pullRequestId: string, noteId: string): Promise<PrAnnotations> {
+  const response = await fetch(`${API_BASE}/api/pull-requests/${pullRequestId}/annotations/notes/${noteId}`, { method: "DELETE" });
   if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
   return await response.json();
 }

@@ -21,6 +21,7 @@ export type PullRequest = {
   id: string;
   repository: string;
   repositoryFullName?: string | null;
+  headRepositoryFullName?: string | null;
   number: number;
   title: string;
   author: string;
@@ -79,11 +80,12 @@ export type AgentRun = {
   repository: string;
   pullRequestId: string;
   pullRequestNumber: number;
-  action: "analyze" | "rebase" | "fix_conflicts" | "address_review" | "fix_checks" | "review_patch";
+  action: "analyze" | "rebase" | "fix_conflicts" | "address_review" | "fix_checks" | "review_patch" | "revise_with_feedback";
   status: "queued" | "running" | "patch_ready" | "review_ready" | "checks_running" | "awaiting_decision" | "awaiting_approval" | "approved" | "pushed" | "failed" | "cancelled";
   requester: string;
   summary: string;
   parentRunId?: string | null;
+  feedback?: AgentFeedback | null;
   agentOutput?: string | null;
   backendSessionId?: string | null;
   workspacePath?: string | null;
@@ -193,6 +195,26 @@ export type ApprovalRecord = {
   createdAt: string;
 };
 
+export type AgentFeedback = {
+  instruction: string;
+  reason?: string | null;
+  createdAt: string;
+};
+
+export type PrNote = {
+  id: string;
+  text: string;
+  author: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type PrAnnotations = {
+  pullRequestId: string;
+  tags: string[];
+  notes: PrNote[];
+};
+
 export type ActionRecord = {
   id: string;
   kind: "checkout" | "agent_run";
@@ -203,6 +225,7 @@ export type ActionRecord = {
   status: string;
   summary: string;
   parentRunId?: string | null;
+  feedback?: AgentFeedback | null;
   agentOutput?: string | null;
   workspacePath?: string | null;
   baseCommit?: string | null;
@@ -248,6 +271,7 @@ export type AppData = {
   agentRuns: AgentRunSummary[];
   actions?: ActionRecord[];
   activity?: ActivityEvent[];
+  prTags?: Record<string, string[]>;
   github?: GitHubSettings | null;
 };
 
