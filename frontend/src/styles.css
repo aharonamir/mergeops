@@ -174,8 +174,41 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   color: var(--bg);
 }
 
-.side-status {
+.language-control {
+  display: grid;
+  gap: 8px;
   margin-top: auto;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.language-toggle {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 3px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.language-toggle button {
+  min-height: 30px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  padding: 0 8px;
+  font-size: 12px;
+}
+
+.language-toggle button:hover,
+.language-toggle button.is-active {
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.side-status {
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 12px;

@@ -22,6 +22,7 @@ import {
 } from "lucide-react";
 import { approveAgentRun, cancelAgentRun, checkBackendHealth, clearAction, createAgentRun, createCheckout, createPrNote, createTeamMember, deletePrNote, deleteTeamMember, loadActionDetails, loadAppData, loadPrAnnotations, pushAgentRun, reviseAgentRun, reviewPatch, selectRebaseDecision, syncGitHub, updateAgentSettings, updateGitHubSettings, updatePrTags, updateTeamMember } from "./api";
 import type { ActionRecord, ActivityEvent, AgentBackend, AgentRun, AgentRunEvent, AgentRunSummary, AgentSettings, AppData, ConflictEvidence, GitHubSettings, GitHubSyncResult, PrAnnotations, PullRequest, QueueFilter, RepositoryConfig, TeamMember, ThemePreference, View } from "./types";
+import { useLocale, type TranslationKey } from "./i18n";
 
 const themeIcons = {
   system: Monitor,
@@ -49,18 +50,6 @@ function statusFor(pr: PullRequest) {
   if (pr.checkState === "failing") return "checks";
   if (pr.reviewState === "approved" && pr.checkState === "passing") return "ready";
   return "review";
-}
-
-function statusLabel(status: string) {
-  return {
-    closed: "Closed",
-    merged: "Merged",
-    draft: "Draft",
-    conflict: "Conflict",
-    checks: "Checks",
-    ready: "Ready",
-    review: "Needs review"
-  }[status] ?? status;
 }
 
 function matchesQueue(pr: PullRequest, queue: QueueFilter) {
@@ -127,6 +116,7 @@ function actionFromSummary(run: AgentRunSummary): ActionRecord {
 }
 
 export function App() {
+  const { locale, setLocale, t } = useLocale();
   const [data, setData] = useState<AppData | null>(null);
   const [activeView, setActiveView] = useState<View>("cockpit");
   const [theme, setTheme] = useState<ThemePreference>(() => (localStorage.getItem("mergeops.theme") as ThemePreference) || "system");
@@ -242,7 +232,7 @@ export function App() {
   }, [query, queue, repo, scopedPrs]);
 
   if (!data || !backend) {
-    return <main className="loading">Loading MergeOps</main>;
+    return <main className="loading">{t("loading")}</main>;
   }
 
   const ThemeIcon = themeIcons[theme];
@@ -405,54 +395,61 @@ export function App() {
           <span className="brand-mark" aria-hidden="true">MO</span>
           <div>
             <strong>MergeOps</strong>
-            <span>SDLC cockpit</span>
+            <span>{t("brand.subtitle")}</span>
           </div>
         </div>
-        <nav className="nav-list">
+        <nav className="nav-list" aria-label={t("nav.primary")}>
           {views.map((view) => {
             const Icon = view.icon;
             return (
               <button key={view.id} className={`nav-item ${activeView === view.id ? "is-active" : ""}`} onClick={() => setActiveView(view.id)}>
                 <Icon size={18} />
-                <span>{view.label}</span>
+                <span>{t(({ cockpit: "nav.cockpit", team: "nav.team", agents: "nav.actions", activity: "nav.activity", settings: "nav.settings" } as const)[view.id])}</span>
               </button>
             );
           })}
         </nav>
+        <div className="language-control" aria-label={t("language.label")}>
+          <span>{t("language.label")}</span>
+          <div className="language-toggle" role="group" aria-label={t("language.label")}>
+            <button type="button" className={locale === "en" ? "is-active" : ""} aria-pressed={locale === "en"} onClick={() => setLocale("en")}>{t("language.english")}</button>
+            <button type="button" className={locale === "zh" ? "is-active" : ""} aria-pressed={locale === "zh"} onClick={() => setLocale("zh")}>{t("language.chinese")}</button>
+          </div>
+        </div>
         <div className={`side-status is-${backendStatus}`} role="status" aria-live="polite">
-          <span className="health-label"><i className="health-dot" aria-hidden="true" />Backend API</span>
-          <strong>{backendStatus === "checking" ? "Checking" : backendStatus === "online" ? "Online" : "Offline"}</strong>
-          <small>{backendStatus === "offline" ? "Cannot reach /api/health" : "Monitoring /api/health"}</small>
+          <span className="health-label"><i className="health-dot" aria-hidden="true" />{t("backend.api")}</span>
+          <strong>{backendStatus === "checking" ? t("backend.checking") : backendStatus === "online" ? t("backend.online") : t("backend.offline")}</strong>
+          <small>{backendStatus === "offline" ? t("backend.unreachable") : t("backend.monitoring")}</small>
         </div>
       </aside>
 
       <main className="workspace">
         {activeView === "cockpit" && (
           <header className="topbar">
-            <label className="search-wrap" aria-label="Bilingual PR and issue search">
+            <label className="search-wrap" aria-label={t("search.label")}>
               <Search size={18} />
-              <input value={query} onChange={(event) => setQuery(event.target.value)} type="search" placeholder="Search PRs, issues, comments, Hebrew or English" />
+              <input value={query} onChange={(event) => setQuery(event.target.value)} type="search" placeholder={t("search.placeholder")} />
             </label>
             <div className="top-actions">
-              <select value={repo} onChange={(event) => setRepo(event.target.value)} aria-label="Repository filter">
-                {repos.map((item) => <option key={item} value={item}>{item === "all" ? "All repos" : item}</option>)}
+              <select value={repo} onChange={(event) => setRepo(event.target.value)} aria-label={t("filter.repository")}>
+                {repos.map((item) => <option key={item} value={item}>{item === "all" ? t("filter.allRepos") : item}</option>)}
               </select>
-              <select value={owner} onChange={(event) => setOwner(event.target.value)} aria-label="Team member filter">
-                <option value="all">All members</option>
+              <select value={owner} onChange={(event) => setOwner(event.target.value)} aria-label={t("filter.member")}>
+                <option value="all">{t("filter.allMembers")}</option>
                 {data.teamMembers.map((member) => <option key={member.id} value={member.id}>{member.displayName}</option>)}
               </select>
-              <select value={dateRange} onChange={(event) => setDateRange(event.target.value === "all" ? "all" : Number(event.target.value))} aria-label="PR age range">
-                <option value={30}>Last 30 days</option>
-                <option value={60}>Last 60 days</option>
-                <option value={90}>Last 90 days</option>
-                <option value="all">All time</option>
+              <select value={dateRange} onChange={(event) => setDateRange(event.target.value === "all" ? "all" : Number(event.target.value))} aria-label={t("filter.age")}>
+                <option value={30}>{t("filter.lastDays", { days: 30 })}</option>
+                <option value={60}>{t("filter.lastDays", { days: 60 })}</option>
+                <option value={90}>{t("filter.lastDays", { days: 90 })}</option>
+                <option value="all">{t("filter.allTime")}</option>
               </select>
               <button className="secondary-btn sync-btn" type="button" onClick={syncFromToolbar} disabled={syncing}>
                 <RefreshCw size={16} className={syncing ? "spin" : ""} />
-                {syncing ? "Syncing" : "Re-sync"}
+                {syncing ? t("sync.syncing") : t("sync.resync")}
               </button>
               {syncMessage ? <span className="sync-status">{syncMessage}</span> : null}
-              <button className="icon-btn" type="button" onClick={() => setTheme(theme === "system" ? "light" : theme === "light" ? "dark" : "system")} aria-label={`Theme: ${theme}`} title={`Theme: ${theme}`}>
+              <button className="icon-btn" type="button" onClick={() => setTheme(theme === "system" ? "light" : theme === "light" ? "dark" : "system")} aria-label={t("theme.label", { theme })} title={t("theme.label", { theme })}>
                 <ThemeIcon size={18} />
               </button>
             </div>
@@ -545,6 +542,7 @@ function Cockpit(props: {
   dateRange: number | "all";
   onDateRangeChange: (range: number | "all") => void;
 }) {
+  const { t } = useLocale();
   const [membersCollapsed, setMembersCollapsed] = useState(() => localStorage.getItem("mergeops.cockpit.membersCollapsed") !== "false");
   const openCount = props.allPrs.filter((pr) => pr.state === "open").length;
   const mergedCount = props.allPrs.filter((pr) => pr.state === "merged").length;
@@ -555,13 +553,13 @@ function Cockpit(props: {
   const repositoryNames = props.github?.repositories.map((repository) => repository.name).join(", ");
   const lastSynced = props.github?.lastSyncedAt ? new Date(props.github.lastSyncedAt).toLocaleString() : "not synced";
   const filters: Array<{ id: QueueFilter; label: string; count: number }> = [
-    { id: "all", label: "All", count: props.allPrs.length },
-    { id: "open", label: "Open", count: openCount },
-    { id: "conflict", label: "Conflicts", count: conflictCount },
-    { id: "review", label: "Review", count: reviewCount },
-    { id: "ready", label: "Ready", count: readyCount },
-    { id: "merged", label: "Merged", count: mergedCount },
-    { id: "closed", label: "Closed", count: closedCount }
+    { id: "all", label: t("cockpit.all"), count: props.allPrs.length },
+    { id: "open", label: t("cockpit.open"), count: openCount },
+    { id: "conflict", label: t("cockpit.conflicts"), count: conflictCount },
+    { id: "review", label: t("cockpit.review"), count: reviewCount },
+    { id: "ready", label: t("cockpit.ready"), count: readyCount },
+    { id: "merged", label: t("cockpit.merged"), count: mergedCount },
+    { id: "closed", label: t("cockpit.closed"), count: closedCount }
   ];
 
   useEffect(() => {
@@ -572,16 +570,16 @@ function Cockpit(props: {
     <section className="view is-visible" aria-labelledby="cockpitTitle">
       <div className="view-head">
         <div className="cockpit-heading">
-          <h1 id="cockpitTitle">PR Triage</h1>
+          <h1 id="cockpitTitle">{t("cockpit.title")}</h1>
           <p>
             {props.allPrs.length
-              ? `${props.allPrs.length} team PRs in the last ${props.dateRange === "all" ? "all time" : `${props.dateRange} days`} · ${repositoryNames || "configured repositories"} · last sync ${lastSynced}`
-              : `No registered-member PRs in the last ${props.dateRange === "all" ? "all time" : `${props.dateRange} days`} · last sync ${lastSynced}`}
+              ? t(props.dateRange === "all" ? "cockpit.summaryAll" : "cockpit.summaryDays", { count: props.allPrs.length, days: props.dateRange === "all" ? "" : props.dateRange, repos: repositoryNames || "configured repositories", lastSynced })
+              : t(props.dateRange === "all" ? "cockpit.emptySummaryAll" : "cockpit.emptySummaryDays", { days: props.dateRange === "all" ? "" : props.dateRange, lastSynced })}
           </p>
         </div>
       </div>
       <div className="cockpit-filters">
-        <div className="saved-views" role="group" aria-label="Saved views">
+        <div className="saved-views" role="group" aria-label={t("cockpit.savedViews")}>
           {filters.map((filter) => (
             <button key={filter.id} className={`seg filter-chip ${filter.id} ${props.queue === filter.id ? "is-active" : ""}`} onClick={() => props.onQueueChange(filter.id)}>
               <span>{filter.label}</span><strong>{filter.count}</strong>
@@ -591,20 +589,20 @@ function Cockpit(props: {
       </div>
       <div className={`member-strip-section ${membersCollapsed ? "is-collapsed" : ""}`}>
         <div className="member-strip-head">
-          <span>Team members</span>
+          <span>{t("cockpit.teamMembers")}</span>
           <button
             className="member-strip-toggle"
             type="button"
             aria-expanded={!membersCollapsed}
             aria-controls="cockpitMemberStrip"
-            aria-label={membersCollapsed ? "Show team members" : "Hide team members"}
+            aria-label={membersCollapsed ? t("cockpit.showMembers") : t("cockpit.hideMembers")}
             onClick={() => setMembersCollapsed((current) => !current)}
           >
             {membersCollapsed ? <ChevronDown size={16} /> : <ChevronUp size={16} />}
           </button>
         </div>
         {!membersCollapsed && (
-          <div className="member-strip" id="cockpitMemberStrip" role="list" aria-label="Team members">
+          <div className="member-strip" id="cockpitMemberStrip" role="list" aria-label={t("cockpit.teamMembers")}>
             {props.teamMembers.map((member) => {
               const owned = props.allPrs.filter((pr) => pr.ownerMemberId === member.id);
               const breakdown = {
@@ -618,8 +616,8 @@ function Cockpit(props: {
                 <button className={`member-entry ${selected ? "is-selected" : ""}`} key={member.id} type="button" role="listitem" aria-pressed={selected} onClick={() => props.onMemberFilter(selected ? "all" : member.id)}>
                   <span className="avatar">{initials(member.displayName)}</span>
                   <span className="member-entry-copy">
-                    <span className="member-entry-top"><strong>{member.displayName}</strong><small>{owned.length} PRs</small></span>
-                    {selected && <span className="member-breakdown">{breakdown.conflict} conflict · {breakdown.review} review · {breakdown.merged} merged · {breakdown.closed} closed</span>}
+                    <span className="member-entry-top"><strong>{member.displayName}</strong><small>{owned.length} {t("cockpit.prs")}</small></span>
+                    {selected && <span className="member-breakdown">{t("cockpit.breakdown", breakdown)}</span>}
                   </span>
                 </button>
               );
@@ -629,12 +627,12 @@ function Cockpit(props: {
       </div>
       <div className="table-shell">
         <div className="table-toolbar">
-          <strong>Live PRs</strong>
-          <span>{props.prs.length} matching PRs</span>
+          <strong>{t("cockpit.livePrs")}</strong>
+          <span>{t("cockpit.matchingPrs", { count: props.prs.length })}</span>
         </div>
-        <div className="pr-table" role="table" aria-label="Pull requests">
+        <div className="pr-table" role="table" aria-label={t("cockpit.tableLabel")}>
           <div className="pr-row pr-head" role="row">
-            <span>Priority</span><span>PR</span><span>Owner</span><span>Review</span><span>Checks</span><span>Age</span><span>Action</span>
+            <span>{t("cockpit.priority")}</span><span>{t("cockpit.pr")}</span><span>{t("cockpit.owner")}</span><span>{t("cockpit.review")}</span><span>{t("cockpit.checks")}</span><span>{t("cockpit.age")}</span><span>{t("cockpit.action")}</span>
           </div>
           {props.prs.map((pr) => {
             const member = props.teamById.get(pr.ownerMemberId);
@@ -642,20 +640,20 @@ function Cockpit(props: {
             const tags = props.prTags[pr.id] ?? [];
             return (
               <div className="pr-row" role="row" key={pr.id}>
-                <div className="pr-cell"><span className={`status ${status}`}>{statusLabel(status)}</span></div>
+                <div className="pr-cell"><span className={`status ${status}`}>{t(({ closed: "status.closed", merged: "status.merged", draft: "status.draft", conflict: "status.conflict", checks: "status.checks", ready: "status.ready", review: "status.review" } as const)[status])}</span></div>
                 <div className="pr-cell"><span className="pr-title"><strong>{pr.title}</strong><span>{pr.repository} #{pr.number} · {pr.state} · {pr.sourceBranch}</span>{tags.length ? <span className="pr-tag-row">{tags.map((tag) => <span className="tag local-tag" key={tag}>{tag}</span>)}</span> : null}</span></div>
                 <div className="pr-cell">{member?.displayName ?? pr.author}</div>
                 <div className="pr-cell">{pr.reviewState.replace("_", " ")}</div>
                 <div className="pr-cell">{pr.checkState.replace("_", " ")}</div>
                 <div className="pr-cell">{pr.ageDays}d</div>
-                <div className="pr-cell"><button className="text-btn" onClick={() => props.onSelectPr(pr)}>Inspect</button></div>
+                <div className="pr-cell"><button className="text-btn" onClick={() => props.onSelectPr(pr)}>{t("cockpit.inspect")}</button></div>
               </div>
             );
           })}
           {!props.prs.length && (
             <div className="empty-state">
-              <strong>No PRs match this view</strong>
-              <span>Clear search, switch to All repos / All members, or check the sync result in Settings.</span>
+              <strong>{t("cockpit.noMatch")}</strong>
+              <span>{t("cockpit.clearFilters")}</span>
             </div>
           )}
         </div>
@@ -675,6 +673,7 @@ function TeamWorkspace({
   onAddMember: (member: Omit<TeamMember, "id">) => Promise<TeamMember>;
   onDeleteMember: (memberId: string) => Promise<void>;
 }) {
+  const { t } = useLocale();
   const [selectedId, setSelectedId] = useState(members[0]?.id ?? "");
   const [draft, setDraft] = useState<TeamMemberDraft>(() => memberToDraft(members[0]));
   const [status, setStatus] = useState("");
@@ -694,35 +693,35 @@ function TeamWorkspace({
 
   async function saveDraft(event: React.FormEvent) {
     event.preventDefault();
-    setStatus("Saving member");
+    setStatus(t("team.saveStatus"));
     try {
       if (selectedMember) {
         await onSaveMember(selectedMember.id, draftToMemberPayload(draft));
-        setStatus("Member saved");
+        setStatus(t("team.saved"));
       } else {
         const created = await onAddMember(draftToNewMember(draft));
         setSelectedId(created.id);
-        setStatus("Member added");
+        setStatus(t("team.added"));
       }
     } catch {
-      setStatus("Member save failed");
+      setStatus(t("team.saveFailed"));
     }
   }
 
   async function addMember() {
     setSelectedId("");
     setDraft(emptyMemberDraft());
-    setStatus("Adding new member");
+    setStatus(t("team.adding"));
   }
 
   async function deleteMember() {
     if (!selectedMember) return;
-    setStatus("Deleting member");
+    setStatus(t("team.deleting"));
     try {
       await onDeleteMember(selectedMember.id);
-      setStatus("Member deleted");
+      setStatus(t("team.deleted"));
     } catch {
-      setStatus("Delete failed");
+      setStatus(t("team.deleteFailed"));
     }
   }
 
@@ -730,10 +729,10 @@ function TeamWorkspace({
     <section className="view is-visible" aria-labelledby="teamTitle">
       <div className="view-head">
         <div>
-          <h1 id="teamTitle">Team workspace</h1>
-          <p>{members.length} team members · edit GitHub IDs, responsibilities, focus, ownership, aliases, and availability.</p>
+          <h1 id="teamTitle">{t("team.title")}</h1>
+          <p>{t("team.subtitle", { count: members.length })}</p>
         </div>
-        <button className="primary-btn" onClick={addMember}><Plus size={18} /><span>Add member</span></button>
+        <button className="primary-btn" onClick={addMember}><Plus size={18} /><span>{t("team.add")}</span></button>
       </div>
       <div className="team-manager">
         <div className="member-list" aria-label="Team members">
@@ -743,41 +742,41 @@ function TeamWorkspace({
               <span className="member-meta"><strong>{member.displayName}</strong><span>@{member.githubUsername} · {member.availability.replace("_", " ")}</span></span>
             </button>
           ))}
-          {!members.length ? <div className="empty-state compact"><strong>No members yet</strong><span>Add your first team member.</span></div> : null}
+          {!members.length ? <div className="empty-state compact"><strong>{t("team.noMembers")}</strong><span>{t("team.addFirst")}</span></div> : null}
         </div>
         <form className="person-card member-editor" onSubmit={saveDraft}>
           <header>
             <span className="avatar">{initials(draft.displayName || "New Member")}</span>
             <span className="member-meta">
-              <strong>{selectedMember ? "Edit team member" : "New team member"}</strong>
-              <span>{selectedMember ? `Member id: ${selectedMember.id}` : "Created locally after save"}</span>
+              <strong>{selectedMember ? t("team.edit") : t("team.new")}</strong>
+              <span>{selectedMember ? t("team.memberId", { id: selectedMember.id }) : t("team.createdLocally")}</span>
             </span>
           </header>
           <div className="profile-fields">
-            <ProfileInput label="Display name" value={draft.displayName} onChange={(value) => updateDraft("displayName", value)} />
-            <ProfileInput label="GitHub username" value={draft.githubUsername} onChange={(value) => updateDraft("githubUsername", value)} />
-            <ProfileInput label="Current focus" value={draft.currentFocus} onChange={(value) => updateDraft("currentFocus", value)} />
-            <ProfileInput label="Responsibilities" value={draft.responsibilities} onChange={(value) => updateDraft("responsibilities", value)} />
-            <ProfileInput label="Owned repos" value={draft.ownedRepos} onChange={(value) => updateDraft("ownedRepos", value)} />
-            <ProfileInput label="Owned paths" value={draft.ownedPaths} onChange={(value) => updateDraft("ownedPaths", value)} />
-            <ProfileInput label="Expertise tags" value={draft.expertiseTags} onChange={(value) => updateDraft("expertiseTags", value)} />
-            <ProfileInput label="Timezone" value={draft.timezone} onChange={(value) => updateDraft("timezone", value)} />
+            <ProfileInput label={t("team.displayName")} value={draft.displayName} onChange={(value) => updateDraft("displayName", value)} />
+            <ProfileInput label={t("team.githubUsername")} value={draft.githubUsername} onChange={(value) => updateDraft("githubUsername", value)} />
+            <ProfileInput label={t("team.currentFocus")} value={draft.currentFocus} onChange={(value) => updateDraft("currentFocus", value)} />
+            <ProfileInput label={t("team.responsibilities")} value={draft.responsibilities} onChange={(value) => updateDraft("responsibilities", value)} />
+            <ProfileInput label={t("team.ownedRepos")} value={draft.ownedRepos} onChange={(value) => updateDraft("ownedRepos", value)} />
+            <ProfileInput label={t("team.ownedPaths")} value={draft.ownedPaths} onChange={(value) => updateDraft("ownedPaths", value)} />
+            <ProfileInput label={t("team.expertiseTags")} value={draft.expertiseTags} onChange={(value) => updateDraft("expertiseTags", value)} />
+            <ProfileInput label={t("team.timezone")} value={draft.timezone} onChange={(value) => updateDraft("timezone", value)} />
             <label className="field">
-              <span>Availability</span>
+              <span>{t("team.availability")}</span>
               <select value={draft.availability} onChange={(event) => updateDraft("availability", event.target.value)}>
-                <option value="active">Active</option>
-                <option value="focus_mode">Focus mode</option>
-                <option value="ooo">Out of office</option>
-                <option value="overloaded">Overloaded</option>
-                <option value="inactive">Inactive</option>
+                <option value="active">{t("availability.active")}</option>
+                <option value="focus_mode">{t("availability.focus")}</option>
+                <option value="ooo">{t("availability.ooo")}</option>
+                <option value="overloaded">{t("availability.overloaded")}</option>
+                <option value="inactive">{t("availability.inactive")}</option>
               </select>
             </label>
-            <ProfileInput label="Git aliases" value={draft.gitAliases} onChange={(value) => updateDraft("gitAliases", value)} full />
-            <ProfileInput label="Emails" value={draft.emails} onChange={(value) => updateDraft("emails", value)} full />
+            <ProfileInput label={t("team.gitAliases")} value={draft.gitAliases} onChange={(value) => updateDraft("gitAliases", value)} full />
+            <ProfileInput label={t("team.emails")} value={draft.emails} onChange={(value) => updateDraft("emails", value)} full />
           </div>
           <div className="settings-actions">
-            <button className="primary-btn" type="submit"><Save size={18} /><span>Save member</span></button>
-            <button className="danger-btn" type="button" onClick={deleteMember} disabled={!selectedMember}><Trash2 size={18} /><span>Delete</span></button>
+            <button className="primary-btn" type="submit"><Save size={18} /><span>{t("team.save")}</span></button>
+            <button className="danger-btn" type="button" onClick={deleteMember} disabled={!selectedMember}><Trash2 size={18} /><span>{t("team.delete")}</span></button>
             {status ? <span className="sync-status">{status}</span> : null}
           </div>
         </form>
@@ -879,6 +878,20 @@ function draftToNewMember(draft: TeamMemberDraft): Omit<TeamMember, "id"> {
 }
 
 function ActionsView({ actions, onClear, onStop, onApprove, onPush, onReviewPatch, onShowDetails, onLoadEvents }: { actions: ActionRecord[]; onClear: (actionId: string) => Promise<void>; onStop: (runId: string) => Promise<void>; onApprove: (runId: string) => Promise<void>; onPush: (runId: string) => Promise<void>; onReviewPatch: (runId: string) => Promise<void>; onShowDetails: (action: ActionRecord) => Promise<void>; onLoadEvents: (actionId: string) => Promise<AgentRun | ActionRecord> }) {
+  const { t } = useLocale();
+  const actionStatusKeys = {
+    queued: "status.queued",
+    running: "status.running",
+    patch_ready: "status.patchReady",
+    review_ready: "status.reviewReady",
+    checks_running: "status.checksRunning",
+    awaiting_decision: "status.awaitingDecision",
+    awaiting_approval: "status.awaitingApproval",
+    approved: "status.approved",
+    pushed: "status.pushed",
+    failed: "status.failed",
+    cancelled: "status.cancelled"
+  } as const;
   const terminalStatuses = new Set(["ready", "failed", "cancelled", "pushed", "approved", "awaiting_approval", "patch_ready", "review_ready"]);
   const [eventPanels, setEventPanels] = useState<Record<string, { events?: AgentRunEvent[]; loading: boolean }>>({});
 
@@ -897,25 +910,25 @@ function ActionsView({ actions, onClear, onStop, onApprove, onPush, onReviewPatc
     <section className="view is-visible" aria-labelledby="agentsTitle">
       <div className="view-head">
         <div>
-          <h1 id="agentsTitle">Actions</h1>
-          <p>Checkout workspaces and agent sessions across the PR queue.</p>
+          <h1 id="agentsTitle">{t("actions.title")}</h1>
+          <p>{t("actions.subtitle")}</p>
         </div>
       </div>
       <div className="runs-list">
-        {actions.length === 0 ? <p className="empty-state">No actions yet.</p> : actions.map((action) => {
+        {actions.length === 0 ? <p className="empty-state">{t("actions.noActions")}</p> : actions.map((action) => {
           const eventCount = action.eventCount ?? action.events?.length ?? 0;
           const eventPanel = eventPanels[action.id];
           const events = action.events ?? eventPanel?.events;
           return <article className="run-item" key={action.id}>
             <div>
-              <strong>{action.kind === "checkout" ? "Checkout" : "Agent run"} · {action.repository} #{action.pullRequestNumber}</strong>
+              <strong>{action.kind === "checkout" ? t("actions.checkout") : t("actions.agentRun")} · {action.repository} #{action.pullRequestNumber}</strong>
               <p>{action.summary}</p>
-              {action.workspacePath ? <span className="action-meta">Workspace: {action.workspacePath} · base {action.baseCommit?.slice(0, 12) ?? "unknown"}</span> : null}
-              {action.parentRunId ? <span className="action-meta">Review of {action.parentRunId}</span> : null}
-              {(eventCount || action.checkCount || action.hasRebaseEvidence) ? <span className="action-meta">{eventCount} events · {action.checkCount ?? 0} checks{action.hasRebaseEvidence ? ` · ${action.resolvedConflictCount ?? 0}/${action.conflictCount ?? 0} conflicts resolved` : ""}</span> : null}
-              {eventCount ? <details className="run-events" onToggle={(event) => { if (event.currentTarget.open) void loadEvents(action.id); }}><summary>{eventCount} recorded events</summary>{eventPanel?.loading ? <p className="event-loading">Loading events…</p> : events ? <RunEventList events={events} /> : <p className="event-loading">Events are unavailable.</p>}</details> : null}
+              {action.workspacePath ? <span className="action-meta">{t("actions.workspace", { path: action.workspacePath, base: action.baseCommit?.slice(0, 12) ?? "unknown" })}</span> : null}
+              {action.parentRunId ? <span className="action-meta">{t("actions.reviewOf", { id: action.parentRunId })}</span> : null}
+              {(eventCount || action.checkCount || action.hasRebaseEvidence) ? <span className="action-meta">{t("actions.eventsMeta", { events: eventCount, checks: action.checkCount ?? 0 })}{action.hasRebaseEvidence ? t("actions.conflictsMeta", { resolved: action.resolvedConflictCount ?? 0, total: action.conflictCount ?? 0 }) : ""}</span> : null}
+              {eventCount ? <details className="run-events" onToggle={(event) => { if (event.currentTarget.open) void loadEvents(action.id); }}><summary>{t("actions.recordedEvents", { count: eventCount })}</summary>{eventPanel?.loading ? <p className="event-loading">{t("actions.loadingEvents")}</p> : events ? <RunEventList events={events} /> : <p className="event-loading">{t("actions.eventsUnavailable")}</p>}</details> : null}
             </div>
-            <div className="action-controls"><span className={`status ${action.status === "failed" ? "is-failed" : "agent"}`}>{action.status.replace("_", " ")}</span><button className="secondary-btn" type="button" onClick={() => void onShowDetails(action)}><FileSearch size={16} /><span>Run details</span></button>{action.status === "patch_ready" ? <button className="secondary-btn" type="button" onClick={() => onReviewPatch(action.id)}><FileSearch size={16} /><span>Review patch</span></button> : null}{action.status === "patch_ready" ? <button className="primary-btn" type="button" onClick={() => onApprove(action.id)}>Approve</button> : null}{action.status === "approved" ? <button className="primary-btn" type="button" onClick={() => onPush(action.id)}>Push</button> : null}{terminalStatuses.has(action.status) ? <button className="icon-btn" type="button" onClick={() => onClear(action.id)} aria-label={`Clear ${action.kind} action`} title="Clear action and workspace"><Trash2 size={16} /></button> : <button className="secondary-btn" type="button" onClick={() => onStop(action.id)}>Stop</button>}</div>
+            <div className="action-controls"><span className={`status ${action.status === "failed" ? "is-failed" : "agent"}`}>{actionStatusKeys[action.status as keyof typeof actionStatusKeys] ? t(actionStatusKeys[action.status as keyof typeof actionStatusKeys]) : action.status.replace("_", " ")}</span><button className="secondary-btn" type="button" onClick={() => void onShowDetails(action)}><FileSearch size={16} /><span>{t("actions.runDetails")}</span></button>{action.status === "patch_ready" ? <button className="secondary-btn" type="button" onClick={() => onReviewPatch(action.id)}><FileSearch size={16} /><span>{t("actions.reviewPatch")}</span></button> : null}{action.status === "patch_ready" ? <button className="primary-btn" type="button" onClick={() => onApprove(action.id)}>{t("actions.approve")}</button> : null}{action.status === "approved" ? <button className="primary-btn" type="button" onClick={() => onPush(action.id)}>{t("actions.push")}</button> : null}{terminalStatuses.has(action.status) ? <button className="icon-btn" type="button" onClick={() => onClear(action.id)} aria-label={t("actions.clear", { kind: action.kind })} title={t("actions.clear", { kind: action.kind })}><Trash2 size={16} /></button> : <button className="secondary-btn" type="button" onClick={() => onStop(action.id)}>{t("actions.stop")}</button>}</div>
           </article>
         })}
       </div>
@@ -1002,17 +1015,18 @@ function parseDiffFiles(diff: string) {
 }
 
 function ActivityView({ events }: { events: ActivityEvent[] }) {
+  const { t } = useLocale();
   const sortedEvents = [...events].sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   return (
     <section className="view is-visible" aria-labelledby="activityTitle">
       <div className="view-head">
         <div>
-          <h1 id="activityTitle">Activity</h1>
-          <p>Operational events across PR triage, actions, sync, team, and settings.</p>
+          <h1 id="activityTitle">{t("activity.title")}</h1>
+          <p>{t("activity.subtitle")}</p>
         </div>
       </div>
       <div className="activity-list">
-        {sortedEvents.length === 0 ? <p className="empty-state">No activity yet.</p> : sortedEvents.map((event) => (
+        {sortedEvents.length === 0 ? <p className="empty-state">{t("activity.empty")}</p> : sortedEvents.map((event) => (
           <article className="activity-item" key={event.id}>
             <span className="activity-dot" aria-hidden="true" />
             <div>
@@ -1045,6 +1059,7 @@ function SettingsView(props: {
   onSaveAgentSettings: (settings: AgentSettings) => Promise<void>;
   onSyncGitHub: () => Promise<GitHubSyncResult>;
 }) {
+  const { t, locale } = useLocale();
   type SettingsTab = "Team" | "Repositories" | "Integrations" | "Automation Policy" | "Search" | "Preferences";
   const [activeTab, setActiveTab] = useState<SettingsTab>("Integrations");
   const [token, setToken] = useState("");
@@ -1061,7 +1076,7 @@ function SettingsView(props: {
 
   async function saveGitHub(event: React.FormEvent) {
     event.preventDefault();
-    setStatus("Saving GitHub settings");
+    setStatus(locale === "zh" ? "正在保存 GitHub 设置" : "Saving GitHub settings");
     try {
       await props.onSaveGitHub({
         username: username.trim() || null,
@@ -1070,19 +1085,19 @@ function SettingsView(props: {
       });
       await props.onSaveAgentSettings({ runnerTimeoutSeconds });
       setToken("");
-      setStatus("Integration settings saved");
+      setStatus(t("settings.saved"));
     } catch {
       setStatus("GitHub settings failed");
     }
   }
 
   async function syncNow() {
-    setStatus("Syncing GitHub PRs");
+    setStatus(t("settings.syncing"));
     try {
       const result = await props.onSyncGitHub();
-      setStatus(result.errors.length ? `Synced ${result.pullRequestsImported} PRs with ${result.errors.length} errors` : `Synced ${result.pullRequestsImported} PRs`);
+      setStatus(result.errors.length ? `${result.pullRequestsImported} PR · ${result.errors.length} ${locale === "zh" ? "个错误" : "errors"}` : `${result.pullRequestsImported} PR`);
     } catch {
-      setStatus("GitHub sync failed");
+      setStatus(t("settings.syncFailed"));
     }
   }
 
@@ -1090,56 +1105,57 @@ function SettingsView(props: {
     <section className="view is-visible" aria-labelledby="settingsTitle">
       <div className="view-head">
         <div>
-          <h1 id="settingsTitle">Settings</h1>
-          <p>Configure people, repositories, integrations, automation policy, search, and dashboard defaults.</p>
+          <h1 id="settingsTitle">{t("settings.title")}</h1>
+          <p>{t("settings.subtitle")}</p>
         </div>
       </div>
       <div className="settings-layout">
-        <nav className="settings-tabs" aria-label="Settings sections">
-          {["Team", "Repositories", "Integrations", "Automation Policy", "Search", "Preferences"].map((item) => (
-            <button key={item} type="button" className={activeTab === item ? "is-active" : ""} onClick={() => setActiveTab(item as SettingsTab)}>{item}</button>
-          ))}
+        <nav className="settings-tabs" aria-label={t("settings.sections")}>
+          {["Team", "Repositories", "Integrations", "Automation Policy", "Search", "Preferences"].map((item) => {
+            const labels: Record<SettingsTab, string> = { Team: t("settings.team"), Repositories: t("settings.repositories"), Integrations: t("settings.integrations"), "Automation Policy": t("settings.automation"), Search: t("settings.search"), Preferences: t("settings.preferences") };
+            return <button key={item} type="button" className={activeTab === item ? "is-active" : ""} onClick={() => setActiveTab(item as SettingsTab)}>{labels[item as SettingsTab]}</button>;
+          })}
         </nav>
         {activeTab === "Team" && (
           <div className="settings-panel is-visible">
-            <h2>Team</h2>
-            <p className="settings-intro">Team identity and ownership fields are managed in the Team Workspace.</p>
+            <h2>{t("settings.team")}</h2>
+            <p className="settings-intro">{t("settings.teamIntro")}</p>
             <div className="settings-list">
               {props.members.map((member) => <div className="settings-list-row" key={member.id}><strong>{member.displayName}</strong><span>@{member.githubUsername || "unlinked"} · {member.availability.replace("_", " ")}</span></div>)}
             </div>
-            <div className="settings-actions"><button className="secondary-btn" type="button" onClick={props.onOpenTeam}>Open Team Workspace</button></div>
+            <div className="settings-actions"><button className="secondary-btn" type="button" onClick={props.onOpenTeam}>{t("settings.openTeam")}</button></div>
           </div>
         )}
         {activeTab === "Repositories" && (
           <form className="settings-panel is-visible" onSubmit={saveGitHub}>
-            <h2>Repositories</h2>
-          <p className="settings-intro">Register repositories, optional local checkouts, and required checks for agent runs. Defaults to <code>git diff --check</code>.</p>
-            <label className="field full"><span>Repository allowlist</span><textarea value={repoText} onChange={(event) => setRepoText(event.target.value)} rows={7} placeholder="owner/repo | /absolute/local/path | npm test, git diff --check" /></label>
-            <div className="settings-actions"><button className="primary-btn" type="submit">Save repositories</button><button className="secondary-btn" type="button" onClick={syncNow}>Sync now</button>{status ? <span className="sync-status">{status}</span> : null}</div>
+            <h2>{t("settings.repositories")}</h2>
+          <p className="settings-intro">{t("settings.repoIntro")} <code>git diff --check</code>.</p>
+            <label className="field full"><span>{t("settings.allowlist")}</span><textarea value={repoText} onChange={(event) => setRepoText(event.target.value)} rows={7} placeholder="owner/repo | /absolute/local/path | npm test, git diff --check" /></label>
+            <div className="settings-actions"><button className="primary-btn" type="submit">{t("settings.saveRepos")}</button><button className="secondary-btn" type="button" onClick={syncNow}>{t("settings.syncNow")}</button>{status ? <span className="sync-status">{status}</span> : null}</div>
           </form>
         )}
         {activeTab === "Integrations" && (
           <form className="settings-panel is-visible" onSubmit={saveGitHub}>
-            <h2>Integrations</h2>
+            <h2>{t("settings.integrations")}</h2>
             <div className="settings-grid">
-              <label className="field"><span>GitHub access</span><input readOnly value="Contributor token" /></label>
-              <label className="field"><span>Backend agent SDK</span><select value={props.backendId} onChange={(event) => props.onBackendChange(event.target.value as AgentBackend["id"])}>{props.backends.map((backend) => <option key={backend.id} value={backend.id}>{backend.displayName}</option>)}</select></label>
-              <label className="field"><span>Agent endpoint</span><input readOnly value="Local SDK process (dynamic port)" /><small>OpenCode runs locally; no fixed network endpoint is required.</small></label>
-              <label className="field"><span>Runner timeout (seconds)</span><input type="number" min="30" max="3600" step="30" value={runnerTimeoutSeconds} onChange={(event) => setRunnerTimeoutSeconds(Number(event.target.value) || 600)} /><small>Default: 600 seconds.</small></label>
-              <label className="field"><span>GitHub username</span><input value={username} onChange={(event) => setUsername(event.target.value)} placeholder="your-github-id" /></label>
-              <label className="field"><span>Contributor token <small>{props.github?.hasToken ? "stored locally" : "not set"}</small></span><input value={token} onChange={(event) => setToken(event.target.value)} type="password" placeholder={props.github?.hasToken ? "Leave blank to keep current token" : "Fine-grained token"} /></label>
+              <label className="field"><span>{t("settings.githubAccess")}</span><input readOnly value={t("settings.contributorToken")} /></label>
+              <label className="field"><span>{t("settings.backendSdk")}</span><select value={props.backendId} onChange={(event) => props.onBackendChange(event.target.value as AgentBackend["id"])}>{props.backends.map((backend) => <option key={backend.id} value={backend.id}>{backend.displayName}</option>)}</select></label>
+              <label className="field"><span>{t("settings.endpoint")}</span><input readOnly value={t("settings.localSdk")} /><small>{t("settings.localSdkHelp")}</small></label>
+              <label className="field"><span>{t("settings.timeout")}</span><input type="number" min="30" max="3600" step="30" value={runnerTimeoutSeconds} onChange={(event) => setRunnerTimeoutSeconds(Number(event.target.value) || 600)} /><small>{t("settings.defaultTimeout")}</small></label>
+              <label className="field"><span>{t("settings.username")}</span><input value={username} onChange={(event) => setUsername(event.target.value)} placeholder="your-github-id" /></label>
+              <label className="field"><span>{t("settings.contributorToken")} <small>{props.github?.hasToken ? t("settings.tokenStored") : t("settings.tokenMissing")}</small></span><input value={token} onChange={(event) => setToken(event.target.value)} type="password" placeholder={props.github?.hasToken ? t("settings.keepToken") : t("settings.fineToken")} /></label>
             </div>
-            <div className="settings-actions"><button className="primary-btn" type="submit">Save integration settings</button>{status ? <span className="sync-status">{status}</span> : null}</div>
+            <div className="settings-actions"><button className="primary-btn" type="submit">{t("settings.saveIntegration")}</button>{status ? <span className="sync-status">{status}</span> : null}</div>
           </form>
         )}
         {activeTab === "Automation Policy" && (
-          <div className="settings-panel is-visible"><h2>Automation Policy</h2><p className="settings-intro">Agent patches are isolated, checked, and held for explicit approval before push.</p><div className="settings-notice"><strong>Approval gate</strong><span>Required checks are configured per repository. Push is blocked until every recorded check passes and a reviewer approves the patch.</span></div></div>
+          <div className="settings-panel is-visible"><h2>{t("settings.automation")}</h2><p className="settings-intro">{t("settings.policyIntro")}</p><div className="settings-notice"><strong>{t("settings.approvalGate")}</strong><span>{t("settings.approvalGateBody")}</span></div></div>
         )}
         {activeTab === "Search" && (
-          <div className="settings-panel is-visible"><h2>Search</h2><p className="settings-intro">Search is active across PR titles, branches, linked issues, summaries, comments, and English/Hebrew text.</p><label className="field full"><span>Current dashboard query</span><input value={props.query} onChange={(event) => props.onQueryChange(event.target.value)} placeholder="Search PRs, issues, comments, Hebrew or English" /></label><div className="settings-notice"><strong>Search scope</strong><span>The current release searches the loaded PR snapshot. Issue, comment, and code-result adapters are planned.</span></div></div>
+          <div className="settings-panel is-visible"><h2>{t("settings.search")}</h2><p className="settings-intro">{t("settings.searchIntro")}</p><label className="field full"><span>{t("settings.currentQuery")}</span><input value={props.query} onChange={(event) => props.onQueryChange(event.target.value)} placeholder={t("search.placeholder")} /></label><div className="settings-notice"><strong>{t("settings.searchScope")}</strong><span>{t("settings.searchScopeBody")}</span></div></div>
         )}
         {activeTab === "Preferences" && (
-          <div className="settings-panel is-visible"><h2>Preferences</h2><div className="settings-grid"><label className="field"><span>Theme</span><select value={props.theme} onChange={(event) => props.onThemeChange(event.target.value as ThemePreference)}><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label><label className="field"><span>PR age range</span><select value={props.dateRange} onChange={(event) => props.onDateRangeChange(event.target.value === "all" ? "all" : Number(event.target.value))}><option value="30">Last 30 days</option><option value="60">Last 60 days</option><option value="90">Last 90 days</option><option value="all">All time</option></select></label></div><p className="settings-intro">These preferences are stored locally in this browser.</p></div>
+          <div className="settings-panel is-visible"><h2>{t("settings.preferences")}</h2><div className="settings-grid"><label className="field"><span>{t("settings.theme")}</span><select value={props.theme} onChange={(event) => props.onThemeChange(event.target.value as ThemePreference)}><option value="system">{t("settings.system")}</option><option value="light">{t("settings.light")}</option><option value="dark">{t("settings.dark")}</option></select></label><label className="field"><span>{t("settings.prAge")}</span><select value={props.dateRange} onChange={(event) => props.onDateRangeChange(event.target.value === "all" ? "all" : Number(event.target.value))}><option value="30">{t("filter.lastDays", { days: 30 })}</option><option value="60">{t("filter.lastDays", { days: 60 })}</option><option value="90">{t("filter.lastDays", { days: 90 })}</option><option value="all">{t("filter.allTime")}</option></select></label></div><p className="settings-intro">{t("settings.localPrefs")}</p></div>
         )}
       </div>
     </section>
@@ -1194,7 +1210,9 @@ function PrDrawer(props: {
   onDeleteNote: (noteId: string) => Promise<void>;
   checkoutMessage: string;
 }) {
+  const { t } = useLocale();
   const status = statusFor(props.pr);
+  const statusKeys: Record<string, TranslationKey> = { closed: "status.closed", merged: "status.merged", draft: "status.draft", conflict: "status.conflict", checks: "status.checks", ready: "status.ready", review: "status.review" };
   const plan = drawerPlan(status);
   const isOpen = props.pr.state === "open";
   const [feedbackOpen, setFeedbackOpen] = useState(false);
@@ -1239,7 +1257,7 @@ function PrDrawer(props: {
         <div className="drawer-body">
           <section className="detail-block">
             <div className="tag-row">
-              <span className={`status ${status}`}>{statusLabel(status)}</span>
+              <span className={`status ${status}`}>{t(statusKeys[status])}</span>
               {props.pr.linkedIssueIds.map((issue) => <span className="tag" key={issue}>{issue}</span>)}
               <span className="tag">{props.member?.displayName ?? props.pr.author}</span>
               {annotations.tags.map((tag) => <span className="tag local-tag" key={tag}>{tag}</span>)}
@@ -1258,7 +1276,7 @@ function PrDrawer(props: {
           </section>
           {plan ? (
             <section className="detail-block recommendation-panel">
-              <div className="recommendation-head"><h3>{plan.title}</h3><span className={`status ${status}`}>{statusLabel(status)}</span></div>
+              <div className="recommendation-head"><h3>{plan.title}</h3><span className={`status ${status}`}>{t(statusKeys[status])}</span></div>
               <p>{plan.explanation}</p>
               <div className="timeline">
                 {plan.steps.map((step, index) => <div className="step" key={step}><i>{index + 1}</i><span>{step}</span></div>)}
@@ -1266,7 +1284,7 @@ function PrDrawer(props: {
             </section>
           ) : (
             <section className="detail-block read-only-state">
-              <h3>{statusLabel(status)} PR</h3>
+              <h3>{t(statusKeys[status])} PR</h3>
               <p>This PR is no longer open for remediation. Checkout, agent preparation, approval, and push actions are unavailable.</p>
             </section>
           )}
