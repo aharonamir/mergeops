@@ -67,6 +67,92 @@ class FailedWorkspaceAdapter(CapturingAdapter):
 
 
 class StoreRepositoryResolutionTest(unittest.TestCase):
+    def test_review_thread_refresh_preserves_concurrent_run_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            pull_request = PullRequest(
+                id="pr-refresh", repository="service", repositoryFullName="owner/service", number=1,
+                title="Refresh", author="dev", ownerMemberId="dev", sourceBranch="feature", baseBranch="main",
+                state="open", mergeable="mergeable", reviewState="commented", unresolvedCommentCount=0,
+                requestedReviewers=[], checkState="passing", linkedIssueIds=[], changedFilesCount=1, ageDays=1,
+                summary="Refresh", searchText="refresh",
+            )
+            running = AgentRun(id="run-refresh", backendId="opencode", repository="service", pullRequestId=pull_request.id, pullRequestNumber=1, action="analyze", status="running", requester="test", summary="Running", createdAt="2026-01-01T00:00:00Z")
+            data = self._data(pull_request)
+            data.githubPrivate.token = "test-token"
+            data.agentRuns = [running]
+            store = LocalJsonStore(root / "mergeops.local.json")
+            store._save(data)
+            entered = threading.Event()
+            release = threading.Event()
+
+            class BlockingGitHubClient:
+                def __init__(self, _token: str) -> None:
+                    pass
+
+                def get_review_threads(self, _owner: str, _name: str, _number: int):
+                    entered.set()
+                    release.wait(timeout=2)
+                    return [{"id": "thread-1", "createdAt": "2026-01-01T00:00:00Z", "viewerCanReply": True, "comments": []}]
+
+            with patch("app.github_sync.GitHubClient", BlockingGitHubClient):
+                refresh = threading.Thread(target=lambda: store.get_review_threads(pull_request.id))
+                refresh.start()
+                self.assertTrue(entered.wait(timeout=1))
+                with store._write_lock:
+                    current = store._load()
+                    completed = running.model_copy(update={"status": "patch_ready", "summary": "Completed", "diff": "diff --git a/a b/a\n"})
+                    current.agentRuns = [completed]
+                    store._save(current)
+                release.set()
+                refresh.join(timeout=2)
+
+            persisted = store.persisted_data().agentRuns[0]
+            self.assertEqual(persisted.status, "patch_ready")
+            self.assertEqual(persisted.diff, "diff --git a/a b/a\n")
+
+    def test_retry_derived_runs_copy_prepared_parent_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            run_root = root / "runs"
+            prepared_workspace = run_root / "run-prepared" / "checkout"
+            prepared_workspace.mkdir(parents=True)
+            (prepared_workspace / "README.md").write_text("prepared patch\n", encoding="utf-8")
+            pull_request = PullRequest(
+                id="pr-retry-review", repository="service", repositoryFullName="owner/service", number=1,
+                title="Retry review", author="dev", ownerMemberId="dev", sourceBranch="feature", baseBranch="main",
+                state="open", mergeable="mergeable", reviewState="commented", unresolvedCommentCount=0,
+                requestedReviewers=[], checkState="passing", linkedIssueIds=[], changedFilesCount=1, ageDays=1,
+                summary="Retry review", searchText="retry review",
+            )
+            prepared = AgentRun(id="run-prepared", backendId="opencode", repository="service", pullRequestId=pull_request.id, pullRequestNumber=1, action="fix_conflicts", status="patch_ready", requester="test", summary="Prepared", workspacePath=str(prepared_workspace), baseCommit="abc", diff="diff --git a/a b/a\n", createdAt="2026-01-01T00:00:00Z")
+            failed_review = AgentRun(id="review-failed", backendId="opencode", repository="service", pullRequestId=pull_request.id, pullRequestNumber=1, action="review_patch", status="failed", requester="test", summary="Failed", parentRunId=prepared.id, workspacePath=str(run_root / "review-failed" / "checkout"), baseCommit="abc", diff=prepared.diff, createdAt="2026-01-01T00:00:00Z")
+            data = self._data(pull_request)
+            data.agentRuns = [failed_review, prepared]
+            store = LocalJsonStore(root / "mergeops.local.json")
+            store._save(data)
+
+            with patch.object(RunWorkspace, "root", run_root):
+                retry = store.retry_agent_run(failed_review.id)
+
+            self.assertEqual(retry.action, "review_patch")
+            self.assertTrue(retry.workspacePath)
+            self.assertNotEqual(retry.workspacePath, prepared.workspacePath)
+            self.assertEqual((Path(retry.workspacePath) / "README.md").read_text(encoding="utf-8"), "prepared patch\n")
+
+            failed_revision = AgentRun(id="revision-failed", backendId="opencode", repository="service", pullRequestId=pull_request.id, pullRequestNumber=1, action="revise_with_feedback", status="failed", requester="test", summary="Failed", parentRunId=prepared.id, workspacePath=str(run_root / "revision-failed" / "checkout"), baseCommit="abc", diff=prepared.diff, createdAt="2026-01-01T00:00:00Z")
+            current = store._load()
+            current.agentRuns.insert(0, failed_revision)
+            store._save(current)
+
+            with patch.object(RunWorkspace, "root", run_root):
+                revision_retry = store.retry_agent_run(failed_revision.id)
+
+            self.assertEqual(revision_retry.action, "revise_with_feedback")
+            self.assertTrue(revision_retry.workspacePath)
+            self.assertNotEqual(revision_retry.workspacePath, prepared.workspacePath)
+            self.assertEqual((Path(revision_retry.workspacePath) / "README.md").read_text(encoding="utf-8"), "prepared patch\n")
+
     def test_feedback_revision_reuses_parent_workspace_and_annotations_survive_reload(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -619,7 +705,7 @@ class StoreRepositoryResolutionTest(unittest.TestCase):
             self.assertEqual(store.persisted_data().actions[0].pushRef, "mergeops/run-push")
             self.assertIn("mergeops/run-push", self._git(remote, "for-each-ref", "--format=%(refname:short)").splitlines())
 
-    def test_patch_review_reuses_parent_workspace_and_keeps_it_until_all_actions_clear(self) -> None:
+    def test_patch_review_isolates_workspace_and_keeps_parent_until_all_actions_clear(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             workspace = root / "runs" / "run-parent" / "checkout"
@@ -673,7 +759,7 @@ class StoreRepositoryResolutionTest(unittest.TestCase):
 
             self.assertEqual(completed.status, "review_ready")
             self.assertEqual(completed.parentRunId, parent.id)
-            self.assertEqual(adapter.requests[0].existing_workspace_path, str(workspace))
+            self.assertNotEqual(adapter.requests[0].existing_workspace_path, str(workspace))
             self.assertEqual(adapter.requests[0].review_diff, parent.diff)
             self.assertEqual(adapter.requests[0].previous_agent_output, parent.agentOutput)
 

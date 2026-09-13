@@ -91,6 +91,7 @@ class ApprovalRecord(BaseModel):
     decision: Literal["approved", "rejected"]
     reviewer: str
     baseCommit: str | None = None
+    diffHash: str | None = None
     createdAt: str
 
 
@@ -114,6 +115,85 @@ class PrAnnotations(BaseModel):
     notes: list[PrNote] = Field(default_factory=list)
 
 
+class ReviewThreadComment(BaseModel):
+    id: str
+    body: str
+    author: str = "unknown"
+    authorType: Literal["human", "bot", "unknown"] = "unknown"
+    createdAt: str
+    url: str | None = None
+
+
+class ReviewThread(BaseModel):
+    id: str
+    pullRequestId: str
+    repositoryFullName: str
+    pullRequestNumber: int
+    author: str = "unknown"
+    authorType: Literal["human", "bot", "unknown"] = "unknown"
+    path: str | None = None
+    line: int | None = None
+    excerpt: str = ""
+    body: str = ""
+    diffHunk: str = ""
+    createdAt: str
+    url: str | None = None
+    isResolved: bool = False
+    isOutdated: bool = False
+    viewerCanReply: bool = False
+    comments: list[ReviewThreadComment] = Field(default_factory=list)
+
+
+class ReviewThreadSnapshot(BaseModel):
+    pullRequestId: str
+    fetchedAt: str
+    stale: bool = False
+    error: str | None = None
+    threads: list[ReviewThread] = Field(default_factory=list)
+
+
+class SelectedReviewThread(BaseModel):
+    threadId: str
+    body: str
+    diffHunk: str = ""
+    path: str | None = None
+    line: int | None = None
+    author: str = "unknown"
+    authorType: Literal["human", "bot", "unknown"] = "unknown"
+    url: str | None = None
+    capturedAt: str
+
+
+class ReviewDisposition(BaseModel):
+    threadId: str
+    disposition: Literal["addressed", "not_addressed", "needs_clarification"]
+    explanation: str
+    relatedFiles: list[str] = Field(default_factory=list)
+    validationEvidence: list[str] = Field(default_factory=list)
+
+
+class ReplyDraft(BaseModel):
+    id: str
+    threadId: str
+    body: str
+    diffHash: str
+    status: Literal["draft", "selected", "posted", "failed", "ambiguous"] = "draft"
+    replyUrl: str | None = None
+    error: str | None = None
+    updatedAt: str
+
+
+class ReplyResult(BaseModel):
+    draftId: str
+    threadId: str
+    status: Literal["posted", "failed", "ambiguous", "skipped"]
+    replyUrl: str | None = None
+    error: str | None = None
+    actor: str = "local user"
+    commitSha: str | None = None
+    createdAt: str
+
+
 class AgentRun(BaseModel):
     id: str
     backendId: str
@@ -133,10 +213,15 @@ class AgentRun(BaseModel):
         "pushed",
         "failed",
         "cancelled",
+        "superseded",
+        "interrupted",
+        "recovery_required",
     ]
     requester: str
     summary: str
+    rootRunId: str | None = None
     parentRunId: str | None = None
+    supersededByRunId: str | None = None
     feedback: AgentFeedback | None = None
     agentOutput: str | None = None
     backendSessionId: str | None = None
@@ -150,6 +235,14 @@ class AgentRun(BaseModel):
     approval: ApprovalRecord | None = None
     pushRef: str | None = None
     rebaseEvidence: "RebaseEvidence | None" = None
+    diffHash: str | None = None
+    pushedCommitSha: str | None = None
+    selectedReviewThreads: list[SelectedReviewThread] = Field(default_factory=list)
+    dispositions: list[ReviewDisposition] = Field(default_factory=list)
+    replyDrafts: list[ReplyDraft] = Field(default_factory=list)
+    replyResults: list[ReplyResult] = Field(default_factory=list)
+    recoveryNote: str | None = None
+    recoveryInspected: bool = False
     createdAt: str
 
 
@@ -243,7 +336,9 @@ class ActionRecord(BaseModel):
     action: str
     status: str
     summary: str
+    rootRunId: str | None = None
     parentRunId: str | None = None
+    supersededByRunId: str | None = None
     feedback: AgentFeedback | None = None
     agentOutput: str | None = None
     workspacePath: str | None = None
@@ -256,6 +351,14 @@ class ActionRecord(BaseModel):
     approval: ApprovalRecord | None = None
     pushRef: str | None = None
     rebaseEvidence: RebaseEvidence | None = None
+    diffHash: str | None = None
+    pushedCommitSha: str | None = None
+    selectedReviewThreads: list[SelectedReviewThread] = Field(default_factory=list)
+    dispositions: list[ReviewDisposition] = Field(default_factory=list)
+    replyDrafts: list[ReplyDraft] = Field(default_factory=list)
+    replyResults: list[ReplyResult] = Field(default_factory=list)
+    recoveryNote: str | None = None
+    recoveryInspected: bool = False
     createdAt: str
 
 
@@ -269,9 +372,13 @@ class AgentRunSummary(BaseModel):
     status: str
     requester: str
     summary: str
+    rootRunId: str | None = None
     parentRunId: str | None = None
+    supersededByRunId: str | None = None
     workspacePath: str | None = None
     baseCommit: str | None = None
+    diffHash: str | None = None
+    pushedCommitSha: str | None = None
     createdAt: str
     eventCount: int = 0
     checkCount: int = 0
@@ -291,6 +398,8 @@ class ActionSummary(BaseModel):
     status: str
     summary: str
     parentRunId: str | None = None
+    rootRunId: str | None = None
+    supersededByRunId: str | None = None
     workspacePath: str | None = None
     baseCommit: str | None = None
     createdAt: str
@@ -301,6 +410,8 @@ class ActionSummary(BaseModel):
     blockedCommandCount: int = 0
     hasRebaseEvidence: bool = False
     pushRef: str | None = None
+    diffHash: str | None = None
+    pushedCommitSha: str | None = None
 
 
 class ActivityEvent(BaseModel):
@@ -328,6 +439,7 @@ class CreateAgentRunRequest(BaseModel):
     backendId: str
     pullRequestId: str
     action: Literal["analyze", "rebase", "fix_conflicts", "address_review", "fix_checks", "review_patch", "revise_with_feedback"]
+    reviewThreadIds: list[str] = Field(default_factory=list)
 
 
 class CreatePatchReviewRequest(BaseModel):
@@ -338,6 +450,14 @@ class CreateRevisionRequest(BaseModel):
     backendId: str
     instruction: str = Field(min_length=1, max_length=12000)
     reason: str | None = Field(default=None, max_length=120)
+
+
+class PostReviewRepliesRequest(BaseModel):
+    replies: list[ReplyDraft] = Field(min_length=1, max_length=100)
+
+
+class RecoveryInspectionRequest(BaseModel):
+    confirmed: bool = False
 
 
 class PushAgentRunRequest(BaseModel):

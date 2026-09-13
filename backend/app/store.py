@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
+import shutil
 import subprocess
+import time
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from threading import Event, Lock
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event, Lock, Thread
 from uuid import uuid4
 
 from pydantic import Field
 
 from .adapters import AgentRunRequest, AgentRunResult, RunWorkspace, adapter_registry, inspect_workspace, utc_now
 from .fixtures import agent_backends, agent_runs, github_settings, pull_requests, team_members
-from .models import ActionRecord, ActionSummary, ActivityEvent, AgentFeedback, AgentRun, AgentRunEvent, AgentRunSummary, AgentSettings, AppData, ApprovalRecord, BoundedText, CheckResult, CheckoutResult, CreatePrNoteRequest, CreateRevisionRequest, CreateTeamMemberRequest, GitHubSettings, GitHubSettingsPublic, PrAnnotations, PrNote, PullRequest, RebaseEvidence, RepositoryConfig, TeamMember, UpdateAgentSettingsRequest, UpdateGitHubSettingsRequest, UpdatePrNoteRequest, UpdateTeamMemberRequest
+from .ledger import ExecutionLedger
+from .models import ActionRecord, ActionSummary, ActivityEvent, AgentFeedback, AgentRun, AgentRunEvent, AgentRunSummary, AgentSettings, AppData, ApprovalRecord, BoundedText, CheckResult, CheckoutResult, CreatePrNoteRequest, CreateRevisionRequest, CreateTeamMemberRequest, GitHubSettings, GitHubSettingsPublic, PostReviewRepliesRequest, PrAnnotations, PrNote, PullRequest, RebaseEvidence, ReplyDraft, ReplyResult, RepositoryConfig, ReviewThread, ReviewThreadComment, ReviewThreadSnapshot, ReviewDisposition, SelectedReviewThread, TeamMember, UpdateAgentSettingsRequest, UpdateGitHubSettingsRequest, UpdatePrNoteRequest, UpdateTeamMemberRequest
 
 
 class PersistedAppData(AppData):
@@ -19,6 +25,7 @@ class PersistedAppData(AppData):
     actions: list[ActionRecord] = Field(default_factory=list)
     githubPrivate: GitHubSettings
     prAnnotations: list[PrAnnotations] = Field(default_factory=list)
+    reviewThreadSnapshots: list[ReviewThreadSnapshot] = Field(default_factory=list)
 
 
 class LocalJsonStore:
@@ -26,6 +33,298 @@ class LocalJsonStore:
         self.path = path
         self._write_lock = Lock()
         self._cancel_events: dict[str, Event] = {}
+        self.ledger = ExecutionLedger(path.with_suffix(".sqlite3"))
+        self._worker_stop = Event()
+        self._worker_thread: Thread | None = None
+        self._worker_executor: ThreadPoolExecutor | None = None
+        self._worker_owner = self.ledger.owner()
+        self._recover_execution_state()
+
+    def start_worker(self) -> None:
+        if self._worker_thread and self._worker_thread.is_alive():
+            return
+        self._worker_stop.clear()
+        self._worker_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mergeops-agent")
+        self._worker_thread = Thread(target=self._worker_loop, name="mergeops-execution-worker", daemon=True)
+        self._worker_thread.start()
+
+    def stop_worker(self) -> None:
+        self._worker_stop.set()
+        for job in self.ledger.active_jobs():
+            process_group = job.get("process_group")
+            if process_group:
+                try:
+                    os.killpg(int(process_group), 15)
+                except (OSError, ProcessLookupError):
+                    pass
+        if self._worker_executor:
+            self._worker_executor.shutdown(wait=False, cancel_futures=False)
+
+    def _worker_loop(self) -> None:
+        futures = set()
+        while not self._worker_stop.wait(0.15):
+            futures = {future for future in futures if not future.done()}
+            if len(futures) >= 4 or self._worker_executor is None:
+                continue
+            job = self.ledger.claim(self._worker_owner)
+            if job is None:
+                continue
+            future = self._worker_executor.submit(self._execute_claimed_job, job)
+            futures.add(future)
+
+    def _execute_claimed_job(self, job: dict[str, object]) -> None:
+        run_id = str(job["id"])
+        payload = job["payload"]
+        if not isinstance(payload, dict):
+            self.ledger.finish(run_id, "failed")
+            return
+        lease_stop = Event()
+        def renew() -> None:
+            while not lease_stop.wait(10):
+                self.ledger.heartbeat(run_id, self._worker_owner)
+        lease_thread = Thread(target=renew, name=f"mergeops-lease-{run_id}", daemon=True)
+        lease_thread.start()
+        try:
+            if payload.get("action") == "review_patch":
+                self.execute_patch_review(run_id, str(payload["backendId"]), str(payload["parentRunId"]))
+            else:
+                self.execute_agent_run(run_id, str(payload["backendId"]), str(payload["pullRequestId"]), str(payload["action"]))
+        finally:
+            lease_stop.set()
+            self.ledger.finish(run_id, "cancelled" if self.ledger.is_cancel_requested(run_id) else "finished")
+
+    def _recover_execution_state(self) -> None:
+        """Make orphaned in-flight work visible before accepting new work."""
+        if not self.path.exists():
+            return
+        data = self._load()
+        changed = False
+        ledger_jobs = {str(job["id"]): job for job in self.ledger.active_jobs()}
+        for run in data.agentRuns:
+            if run.status not in {"running", "checks_running"}:
+                if run.status == "queued":
+                    self.ledger.ensure_queued(run.id, self._job_payload(run), run.createdAt)
+                continue
+            job = ledger_jobs.get(run.id)
+            process_pid = int(job["process_pid"]) if job and job.get("process_pid") else None
+            safe_identity = False
+            if process_pid:
+                try:
+                    command_line = Path(f"/proc/{process_pid}/cmdline").read_bytes().decode(errors="ignore")
+                    environment = Path(f"/proc/{process_pid}/environ").read_bytes()
+                    run_marker = f"MERGEOPS_RUN_ID={run.id}".encode()
+                    safe_identity = "agent-runner" in command_line and run_marker in environment
+                except OSError:
+                    safe_identity = False
+                if safe_identity:
+                    try:
+                        os.killpg(int(job.get("process_group") or process_pid), 15)
+                    except ProcessLookupError:
+                        # The verified process exited between inspection and
+                        # termination, which is already a safe outcome.
+                        pass
+                    except OSError:
+                        safe_identity = False
+            # Without a verified runner identity we cannot know whether the
+            # recorded PID is still this run, so leave the run behind an
+            # explicit human recovery gate instead of making it retryable.
+            next_status = "interrupted" if safe_identity else "recovery_required"
+            replacement = run.model_copy(update={
+                "status": next_status,
+                "summary": "The backend restarted while this run was active. Inspect the retained workspace before retrying.",
+                "recoveryNote": "The recorded runner was terminated during recovery." if safe_identity else "Automatic resume is disabled; the previous runner identity could not be safely verified. Confirm that no old runner remains before retrying.",
+                "events": [*run.events, AgentRunEvent(sequence=len(run.events) + 1, type=next_status, message="Backend restart interrupted the run; automatic resume is disabled.", createdAt=utc_now())],
+            })
+            data.agentRuns = [replacement if item.id == run.id else item for item in data.agentRuns]
+            data.actions = [item.model_copy(update={"status": replacement.status, "summary": replacement.summary, "events": replacement.events, "recoveryNote": replacement.recoveryNote}) if item.id == run.id else item for item in data.actions]
+            self.ledger.finish(run.id, "interrupted")
+            changed = True
+        if changed:
+            self._save(data)
+
+    @staticmethod
+    def _job_payload(run: AgentRun) -> dict[str, object]:
+        return {"backendId": run.backendId, "pullRequestId": run.pullRequestId, "action": run.action, "parentRunId": run.parentRunId}
+
+    def _assert_writable_lineage_available(self, data: PersistedAppData, pull_request_id: str, excluding: set[str] | None = None) -> None:
+        writable = {"analyze", "rebase", "fix_conflicts", "address_review", "fix_checks", "revise_with_feedback"}
+        excluded = excluding or set()
+        active = [run for run in data.agentRuns if run.id not in excluded and run.pullRequestId == pull_request_id and run.action in writable and run.status in {"queued", "running", "checks_running", "awaiting_decision", "patch_ready", "awaiting_approval", "approved"} and not run.supersededByRunId]
+        if active:
+            raise ValueError(f"A writable remediation lineage is already active for this PR ({active[0].id})")
+
+    def _fresh_revision_workspace(self, parent: AgentRun, run_id: str) -> str:
+        workspace = Path(parent.workspacePath or "").expanduser().resolve()
+        root = RunWorkspace.root.resolve()
+        if root in workspace.parents:
+            destination_root = root / run_id
+            destination = destination_root / "checkout"
+            destination_root.mkdir(parents=True, exist_ok=False)
+            try:
+                shutil.copytree(workspace, destination, dirs_exist_ok=False, ignore=shutil.ignore_patterns(".local", ".config", ".mergeops-bin"))
+                return str(destination)
+            except Exception:
+                shutil.rmtree(destination_root, ignore_errors=True)
+                raise
+        # Test and legacy workspaces may live outside the managed root. They
+        # cannot be safely copied into a production run lineage.
+        return str(workspace)
+
+    def _validate_review_selection(self, pull_request: PullRequest, thread_ids: list[str], refresh: bool) -> list[SelectedReviewThread]:
+        snapshot = self.get_review_threads(pull_request.id, refresh=refresh)
+        if snapshot.stale:
+            raise ValueError(f"Review-thread snapshot is stale; refresh before queuing a fix: {snapshot.error or 'refresh failed'}")
+        requested = list(dict.fromkeys(thread_ids))
+        by_id = {thread.id: thread for thread in snapshot.threads}
+        missing = [thread_id for thread_id in requested if thread_id not in by_id]
+        if missing:
+            raise ValueError(f"Unknown review thread(s): {', '.join(missing)}")
+        invalid = [thread.id for thread in (by_id[thread_id] for thread_id in requested) if thread.isResolved or thread.isOutdated]
+        if invalid:
+            raise ValueError("Selected review thread is already resolved or outdated; refresh and select again")
+        captured_at = utc_now()
+        return [SelectedReviewThread(threadId=thread.id, body=thread.body[:12000], diffHunk=thread.diffHunk[:20000], path=thread.path, line=thread.line, author=thread.author, authorType=thread.authorType, url=thread.url, capturedAt=captured_at) for thread in (by_id[thread_id] for thread_id in requested)]
+
+    @staticmethod
+    def _diff_files(diff: str) -> list[str]:
+        files: list[str] = []
+        for line in diff.splitlines():
+            if not line.startswith("diff --git "):
+                continue
+            parts = line.split(" ")
+            if len(parts) >= 4:
+                files.append(parts[3][2:])
+        return list(dict.fromkeys(files))
+
+    @staticmethod
+    def _parse_disposition_output(output: str | None, selected_ids: set[str]) -> dict[str, ReviewDisposition]:
+        if not output:
+            return {}
+        decoder = json.JSONDecoder()
+        candidates: list[object] = []
+        for index, character in enumerate(output):
+            if character != "{":
+                continue
+            try:
+                payload, _ = decoder.raw_decode(output[index:])
+            except json.JSONDecodeError:
+                continue
+            candidates.append(payload)
+        for payload in reversed(candidates):
+            items = payload.get("dispositions") if isinstance(payload, dict) else None
+            if not isinstance(items, list):
+                continue
+            parsed: dict[str, ReviewDisposition] = {}
+            for item in items:
+                if not isinstance(item, dict) or item.get("threadId") not in selected_ids:
+                    continue
+                try:
+                    disposition = ReviewDisposition.model_validate(item)
+                except ValueError:
+                    continue
+                parsed[disposition.threadId] = disposition
+            if parsed:
+                return parsed
+        return {}
+
+    def _build_dispositions(self, run: AgentRun, diff: str, checks: list[CheckResult], output: str | None = None, preserve: bool = False) -> list[ReviewDisposition]:
+        selected_ids = {thread.threadId for thread in run.selectedReviewThreads}
+        parsed = self._parse_disposition_output(output, selected_ids)
+        previous = {item.threadId: item for item in run.dispositions} if preserve else {}
+        evidence = [check.name for check in checks if check.status == "passed"]
+        dispositions: list[ReviewDisposition] = []
+        for thread in run.selectedReviewThreads:
+            item = parsed.get(thread.threadId)
+            if item is None and thread.threadId in previous and not output:
+                item = previous[thread.threadId].model_copy(update={"validationEvidence": evidence or previous[thread.threadId].validationEvidence})
+            if item is None:
+                item = ReviewDisposition(
+                    threadId=thread.threadId,
+                    disposition="needs_clarification",
+                    explanation="The agent did not provide a structured finding for this thread; human clarification is required before replying.",
+                    relatedFiles=[thread.path] if thread.path else [],
+                    validationEvidence=evidence,
+                )
+            dispositions.append(item)
+        return dispositions
+
+    @staticmethod
+    def _build_reply_drafts(run: AgentRun, dispositions: list[ReviewDisposition], diff_hash: str | None) -> list[ReplyDraft]:
+        if not diff_hash:
+            return []
+        by_id = {item.threadId: item for item in dispositions}
+        now = utc_now()
+        drafts: list[ReplyDraft] = []
+        for thread in run.selectedReviewThreads:
+            disposition = by_id.get(thread.threadId)
+            if not disposition or disposition.disposition != "addressed":
+                continue
+            files = ", ".join(disposition.relatedFiles) or "the prepared patch"
+            drafts.append(ReplyDraft(id=f"reply-{uuid4().hex[:12]}", threadId=thread.threadId, body=f"Addressed in the MergeOps patch. Updated {files} and validated: {', '.join(disposition.validationEvidence) or 'required checks completed'}.", diffHash=diff_hash, updatedAt=now))
+        return drafts
+
+    def get_review_threads(self, pull_request_id: str, refresh: bool = True) -> ReviewThreadSnapshot:
+        data = self._load()
+        pull_request = next((item for item in data.pullRequests if item.id == pull_request_id), None)
+        if pull_request is None:
+            raise ValueError("Unknown pull request")
+        cached = next((item for item in data.reviewThreadSnapshots if item.pullRequestId == pull_request_id), None)
+        if not refresh:
+            return cached or ReviewThreadSnapshot(pullRequestId=pull_request_id, fetchedAt="", stale=True, error="No review-thread snapshot has been loaded.")
+        if not data.githubPrivate.token:
+            return self._mark_review_thread_snapshot_stale(pull_request_id, "GitHub token is not configured.")
+        try:
+            from .github_sync import GitHubClient
+            full_name = pull_request.repositoryFullName or self._pull_request_repository_key(pull_request, data)
+            if not full_name or "/" not in full_name:
+                raise ValueError("Pull request repository identity is unavailable")
+            owner, name = full_name.split("/", 1)
+            threads = GitHubClient(data.githubPrivate.token).get_review_threads(owner, name, pull_request.number)
+            normalized = [{**thread, "pullRequestId": pull_request_id, "repositoryFullName": full_name, "pullRequestNumber": pull_request.number} for thread in threads]
+            snapshot = ReviewThreadSnapshot(pullRequestId=pull_request_id, fetchedAt=utc_now(), threads=[ReviewThread.model_validate(thread) for thread in normalized])
+            self._persist_review_thread_snapshot(snapshot, update_unresolved_count=True)
+            return snapshot
+        except Exception as exc:
+            return self._mark_review_thread_snapshot_stale(pull_request_id, str(exc))
+
+    def _persist_review_thread_snapshot(self, snapshot: ReviewThreadSnapshot, update_unresolved_count: bool = False) -> None:
+        """Merge a refreshed snapshot into the latest dashboard state.
+
+        GitHub calls intentionally happen outside the lock. Reloading only at
+        this merge point prevents a slow refresh from writing an older full
+        JSON document over a concurrently completed agent run.
+        """
+        with self._write_lock:
+            data = self._load()
+            pull_request_id = snapshot.pullRequestId
+            data.reviewThreadSnapshots = [snapshot if item.pullRequestId == pull_request_id else item for item in data.reviewThreadSnapshots]
+            if not any(item.pullRequestId == pull_request_id for item in data.reviewThreadSnapshots):
+                data.reviewThreadSnapshots.append(snapshot)
+            if update_unresolved_count:
+                unresolved_count = sum(1 for thread in snapshot.threads if not thread.isResolved and not thread.isOutdated)
+                data.pullRequests = [item.model_copy(update={"unresolvedCommentCount": unresolved_count}) if item.id == pull_request_id else item for item in data.pullRequests]
+            self._save(data)
+
+    def _mark_review_thread_snapshot_stale(self, pull_request_id: str, error: str) -> ReviewThreadSnapshot:
+        with self._write_lock:
+            data = self._load()
+            cached = next((item for item in data.reviewThreadSnapshots if item.pullRequestId == pull_request_id), None)
+            if cached is None:
+                return ReviewThreadSnapshot(pullRequestId=pull_request_id, fetchedAt="", stale=True, error=error)
+            stale = cached.model_copy(update={"stale": True, "error": error})
+            data.reviewThreadSnapshots = [stale if item.pullRequestId == pull_request_id else item for item in data.reviewThreadSnapshots]
+            self._save(data)
+            return stale
+
+    def cache_review_threads(self, pull_request_id: str, threads: list[dict[str, object]]) -> ReviewThreadSnapshot:
+        data = self._load()
+        pull_request = next((item for item in data.pullRequests if item.id == pull_request_id), None)
+        if pull_request is None:
+            raise ValueError("Unknown pull request")
+        normalized = [{**thread, "pullRequestId": pull_request_id, "repositoryFullName": pull_request.repositoryFullName or pull_request.repository, "pullRequestNumber": pull_request.number} for thread in threads]
+        snapshot = ReviewThreadSnapshot(pullRequestId=pull_request_id, fetchedAt=utc_now(), threads=[ReviewThread.model_validate(thread) for thread in normalized])
+        self._persist_review_thread_snapshot(snapshot, update_unresolved_count=True)
+        return snapshot
 
     def app_data(self) -> AppData:
         return self._public(self._load())
@@ -33,7 +332,7 @@ class LocalJsonStore:
     def persisted_data(self) -> PersistedAppData:
         return self._load()
 
-    def queue_agent_run(self, backend_id: str, pull_request_id: str, action: str) -> AgentRun:
+    def queue_agent_run(self, backend_id: str, pull_request_id: str, action: str, review_thread_ids: list[str] | None = None) -> AgentRun:
         data = self._load()
         pull_request = next((item for item in data.pullRequests if item.id == pull_request_id), None)
         if pull_request is None:
@@ -44,6 +343,15 @@ class LocalJsonStore:
         )
         if backend_id not in enabled_backends:
             raise ValueError("Unknown agent backend")
+        selected_threads: list[SelectedReviewThread] = []
+        if action == "address_review":
+            if not review_thread_ids:
+                raise ValueError("Select at least one unresolved review thread")
+            selected_threads = self._validate_review_selection(pull_request, review_thread_ids, refresh=True)
+            data = self._load()
+            pull_request = next(item for item in data.pullRequests if item.id == pull_request_id)
+        if action in {"address_review", "rebase", "fix_conflicts", "fix_checks"}:
+            self._assert_writable_lineage_available(data, pull_request_id)
         created_at = utc_now()
         run = AgentRun(
             id=run_id,
@@ -55,6 +363,8 @@ class LocalJsonStore:
             status="queued",
             requester="local user",
             summary=f"Queued {action.replace('_', ' ')} run. Preparing isolated workspace.",
+            rootRunId=run_id,
+            selectedReviewThreads=selected_threads,
             events=[AgentRunEvent(sequence=1, type="queued", message="Run queued; waiting for an available worker.", createdAt=created_at)],
             createdAt=created_at,
         )
@@ -74,11 +384,18 @@ class LocalJsonStore:
         data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="agent_run", message=f"Agent run {run.action} for {run.repository}#{run.pullRequestNumber} was queued.", actionId=run.id, createdAt=run.createdAt))
         self._cancel_events[run.id] = Event()
         self._save(data)
+        # Persist the JSON snapshot before exposing the job to a worker. A
+        # worker may claim immediately after enqueue and must be able to load
+        # the run it is claiming.
+        self.ledger.enqueue(run.id, self._job_payload(run), created_at)
+        self.ledger.event(run.id, "queued", run.summary, created_at)
         return run
 
     def create_agent_run(self, backend_id: str, pull_request_id: str, action: str) -> AgentRun:
         run = self.queue_agent_run(backend_id, pull_request_id, action)
-        return self.execute_agent_run(run.id, backend_id, pull_request_id, action)
+        result = self.execute_agent_run(run.id, backend_id, pull_request_id, action)
+        self.ledger.finish(run.id, "cancelled" if result.status == "cancelled" else "finished")
+        return result
 
     def queue_revision(self, backend_id: str, parent_run_id: str, payload: CreateRevisionRequest) -> AgentRun:
         data = self._load()
@@ -91,26 +408,44 @@ class LocalJsonStore:
             raise ValueError("Run has no retained prepared patch to revise")
         if not Path(parent.workspacePath).is_dir():
             raise ValueError("Run workspace is no longer available")
+        active_review = next((item for item in data.agentRuns if item.parentRunId == parent.id and item.action == "review_patch" and item.status in {"queued", "running"}), None)
+        if active_review:
+            raise ValueError(f"Run cannot be revised while patch review {active_review.id} is active")
         enabled_backends = adapter_registry([(backend.id, backend.endpoint) for backend in data.agentBackends if backend.enabled])
         if backend_id not in enabled_backends:
             raise ValueError("Unknown agent backend")
+        superseded_ids = {parent.id}
+        if parent.action == "review_patch" and parent.parentRunId:
+            writable_parent = next((item for item in data.agentRuns if item.id == parent.parentRunId), None)
+            if writable_parent is None:
+                raise ValueError("Patch review parent is no longer available")
+            superseded_ids.add(writable_parent.id)
+        self._assert_writable_lineage_available(data, parent.pullRequestId, excluding=superseded_ids)
         created_at = utc_now()
         feedback = AgentFeedback(instruction=payload.instruction.strip(), reason=payload.reason.strip() if payload.reason else None, createdAt=created_at)
+        run_id = f"run-{uuid4().hex[:12]}"
+        revision_workspace = self._fresh_revision_workspace(parent, run_id)
         run = AgentRun(
-            id=f"run-{uuid4().hex[:12]}", backendId=backend_id, repository=parent.repository,
+            id=run_id, backendId=backend_id, repository=parent.repository,
             pullRequestId=parent.pullRequestId, pullRequestNumber=parent.pullRequestNumber,
             action="revise_with_feedback", status="queued", requester="local user",
             summary=f"Queued revision from feedback for {parent.repository}#{parent.pullRequestNumber}.",
-            parentRunId=parent.id, feedback=feedback, workspacePath=parent.workspacePath,
+            rootRunId=parent.rootRunId or parent.id, parentRunId=parent.id, feedback=feedback, workspacePath=revision_workspace,
             baseCommit=parent.baseCommit,
+            selectedReviewThreads=parent.selectedReviewThreads,
+            dispositions=parent.dispositions,
             events=[AgentRunEvent(sequence=1, type="queued", message="Feedback revision queued; waiting for an available worker.", createdAt=created_at)],
             createdAt=created_at,
         )
+        data.agentRuns = [item.model_copy(update={"status": "superseded", "supersededByRunId": run.id, "approval": None, "summary": f"Superseded by revision {run.id}; prior approval is invalid."}) if item.id in superseded_ids else item for item in data.agentRuns]
+        data.actions = [item.model_copy(update={"status": "superseded", "summary": f"Superseded by revision {run.id}; prior approval is invalid.", "approval": None, "supersededByRunId": run.id}) if item.id in superseded_ids else item for item in data.actions]
         data.agentRuns.insert(0, run)
         data.actions.insert(0, ActionRecord(id=run.id, kind="agent_run", repository=run.repository, pullRequestId=run.pullRequestId, pullRequestNumber=run.pullRequestNumber, action=run.action, status=run.status, summary=run.summary, parentRunId=run.parentRunId, feedback=run.feedback, workspacePath=run.workspacePath, baseCommit=run.baseCommit, events=run.events, createdAt=run.createdAt))
         data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="agent_feedback", message=f"Feedback revision queued for {run.repository}#{run.pullRequestNumber}.", actionId=run.id, createdAt=created_at))
         self._cancel_events[run.id] = Event()
         self._save(data)
+        self.ledger.enqueue(run.id, self._job_payload(run), created_at)
+        self.ledger.event(run.id, "queued", run.summary, created_at)
         return run
 
     def queue_patch_review(self, backend_id: str, parent_run_id: str) -> AgentRun:
@@ -129,6 +464,7 @@ class LocalJsonStore:
             raise ValueError("Unknown agent backend")
         run_id = f"review-{uuid4().hex[:12]}"
         created_at = utc_now()
+        review_workspace = self._fresh_revision_workspace(parent, run_id)
         run = AgentRun(
             id=run_id,
             backendId=backend_id,
@@ -139,9 +475,12 @@ class LocalJsonStore:
             status="queued",
             requester="local user",
             summary=f"Queued patch review for {parent.repository}#{parent.pullRequestNumber}.",
+            rootRunId=parent.rootRunId or parent.id,
             parentRunId=parent.id,
-            workspacePath=parent.workspacePath,
+            workspacePath=review_workspace,
             baseCommit=parent.baseCommit,
+            diffHash=parent.diffHash,
+            selectedReviewThreads=parent.selectedReviewThreads,
             events=[AgentRunEvent(sequence=1, type="queued", message="Patch review queued; waiting for an available worker.", createdAt=created_at)],
             patchSummary=parent.patchSummary,
             diff=parent.diff,
@@ -172,6 +511,8 @@ class LocalJsonStore:
         data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="agent_run", message=f"Patch review for {parent.repository}#{parent.pullRequestNumber} was queued.", actionId=run.id, createdAt=run.createdAt))
         self._cancel_events[run.id] = Event()
         self._save(data)
+        self.ledger.enqueue(run.id, self._job_payload(run), created_at)
+        self.ledger.event(run.id, "queued", run.summary, created_at)
         return run
 
     def execute_patch_review(self, run_id: str, backend_id: str, parent_run_id: str) -> AgentRun:
@@ -187,6 +528,7 @@ class LocalJsonStore:
         if adapter is None:
             raise ValueError("Unknown agent backend")
         cancel_event = self._cancel_events.setdefault(run_id, Event())
+        self.ledger.heartbeat(run_id, self._worker_owner)
         started_at = utc_now()
         running = run.model_copy(update={
             "status": "running",
@@ -204,12 +546,13 @@ class LocalJsonStore:
                 pull_request_number=parent.pullRequestNumber,
                 action="review_patch",
                 backend_id=backend_id,
-                existing_workspace_path=parent.workspacePath,
+                existing_workspace_path=run.workspacePath,
                 base_branch=pull_request.baseBranch,
                 source_branch=pull_request.sourceBranch,
                 review_diff=parent.diff,
                 previous_agent_output=parent.agentOutput,
                 runner_timeout_seconds=data.agentSettings.runnerTimeoutSeconds,
+                process_identity=lambda pid, group: self.ledger.heartbeat(run_id, self._worker_owner, process_pid=pid, process_group=group),
             ), on_event=lambda event: self.append_agent_event(run_id, event), cancel_event=cancel_event)
         except Exception as exc:
             result = AgentRunResult(status="failed", summary=f"Patch review failed: {exc}", events=[{"type": "error", "message": f"Patch review failed: {exc}", "createdAt": utc_now()}])
@@ -222,7 +565,7 @@ class LocalJsonStore:
                 "summary": result.summary,
                 "agentOutput": result.output,
                 "backendSessionId": result.backend_session_id,
-                "workspacePath": parent.workspacePath,
+                "workspacePath": run.workspacePath,
                 "baseCommit": parent.baseCommit,
             })
             data.agentRuns = [updated if item.id == run_id else item for item in data.agentRuns]
@@ -243,6 +586,7 @@ class LocalJsonStore:
         if adapter is None:
             raise ValueError("Unknown agent backend")
         cancel_event = self._cancel_events.setdefault(run_id, Event())
+        self.ledger.heartbeat(run_id, self._worker_owner)
         started_at = utc_now()
         running = run.model_copy(update={
             "status": "running",
@@ -316,11 +660,14 @@ class LocalJsonStore:
                 previous_agent_output=parent_run.agentOutput if parent_run else None,
                 feedback_instruction=run.feedback.instruction if run.feedback else None,
                 feedback_reason=run.feedback.reason if run.feedback else None,
+                selected_review_threads=[thread.model_dump(mode="json") for thread in run.selectedReviewThreads],
+                process_identity=lambda pid, group: self.ledger.heartbeat(run_id, self._worker_owner, process_pid=pid, process_group=group),
             ), on_event=lambda event: self.append_agent_event(run_id, event), cancel_event=cancel_event)
         except Exception as exc:
             result = AgentRunResult(status="failed", summary=f"Agent worker failed: {exc}", events=[{"type": "error", "message": f"Agent worker failed: {exc}", "createdAt": utc_now()}])
         patch_summary = None
         diff = None
+        diff_hash = None
         checks: list[CheckResult] = []
         risk_summary = None
         rebase_evidence = RebaseEvidence.model_validate(result.rebase_evidence) if result.rebase_evidence else None
@@ -336,6 +683,9 @@ class LocalJsonStore:
                     review_base,
                 )
                 diff = raw_diff[:50000] if raw_diff else raw_diff
+                # Approval and reply validation operate on the retained diff,
+                # so hash exactly that bounded representation.
+                diff_hash = hashlib.sha256((diff or "").encode("utf-8")).hexdigest() if diff else None
                 if rebase_evidence is not None and raw_diff is not None:
                     rebase_evidence.diff = BoundedText(text=diff or "", truncated=len(raw_diff) > 50000, originalLength=len(raw_diff))
                 checks = [CheckResult.model_validate(check) for check in raw_checks]
@@ -374,6 +724,15 @@ class LocalJsonStore:
                 final_summary = "Agent completed without producing a working-tree patch. No approval is available."
             elif result.status == "awaiting_approval" and has_patch and not checks_passed:
                 final_summary = "Agent produced a patch, but one or more required checks failed. No approval is available."
+            review_lineage = action == "address_review" or (action == "revise_with_feedback" and bool(current.selectedReviewThreads))
+            dispositions = self._build_dispositions(
+                current,
+                diff or "",
+                checks,
+                result.output,
+                preserve=action == "revise_with_feedback" and not result.output,
+            ) if review_lineage and has_patch else current.dispositions
+            reply_drafts = self._build_reply_drafts(current, dispositions, diff_hash) if review_lineage and final_status == "patch_ready" else current.replyDrafts
             updated = current.model_copy(update={
                 "status": final_status,
                 "summary": (f"Patch prepared for review. {patch_summary}" if final_status == "patch_ready" and patch_summary else final_summary),
@@ -387,13 +746,17 @@ class LocalJsonStore:
                 "checks": checks,
                 "riskSummary": risk_summary,
                 "rebaseEvidence": rebase_evidence,
+                "diffHash": diff_hash,
+                "dispositions": dispositions,
+                "replyDrafts": reply_drafts,
             })
             data.agentRuns = [updated if item.id == run_id else item for item in data.agentRuns]
-            data.actions = [item.model_copy(update={"status": updated.status, "summary": updated.summary, "agentOutput": updated.agentOutput, "workspacePath": updated.workspacePath, "baseCommit": updated.baseCommit, "events": updated.events, "patchSummary": updated.patchSummary, "diff": updated.diff, "checks": updated.checks, "riskSummary": updated.riskSummary, "rebaseEvidence": updated.rebaseEvidence}) if item.id == run_id else item for item in data.actions]
+            data.actions = [item.model_copy(update={"status": updated.status, "summary": updated.summary, "agentOutput": updated.agentOutput, "workspacePath": updated.workspacePath, "baseCommit": updated.baseCommit, "events": updated.events, "patchSummary": updated.patchSummary, "diff": updated.diff, "checks": updated.checks, "riskSummary": updated.riskSummary, "rebaseEvidence": updated.rebaseEvidence, "diffHash": updated.diffHash, "selectedReviewThreads": updated.selectedReviewThreads, "dispositions": updated.dispositions, "replyDrafts": updated.replyDrafts, "replyResults": updated.replyResults}) if item.id == run_id else item for item in data.actions]
             if checks:
                 data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="checks", message=f"Required checks completed for {updated.repository}#{updated.pullRequestNumber}.", actionId=updated.id, createdAt=utc_now()))
             data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="agent_run", message=f"Agent run {updated.action} for {updated.repository}#{updated.pullRequestNumber} is {updated.status}.", actionId=updated.id, createdAt=utc_now()))
             self._save(data)
+            self.ledger.event(updated.id, updated.status, updated.summary, utc_now())
         return updated
 
     def cancel_agent_run(self, run_id: str) -> AgentRun:
@@ -405,6 +768,7 @@ class LocalJsonStore:
             if run.status not in {"queued", "running", "patch_ready", "checks_running"}:
                 return run
             self._cancel_events.setdefault(run_id, Event()).set()
+            self.ledger.request_cancel(run_id)
             cancelled = run.model_copy(update={
                 "status": "cancelled",
                 "summary": "Cancellation requested; stopping the worker.",
@@ -414,7 +778,80 @@ class LocalJsonStore:
             data.actions = [item.model_copy(update={"status": cancelled.status, "summary": cancelled.summary, "events": cancelled.events}) if item.id == run_id else item for item in data.actions]
             data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="agent_run", message=f"Cancellation requested for {run.repository}#{run.pullRequestNumber}.", actionId=run.id, createdAt=utc_now()))
             self._save(data)
+            self.ledger.event(run.id, "cancel_requested", "Cancellation requested; stopping the worker.", cancelled.createdAt)
             return cancelled
+
+    def retry_agent_run(self, run_id: str) -> AgentRun:
+        data = self._load()
+        parent = next((item for item in data.agentRuns if item.id == run_id), None)
+        if parent is None:
+            raise ValueError("Unknown agent run")
+        if parent.status not in {"failed", "cancelled", "interrupted", "recovery_required"}:
+            raise ValueError(f"Only failed or interrupted runs can be retried: {parent.status}")
+        if parent.status == "recovery_required" and not parent.recoveryInspected:
+            raise ValueError("Recovery is required: inspect the retained workspace and confirm the old runner is gone before retrying")
+        if parent.action == "address_review":
+            selected = self._validate_review_selection(next(item for item in data.pullRequests if item.id == parent.pullRequestId), [item.threadId for item in parent.selectedReviewThreads], refresh=True)
+            data = self._load()
+            parent = next(item for item in data.agentRuns if item.id == run_id)
+        else:
+            selected = parent.selectedReviewThreads
+        created_at = utc_now()
+        retry_id = f"run-{uuid4().hex[:12]}"
+        workspace_path = None
+        base_commit = parent.baseCommit
+        excluded_lineage = {parent.id}
+        if parent.action in {"review_patch", "revise_with_feedback"}:
+            workspace_source = parent
+            if parent.parentRunId:
+                source_parent = next((item for item in data.agentRuns if item.id == parent.parentRunId), None)
+                if source_parent and source_parent.workspacePath:
+                    workspace_source = source_parent
+                    excluded_lineage.add(source_parent.id)
+            if not workspace_source.workspacePath or not Path(workspace_source.workspacePath).is_dir():
+                raise ValueError("Retry source workspace is no longer available")
+            workspace_path = self._fresh_revision_workspace(workspace_source, retry_id)
+            base_commit = workspace_source.baseCommit or base_commit
+        self._assert_writable_lineage_available(data, parent.pullRequestId, excluding=excluded_lineage)
+        retry = AgentRun(
+            id=retry_id, backendId=parent.backendId, repository=parent.repository,
+            pullRequestId=parent.pullRequestId, pullRequestNumber=parent.pullRequestNumber, action=parent.action,
+            status="queued", requester="local user", summary=f"Retry queued for {parent.repository}#{parent.pullRequestNumber}.",
+            rootRunId=parent.rootRunId or parent.id, parentRunId=parent.id, feedback=parent.feedback,
+            workspacePath=workspace_path, baseCommit=base_commit, selectedReviewThreads=selected,
+            dispositions=parent.dispositions,
+            events=[AgentRunEvent(sequence=1, type="queued", message="Retry queued with a fresh isolated workspace.", createdAt=created_at)], createdAt=created_at,
+        )
+        data.agentRuns.insert(0, retry)
+        data.actions.insert(0, ActionRecord(id=retry.id, kind="agent_run", repository=retry.repository, pullRequestId=retry.pullRequestId, pullRequestNumber=retry.pullRequestNumber, action=retry.action, status=retry.status, summary=retry.summary, rootRunId=retry.rootRunId, parentRunId=retry.parentRunId, feedback=retry.feedback, workspacePath=retry.workspacePath, baseCommit=retry.baseCommit, selectedReviewThreads=retry.selectedReviewThreads, dispositions=retry.dispositions, events=retry.events, createdAt=retry.createdAt))
+        data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="agent_run", message=retry.summary, actionId=retry.id, createdAt=created_at))
+        self._cancel_events[retry.id] = Event()
+        self._save(data)
+        self.ledger.enqueue(retry.id, self._job_payload(retry), created_at)
+        self.ledger.event(retry.id, "retry_queued", retry.summary, created_at)
+        return retry
+
+    def inspect_recovery(self, run_id: str, confirmed: bool) -> AgentRun:
+        if not confirmed:
+            raise ValueError("Recovery inspection must be explicitly confirmed")
+        with self._write_lock:
+            data = self._load()
+            run = next((item for item in data.agentRuns if item.id == run_id), None)
+            if run is None:
+                raise ValueError("Unknown agent run")
+            if run.status != "recovery_required":
+                raise ValueError(f"Run does not require recovery inspection: {run.status}")
+            inspected = run.model_copy(update={
+                "recoveryInspected": True,
+                "recoveryNote": "A local user confirmed that no old runner remains and the retained workspace may be retried.",
+                "summary": "Recovery inspected; retry is available with a fresh isolated workspace.",
+                "events": [*run.events, AgentRunEvent(sequence=len(run.events) + 1, type="recovery_inspected", message="A local user confirmed the old runner is gone; retry is now available.", createdAt=utc_now())],
+            })
+            data.agentRuns = [inspected if item.id == run_id else item for item in data.agentRuns]
+            data.actions = [item.model_copy(update={"status": inspected.status, "summary": inspected.summary, "events": inspected.events, "recoveryNote": inspected.recoveryNote, "recoveryInspected": True}) if item.id == run_id else item for item in data.actions]
+            self._save(data)
+            self.ledger.event(run_id, "recovery_inspected", inspected.summary, utc_now())
+            return inspected
 
     def select_rebase_decision(self, run_id: str, option_id: str) -> AgentRun:
         with self._write_lock:
@@ -433,6 +870,8 @@ class LocalJsonStore:
             data.agentRuns = [updated if item.id == run_id else item for item in data.agentRuns]
             data.actions = [item.model_copy(update={"status": updated.status, "summary": updated.summary, "events": updated.events, "rebaseEvidence": updated.rebaseEvidence}) if item.id == run_id else item for item in data.actions]
             self._save(data)
+            if updated.status == "queued":
+                self.ledger.enqueue(updated.id, self._job_payload(updated), utc_now())
             return updated
 
     def approve_agent_run(self, run_id: str, reviewer: str = "local user") -> AgentRun:
@@ -447,13 +886,17 @@ class LocalJsonStore:
                 raise ValueError("A non-empty patch is required before approval")
             if not run.checks or any(check.status != "passed" for check in run.checks):
                 raise ValueError("All required checks must pass before approval")
-            approval = ApprovalRecord(id=f"approval-{uuid4().hex[:12]}", runId=run.id, decision="approved", reviewer=reviewer, baseCommit=run.baseCommit, createdAt=utc_now())
+            current_diff_hash = hashlib.sha256(run.diff.encode("utf-8")).hexdigest()
+            if run.diffHash and run.diffHash != current_diff_hash:
+                raise ValueError("The retained diff changed; refresh the run before approval")
+            approval = ApprovalRecord(id=f"approval-{uuid4().hex[:12]}", runId=run.id, decision="approved", reviewer=reviewer, baseCommit=run.baseCommit, diffHash=current_diff_hash, createdAt=utc_now())
             approved = run.model_copy(update={"status": "approved", "approval": approval, "summary": f"Approved by {reviewer}; ready to push."})
             data.agentRuns = [approved if item.id == run_id else item for item in data.agentRuns]
             data.approvals.insert(0, approval)
             data.actions = [item.model_copy(update={"status": approved.status, "summary": approved.summary, "approval": approved.approval}) if item.id == run_id else item for item in data.actions]
             data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="approval", message=f"Approved agent run for {run.repository}#{run.pullRequestNumber} by {reviewer}.", actionId=run.id, createdAt=approval.createdAt))
             self._save(data)
+            self.ledger.event(run.id, "approved", approved.summary, approval.createdAt)
             return approved
 
     def push_agent_run(self, run_id: str, target: str = "mergeops_branch") -> AgentRun:
@@ -467,6 +910,13 @@ class LocalJsonStore:
             raise ValueError("Run has no isolated workspace to push")
         if run.baseCommit != run.approval.baseCommit:
             raise ValueError("Run base commit changed after approval")
+        if run.supersededByRunId:
+            raise ValueError("This run was superseded; its approval is no longer valid")
+        expected_diff_hash = hashlib.sha256((run.diff or "").encode("utf-8")).hexdigest()
+        if run.diffHash and run.diffHash != expected_diff_hash:
+            raise ValueError("Run diff changed after approval")
+        if run.approval.diffHash and run.approval.diffHash != expected_diff_hash:
+            raise ValueError("Run diff changed after approval")
         if target not in {"mergeops_branch", "pr_branch"}:
             raise ValueError("Unsupported push target")
         pull_request = next((item for item in data.pullRequests if item.id == run.pullRequestId), None)
@@ -497,12 +947,75 @@ class LocalJsonStore:
             self._save(data)
             raise ValueError(f"Push failed: {exc}") from exc
         destination = "the PR branch" if target == "pr_branch" else f"{push_ref}"
-        pushed = run.model_copy(update={"status": "pushed", "pushRef": push_ref, "summary": f"Pushed approved patch to {destination}."})
+        pushed_commit_sha = RunWorkspace._git(workspace, "rev-parse", "HEAD").strip()
+        effective_approval = run.approval.model_copy(update={"diffHash": expected_diff_hash}) if run.approval.diffHash is None else run.approval
+        pushed = run.model_copy(update={"status": "pushed", "pushRef": push_ref, "pushedCommitSha": pushed_commit_sha, "diffHash": expected_diff_hash, "approval": effective_approval, "summary": f"Pushed approved patch to {destination}."})
         data.agentRuns = [pushed if item.id == run_id else item for item in data.agentRuns]
-        data.actions = [item.model_copy(update={"status": pushed.status, "summary": pushed.summary, "approval": pushed.approval, "pushRef": pushed.pushRef}) if item.id == run_id else item for item in data.actions]
+        data.actions = [item.model_copy(update={"status": pushed.status, "summary": pushed.summary, "approval": pushed.approval, "pushRef": pushed.pushRef, "pushedCommitSha": pushed.pushedCommitSha}) if item.id == run_id else item for item in data.actions]
         data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="push", message=f"Pushed approved run for {run.repository}#{run.pullRequestNumber} to {push_ref}.", actionId=run.id, createdAt=utc_now()))
         self._save(data)
+        self.ledger.event(run.id, "pushed", pushed.summary, utc_now())
         return pushed
+
+    def post_review_replies(self, run_id: str, payload: PostReviewRepliesRequest) -> AgentRun:
+        data = self._load()
+        run = next((item for item in data.agentRuns if item.id == run_id), None)
+        if run is None:
+            raise ValueError("Unknown agent run")
+        if run.status != "pushed" or not run.pushedCommitSha:
+            raise ValueError("Replies are available only after a successful approved push")
+        if not run.diffHash:
+            raise ValueError("Run has no final diff hash")
+        supplied = {draft.id: draft for draft in payload.replies}
+        drafts = {draft.id: draft for draft in run.replyDrafts}
+        if any(draft_id not in drafts for draft_id in supplied):
+            raise ValueError("Reply draft does not belong to this run")
+        if any(draft.diffHash != run.diffHash for draft in supplied.values()):
+            raise ValueError("Reply draft is stale because the final diff changed")
+        snapshot = self.get_review_threads(run.pullRequestId, refresh=True)
+        if snapshot.stale:
+            raise ValueError(f"Review-thread refresh failed; replies are blocked until GitHub data is fresh: {snapshot.error or 'refresh failed'}")
+        data = self._load()
+        run = next(item for item in data.agentRuns if item.id == run_id)
+        by_thread = {thread.id: thread for thread in snapshot.threads}
+        from .github_sync import GitHubClient
+        client = GitHubClient(data.githubPrivate.token)
+        results = list(run.replyResults)
+        updated_drafts = list(run.replyDrafts)
+        for draft_id, submitted in supplied.items():
+            draft = drafts[draft_id]
+            thread = by_thread.get(draft.threadId)
+            now = utc_now()
+            if draft.status == "posted":
+                result = ReplyResult(draftId=draft_id, threadId=draft.threadId, status="skipped", replyUrl=draft.replyUrl, commitSha=run.pushedCommitSha, createdAt=now)
+            elif thread is None or thread.pullRequestId != run.pullRequestId:
+                result = ReplyResult(draftId=draft_id, threadId=draft.threadId, status="failed", error="Thread is no longer part of this pull request.", commitSha=run.pushedCommitSha, createdAt=now)
+            elif thread.isResolved or thread.isOutdated:
+                result = ReplyResult(draftId=draft_id, threadId=draft.threadId, status="failed", error="Thread is already resolved or outdated.", commitSha=run.pushedCommitSha, createdAt=now)
+            elif not thread.viewerCanReply:
+                result = ReplyResult(draftId=draft_id, threadId=draft.threadId, status="failed", error="The current GitHub identity cannot reply to this thread.", commitSha=run.pushedCommitSha, createdAt=now)
+            elif any(comment.body.strip() == submitted.body.strip() for comment in thread.comments):
+                # An earlier mutation may have succeeded while its response
+                # was lost. Treat a matching existing comment as posted so a
+                # retry cannot create a duplicate GitHub reply.
+                duplicate = next(comment for comment in thread.comments if comment.body.strip() == submitted.body.strip())
+                result = ReplyResult(draftId=draft_id, threadId=draft.threadId, status="posted", replyUrl=duplicate.url, commitSha=run.pushedCommitSha, createdAt=now)
+            else:
+                try:
+                    reply = client.add_thread_reply(thread.id, submitted.body.strip())
+                    result = ReplyResult(draftId=draft_id, threadId=draft.threadId, status="posted", replyUrl=str(reply.get("url") or "") or None, commitSha=run.pushedCommitSha, createdAt=now)
+                except Exception as exc:
+                    # Network outcomes are intentionally ambiguous. The next
+                    # refresh/retry must revalidate the thread first.
+                    result = ReplyResult(draftId=draft_id, threadId=draft.threadId, status="ambiguous", error=str(exc), commitSha=run.pushedCommitSha, createdAt=now)
+            results = [item for item in results if item.draftId != draft_id] + [result]
+            updated_drafts = [item.model_copy(update={"body": submitted.body, "status": result.status, "replyUrl": result.replyUrl, "error": result.error, "updatedAt": now}) if item.id == draft_id else item for item in updated_drafts]
+        updated = run.model_copy(update={"replyDrafts": updated_drafts, "replyResults": results})
+        data.agentRuns = [updated if item.id == run_id else item for item in data.agentRuns]
+        data.actions = [item.model_copy(update={"replyDrafts": updated.replyDrafts, "replyResults": updated.replyResults}) if item.id == run_id else item for item in data.actions]
+        data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="review_reply", message=f"Posted review replies for {run.repository}#{run.pullRequestNumber}; inspect individual outcomes.", actionId=run.id, createdAt=utc_now()))
+        self._save(data)
+        return updated
 
     def append_agent_event(self, run_id: str, event: dict[str, object]) -> None:
         with self._write_lock:
@@ -516,6 +1029,11 @@ class LocalJsonStore:
                 message=str(event.get("message", "")),
                 createdAt=event.get("createdAt") if isinstance(event.get("createdAt"), str) else utc_now(),
             )
+            self.ledger.event(run_id, recorded.type, recorded.message, recorded.createdAt)
+            process_pid = event.get("processPid")
+            process_group = event.get("processGroup")
+            if isinstance(process_pid, int):
+                self.ledger.heartbeat(run_id, self._worker_owner, process_pid=process_pid, process_group=process_group if isinstance(process_group, int) else process_pid)
             updated = run.model_copy(update={"events": [*run.events, recorded]})
             data.agentRuns = [updated if item.id == run_id else item for item in data.agentRuns]
             data.actions = [item.model_copy(update={"events": updated.events}) if item.id == run_id else item for item in data.actions]
@@ -645,6 +1163,8 @@ class LocalJsonStore:
         action = next((item for item in data.actions if item.id == action_id), None)
         if action is None:
             raise ValueError("Unknown action")
+        if action.status == "recovery_required" and not action.recoveryInspected:
+            raise ValueError("Recovery-required actions must be inspected before cleanup")
         if action.workspacePath and not any(item.id != action.id and item.workspacePath == action.workspacePath for item in data.actions):
             workspace = Path(action.workspacePath).resolve()
             root = RunWorkspace.root.resolve()
@@ -845,9 +1365,13 @@ class LocalJsonStore:
             status=run.status,
             requester=run.requester,
             summary=run.summary,
+            rootRunId=run.rootRunId,
             parentRunId=run.parentRunId,
+            supersededByRunId=run.supersededByRunId,
             workspacePath=run.workspacePath,
             baseCommit=run.baseCommit,
+            diffHash=run.diffHash,
+            pushedCommitSha=run.pushedCommitSha,
             createdAt=run.createdAt,
             eventCount=len(run.events),
             checkCount=len(run.checks),
@@ -869,7 +1393,9 @@ class LocalJsonStore:
             action=action.action,
             status=action.status,
             summary=action.summary,
+            rootRunId=action.rootRunId,
             parentRunId=action.parentRunId,
+            supersededByRunId=action.supersededByRunId,
             workspacePath=action.workspacePath,
             baseCommit=action.baseCommit,
             createdAt=action.createdAt,
@@ -880,6 +1406,8 @@ class LocalJsonStore:
             blockedCommandCount=len(evidence.blockedCommands) if evidence else 0,
             hasRebaseEvidence=evidence is not None,
             pushRef=action.pushRef,
+            diffHash=action.diffHash,
+            pushedCommitSha=action.pushedCommitSha,
         )
 
     def _normalize_pull_request(self, pull_request: PullRequest, data: PersistedAppData) -> PullRequest:

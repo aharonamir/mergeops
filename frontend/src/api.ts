@@ -1,5 +1,5 @@
 import { fixtureData } from "./fixtures";
-import type { ActionRecord, AgentRun, AgentSettings, AppData, CheckoutResult, GitHubSettings, GitHubSyncResult, PrAnnotations, RepositoryConfig, TeamMember } from "./types";
+import type { ActionRecord, AgentRun, AgentSettings, AppData, CheckoutResult, GitHubSettings, GitHubSyncResult, PrAnnotations, ReplyDraft, RepositoryConfig, ReviewThreadSnapshot, TeamMember } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "";
 
@@ -29,6 +29,7 @@ export async function createAgentRun(input: {
   backendId: string;
   pullRequestId: string;
   action: AgentRun["action"];
+  reviewThreadIds?: string[];
 }): Promise<AgentRun> {
   try {
     const response = await fetch(`${API_BASE}/api/agent-runs`, {
@@ -114,6 +115,37 @@ export async function reviseAgentRun(runId: string, input: { backendId: string; 
   const response = await fetch(`${API_BASE}/api/agent-runs/${runId}/revise`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) });
   if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
   return await response.json();
+}
+
+export async function retryAgentRun(runId: string): Promise<AgentRun> {
+  const response = await fetch(`${API_BASE}/api/agent-runs/${runId}/retry`, { method: "POST" });
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
+  return await response.json();
+}
+
+export async function inspectRecoveryAgentRun(runId: string): Promise<AgentRun> {
+  const response = await fetch(`${API_BASE}/api/agent-runs/${runId}/inspect-recovery`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmed: true }) });
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
+  return await response.json();
+}
+
+export async function loadReviewThreads(pullRequestId: string): Promise<ReviewThreadSnapshot> {
+  const response = await fetch(`${API_BASE}/api/pull-requests/${pullRequestId}/review-threads`);
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
+  return await response.json();
+}
+
+export async function postReviewReplies(runId: string, replies: ReplyDraft[]): Promise<AgentRun> {
+  const response = await fetch(`${API_BASE}/api/agent-runs/${runId}/review-replies`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ replies }) });
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
+  return await response.json();
+}
+
+export function subscribeToAgentEvents(onEvent: () => void): () => void {
+  if (typeof EventSource === "undefined") return () => undefined;
+  const source = new EventSource(`${API_BASE}/api/agent-runs/events`);
+  source.addEventListener("agent-run", onEvent);
+  return () => source.close();
 }
 
 export async function loadPrAnnotations(pullRequestId: string): Promise<PrAnnotations> {

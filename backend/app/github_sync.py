@@ -29,6 +29,105 @@ class GitHubClient:
         with urlopen(request, timeout=20) as response:
             return json.loads(response.read().decode("utf-8"))
 
+    def graphql(self, query: str, variables: dict[str, object]) -> dict[str, object]:
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "User-Agent": "MergeOps-local",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        request = Request("https://api.github.com/graphql", data=json.dumps({"query": query, "variables": variables}).encode("utf-8"), headers=headers, method="POST")
+        with urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if payload.get("errors"):
+            raise ValueError("GitHub GraphQL error: " + "; ".join(str(error.get("message", error)) for error in payload["errors"] if isinstance(error, dict)))
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise ValueError("Unexpected GitHub GraphQL response")
+        return data
+
+    def get_review_threads(self, owner: str, name: str, number: int) -> list[dict[str, object]]:
+        query = """
+        query($owner:String!, $name:String!, $number:Int!, $after:String) {
+          repository(owner:$owner, name:$name) {
+            pullRequest(number:$number) {
+              reviewThreads(first:100, after:$after) {
+                nodes {
+                  id isResolved isOutdated viewerCanReply path line
+                  comments(first:50) { nodes { id body url createdAt path line diffHunk author { login __typename } } }
+                }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+          }
+        }
+        """
+        after: str | None = None
+        threads: list[dict[str, object]] = []
+        while True:
+            data = self.graphql(query, {"owner": owner, "name": name, "number": number, "after": after})
+            repository = data.get("repository")
+            pull_request = repository.get("pullRequest") if isinstance(repository, dict) else None
+            connection = pull_request.get("reviewThreads") if isinstance(pull_request, dict) else None
+            if not isinstance(connection, dict):
+                raise ValueError("GitHub did not return review threads for this pull request")
+            for raw in connection.get("nodes", []):
+                if not isinstance(raw, dict):
+                    continue
+                comments = raw.get("comments") if isinstance(raw.get("comments"), dict) else {}
+                comment_nodes = comments.get("nodes", []) if isinstance(comments, dict) else []
+                first_comment = comment_nodes[0] if comment_nodes and isinstance(comment_nodes[0], dict) else {}
+                author = first_comment.get("author") if isinstance(first_comment, dict) and isinstance(first_comment.get("author"), dict) else {}
+                normalized_comments = []
+                for comment in comment_nodes:
+                    if not isinstance(comment, dict):
+                        continue
+                    comment_author = comment.get("author") if isinstance(comment.get("author"), dict) else {}
+                    normalized_comments.append({
+                        "id": str(comment.get("id") or ""), "body": _bounded_graphql_text(comment.get("body")),
+                        "author": str(comment_author.get("login") or "unknown"), "authorType": _author_type(comment_author),
+                        "createdAt": str(comment.get("createdAt") or ""), "url": comment.get("url"),
+                    })
+                threads.append({
+                    "id": str(raw.get("id") or ""), "author": str(author.get("login") or "unknown"), "authorType": _author_type(author),
+                    "path": raw.get("path") or first_comment.get("path"), "line": raw.get("line") or first_comment.get("line"), "excerpt": _bounded_graphql_text(first_comment.get("body")),
+                    "body": _bounded_graphql_text(first_comment.get("body")), "diffHunk": _bounded_graphql_text(first_comment.get("diffHunk"), 20000),
+                    "createdAt": str(first_comment.get("createdAt") or ""), "url": first_comment.get("url"),
+                    "isResolved": bool(raw.get("isResolved")), "isOutdated": bool(raw.get("isOutdated")), "viewerCanReply": bool(raw.get("viewerCanReply")),
+                    "comments": normalized_comments,
+                })
+            page_info = connection.get("pageInfo") if isinstance(connection.get("pageInfo"), dict) else {}
+            if not page_info.get("hasNextPage"):
+                return threads
+            after = str(page_info.get("endCursor"))
+
+    def add_thread_reply(self, thread_id: str, body: str) -> dict[str, object]:
+        mutation = """
+        mutation($threadId:ID!, $body:String!) {
+          addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId, body:$body}) {
+            comment { id url }
+          }
+        }
+        """
+        data = self.graphql(mutation, {"threadId": thread_id, "body": body})
+        result = data.get("addPullRequestReviewThreadReply")
+        comment = result.get("comment") if isinstance(result, dict) else None
+        if not isinstance(comment, dict):
+            raise ValueError("GitHub did not return the created reply")
+        return {"id": comment.get("id"), "url": comment.get("url")}
+
+
+def _bounded_graphql_text(value: object, limit: int = 12000) -> str:
+    return str(value or "")[:limit]
+
+
+def _author_type(value: object) -> str:
+    if not isinstance(value, dict):
+        return "unknown"
+    return "bot" if value.get("__typename") in {"Bot", "App"} else "human" if value.get("login") else "unknown"
+
 
 def sync_github_pull_requests(store: LocalJsonStore) -> GitHubSyncResult:
     data = store.persisted_data()
@@ -42,7 +141,7 @@ def sync_github_pull_requests(store: LocalJsonStore) -> GitHubSyncResult:
 
     for repository in enabled_repositories:
         try:
-            imported.extend(_sync_repository(client, repository, settings, data.teamMembers))
+            imported.extend(_sync_repository(client, repository, settings, data.teamMembers, store))
         except (HTTPError, URLError, TimeoutError, ValueError) as exc:
             errors.append(f"{repository.owner}/{repository.name}: {exc}")
 
@@ -61,6 +160,7 @@ def _sync_repository(
     repository: RepositoryConfig,
     settings: GitHubSettings,
     team_members: list[TeamMember],
+    store: LocalJsonStore | None = None,
 ) -> list[PullRequest]:
     usernames = {member.githubUsername for member in team_members if member.githubUsername}
     if not usernames and settings.username and len(team_members) == 1:
@@ -85,14 +185,21 @@ def _sync_repository(
         if not isinstance(detail, dict):
             continue
         comment_count = len(comments) if isinstance(comments, list) else 0
+        review_threads: list[dict[str, object]] | None = None
+        try:
+            review_threads = client.get_review_threads(repository.owner, repository.name, number)
+            comment_count = sum(1 for thread in review_threads if not thread.get("isResolved") and not thread.get("isOutdated"))
+        except (HTTPError, URLError, TimeoutError, ValueError):
+            # Keep the PR import useful when GraphQL is unavailable. A later
+            # drawer refresh will retain/cache a stale snapshot explicitly.
+            review_threads = None
         author = _login(detail.get("user")) or "unknown"
         owner_member_id = _owner_member_id(author, settings.username, team_members)
         state = _state(detail)
         mergeable = _mergeable(detail.get("mergeable"))
         review_state = "review_required" if detail.get("requested_reviewers") else "commented" if comment_count else "approved"
 
-        pull_requests.append(
-            PullRequest(
+        pull_request = PullRequest(
                 id=f"{repository.owner}-{repository.name}-{number}",
                 repository=repository.name,
                 repositoryFullName=f"{repository.owner}/{repository.name}",
@@ -115,7 +222,14 @@ def _sync_repository(
                 summary=str(detail.get("body") or "")[:280] or "No PR description.",
                 searchText=f"{detail.get('title', '')} {detail.get('body', '')}",
             )
-        )
+        pull_requests.append(pull_request)
+        if review_threads is not None and store is not None:
+            try:
+                store.cache_review_threads(pull_request.id, review_threads)
+            except ValueError:
+                # The PR is new to this snapshot; replace_pull_requests will
+                # persist the dashboard record before the next detail load.
+                pass
 
     return pull_requests
 

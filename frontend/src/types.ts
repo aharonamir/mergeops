@@ -1,6 +1,6 @@
 export type ThemePreference = "system" | "light" | "dark";
 export type View = "cockpit" | "team" | "agents" | "activity" | "settings";
-export type QueueFilter = "all" | "open" | "conflict" | "review" | "ready" | "merged" | "closed";
+export type QueueFilter = "all" | "open" | "conflict" | "review" | "ready" | "needs_you" | "merged" | "closed";
 
 export type TeamMember = {
   id: string;
@@ -81,10 +81,12 @@ export type AgentRun = {
   pullRequestId: string;
   pullRequestNumber: number;
   action: "analyze" | "rebase" | "fix_conflicts" | "address_review" | "fix_checks" | "review_patch" | "revise_with_feedback";
-  status: "queued" | "running" | "patch_ready" | "review_ready" | "checks_running" | "awaiting_decision" | "awaiting_approval" | "approved" | "pushed" | "failed" | "cancelled";
+  status: "queued" | "running" | "patch_ready" | "review_ready" | "checks_running" | "awaiting_decision" | "awaiting_approval" | "approved" | "pushed" | "failed" | "cancelled" | "superseded" | "interrupted" | "recovery_required";
   requester: string;
   summary: string;
   parentRunId?: string | null;
+  rootRunId?: string | null;
+  supersededByRunId?: string | null;
   feedback?: AgentFeedback | null;
   agentOutput?: string | null;
   backendSessionId?: string | null;
@@ -97,6 +99,14 @@ export type AgentRun = {
   riskSummary?: string | null;
   approval?: ApprovalRecord | null;
   pushRef?: string | null;
+  diffHash?: string | null;
+  pushedCommitSha?: string | null;
+  selectedReviewThreads?: SelectedReviewThread[];
+  dispositions?: ReviewDisposition[];
+  replyDrafts?: ReplyDraft[];
+  replyResults?: ReplyResult[];
+  recoveryNote?: string | null;
+  recoveryInspected?: boolean;
   rebaseEvidence?: RebaseEvidence | null;
   createdAt: string;
 };
@@ -112,8 +122,12 @@ export type AgentRunSummary = {
   requester: string;
   summary: string;
   parentRunId?: string | null;
+  rootRunId?: string | null;
+  supersededByRunId?: string | null;
   workspacePath?: string | null;
   baseCommit?: string | null;
+  diffHash?: string | null;
+  pushedCommitSha?: string | null;
   createdAt: string;
   eventCount?: number;
   checkCount?: number;
@@ -192,6 +206,7 @@ export type ApprovalRecord = {
   decision: "approved" | "rejected";
   reviewer: string;
   baseCommit?: string | null;
+  diffHash?: string | null;
   createdAt: string;
 };
 
@@ -215,6 +230,32 @@ export type PrAnnotations = {
   notes: PrNote[];
 };
 
+export type ReviewThreadComment = { id: string; body: string; author: string; authorType: "human" | "bot" | "unknown"; createdAt: string; url?: string | null };
+export type ReviewThread = {
+  id: string;
+  pullRequestId: string;
+  repositoryFullName: string;
+  pullRequestNumber: number;
+  author: string;
+  authorType: "human" | "bot" | "unknown";
+  path?: string | null;
+  line?: number | null;
+  excerpt: string;
+  body: string;
+  diffHunk: string;
+  createdAt: string;
+  url?: string | null;
+  isResolved: boolean;
+  isOutdated: boolean;
+  viewerCanReply: boolean;
+  comments: ReviewThreadComment[];
+};
+export type ReviewThreadSnapshot = { pullRequestId: string; fetchedAt: string; stale: boolean; error?: string | null; threads: ReviewThread[] };
+export type SelectedReviewThread = { threadId: string; body: string; diffHunk: string; path?: string | null; line?: number | null; author: string; authorType: "human" | "bot" | "unknown"; url?: string | null; capturedAt: string };
+export type ReviewDisposition = { threadId: string; disposition: "addressed" | "not_addressed" | "needs_clarification"; explanation: string; relatedFiles: string[]; validationEvidence: string[] };
+export type ReplyDraft = { id: string; threadId: string; body: string; diffHash: string; status: "draft" | "selected" | "posted" | "failed" | "ambiguous"; replyUrl?: string | null; error?: string | null; updatedAt: string };
+export type ReplyResult = { draftId: string; threadId: string; status: "posted" | "failed" | "ambiguous" | "skipped"; replyUrl?: string | null; error?: string | null; actor?: string; commitSha?: string | null; createdAt: string };
+
 export type ActionRecord = {
   id: string;
   kind: "checkout" | "agent_run";
@@ -225,6 +266,8 @@ export type ActionRecord = {
   status: string;
   summary: string;
   parentRunId?: string | null;
+  rootRunId?: string | null;
+  supersededByRunId?: string | null;
   feedback?: AgentFeedback | null;
   agentOutput?: string | null;
   workspacePath?: string | null;
@@ -236,6 +279,14 @@ export type ActionRecord = {
   riskSummary?: string | null;
   approval?: ApprovalRecord | null;
   pushRef?: string | null;
+  diffHash?: string | null;
+  pushedCommitSha?: string | null;
+  selectedReviewThreads?: SelectedReviewThread[];
+  dispositions?: ReviewDisposition[];
+  replyDrafts?: ReplyDraft[];
+  replyResults?: ReplyResult[];
+  recoveryNote?: string | null;
+  recoveryInspected?: boolean;
   rebaseEvidence?: RebaseEvidence | null;
   eventCount?: number;
   checkCount?: number;

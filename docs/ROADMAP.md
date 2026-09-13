@@ -4,6 +4,11 @@
 
 `mergeops/` contains the original static prototype plus the first React/Vite and FastAPI local-only scaffold. It validates product shape, information architecture, core screens, theme behavior, team workspace fields, backend agent SDK selection, and fixture-backed API flow.
 
+## Approved Next Investment
+
+The detailed plan for durable, approval-gated headless remediation and selected
+GitHub review-thread fixes is in [HEADLESS_PR_REVIEW_PLAN.md](HEADLESS_PR_REVIEW_PLAN.md).
+
 ## Review Blockers
 
 ### P2: Avoid selecting local paths by bare repo name

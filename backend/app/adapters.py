@@ -37,6 +37,8 @@ class AgentRunRequest:
     previous_agent_output: str | None = None
     feedback_instruction: str | None = None
     feedback_reason: str | None = None
+    selected_review_threads: list[dict[str, object]] | None = None
+    process_identity: Callable[[int, int], None] | None = None
     rebase_plan: dict[str, object] | None = None
     runner_timeout_seconds: int = 600
 
@@ -186,6 +188,7 @@ class SubprocessAgentAdapter:
             "previousAgentOutput": request.previous_agent_output,
             "feedbackInstruction": request.feedback_instruction,
             "feedbackReason": request.feedback_reason,
+            "selectedReviewThreads": request.selected_review_threads,
         }
         try:
             inherited_path = os.environ.get("PATH", "")
@@ -213,6 +216,8 @@ class SubprocessAgentAdapter:
                 env=environment,
                 start_new_session=True,
             )
+            if request.process_identity:
+                request.process_identity(process.pid, process.pid)
             assert process.stdin is not None
             process.stdin.write(json.dumps(payload))
             process.stdin.close()

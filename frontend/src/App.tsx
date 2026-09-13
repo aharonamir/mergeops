@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   GitPullRequest,
   Activity,
@@ -18,10 +18,11 @@ import {
   FileSearch,
   GitCompare,
   ChevronDown,
-  ChevronUp
+  ChevronUp,
+  BellRing
 } from "lucide-react";
-import { approveAgentRun, cancelAgentRun, checkBackendHealth, clearAction, createAgentRun, createCheckout, createPrNote, createTeamMember, deletePrNote, deleteTeamMember, loadActionDetails, loadAppData, loadPrAnnotations, pushAgentRun, reviseAgentRun, reviewPatch, selectRebaseDecision, syncGitHub, updateAgentSettings, updateGitHubSettings, updatePrTags, updateTeamMember } from "./api";
-import type { ActionRecord, ActivityEvent, AgentBackend, AgentRun, AgentRunEvent, AgentRunSummary, AgentSettings, AppData, ConflictEvidence, GitHubSettings, GitHubSyncResult, PrAnnotations, PullRequest, QueueFilter, RepositoryConfig, TeamMember, ThemePreference, View } from "./types";
+import { approveAgentRun, cancelAgentRun, checkBackendHealth, clearAction, createAgentRun, createCheckout, createPrNote, createTeamMember, deletePrNote, deleteTeamMember, inspectRecoveryAgentRun, loadActionDetails, loadAppData, loadPrAnnotations, loadReviewThreads, postReviewReplies, pushAgentRun, reviseAgentRun, retryAgentRun, reviewPatch, selectRebaseDecision, subscribeToAgentEvents, syncGitHub, updateAgentSettings, updateGitHubSettings, updatePrTags, updateTeamMember } from "./api";
+import type { ActionRecord, ActivityEvent, AgentBackend, AgentRun, AgentRunEvent, AgentRunSummary, AgentSettings, AppData, ConflictEvidence, GitHubSettings, GitHubSyncResult, PrAnnotations, PullRequest, QueueFilter, ReplyDraft, RepositoryConfig, ReviewThread, ReviewThreadSnapshot, TeamMember, ThemePreference, View } from "./types";
 import { useLocale, type TranslationKey } from "./i18n";
 
 const themeIcons = {
@@ -56,6 +57,7 @@ function matchesQueue(pr: PullRequest, queue: QueueFilter) {
   const status = statusFor(pr);
   return queue === "all"
     || (queue === "open" && pr.state === "open")
+    || (queue === "needs_you" && pr.state === "open" && (pr.unresolvedCommentCount > 0 || pr.reviewState === "changes_requested" || pr.reviewState === "review_required"))
     || (queue === "conflict" && status === "conflict")
     || (queue === "review" && status === "review")
     || (queue === "ready" && status === "ready")
@@ -108,11 +110,11 @@ function drawerPlan(status: string) {
 }
 
 function actionFromRun(run: AgentRun): ActionRecord {
-  return { id: run.id, kind: "agent_run", repository: run.repository, pullRequestId: run.pullRequestId, pullRequestNumber: run.pullRequestNumber, action: run.action, status: run.status, summary: run.summary, parentRunId: run.parentRunId, feedback: run.feedback, agentOutput: run.agentOutput, workspacePath: run.workspacePath, baseCommit: run.baseCommit, events: run.events, patchSummary: run.patchSummary, diff: run.diff, checks: run.checks, riskSummary: run.riskSummary, approval: run.approval, pushRef: run.pushRef, createdAt: run.createdAt };
+  return { id: run.id, kind: "agent_run", repository: run.repository, pullRequestId: run.pullRequestId, pullRequestNumber: run.pullRequestNumber, action: run.action, status: run.status, summary: run.summary, rootRunId: run.rootRunId, parentRunId: run.parentRunId, supersededByRunId: run.supersededByRunId, feedback: run.feedback, agentOutput: run.agentOutput, workspacePath: run.workspacePath, baseCommit: run.baseCommit, events: run.events, patchSummary: run.patchSummary, diff: run.diff, checks: run.checks, riskSummary: run.riskSummary, approval: run.approval, pushRef: run.pushRef, diffHash: run.diffHash, pushedCommitSha: run.pushedCommitSha, selectedReviewThreads: run.selectedReviewThreads, dispositions: run.dispositions, replyDrafts: run.replyDrafts, replyResults: run.replyResults, recoveryNote: run.recoveryNote, recoveryInspected: run.recoveryInspected, createdAt: run.createdAt };
 }
 
 function actionFromSummary(run: AgentRunSummary): ActionRecord {
-  return { id: run.id, kind: "agent_run", repository: run.repository, pullRequestId: run.pullRequestId, pullRequestNumber: run.pullRequestNumber, action: run.action, status: run.status, summary: run.summary, parentRunId: run.parentRunId, workspacePath: run.workspacePath, baseCommit: run.baseCommit, eventCount: run.eventCount, checkCount: run.checkCount, conflictCount: run.conflictCount, resolvedConflictCount: run.resolvedConflictCount, blockedCommandCount: run.blockedCommandCount, hasRebaseEvidence: run.hasRebaseEvidence, createdAt: run.createdAt };
+  return { id: run.id, kind: "agent_run", repository: run.repository, pullRequestId: run.pullRequestId, pullRequestNumber: run.pullRequestNumber, action: run.action, status: run.status, summary: run.summary, rootRunId: run.rootRunId, parentRunId: run.parentRunId, supersededByRunId: run.supersededByRunId, workspacePath: run.workspacePath, baseCommit: run.baseCommit, diffHash: run.diffHash, pushedCommitSha: run.pushedCommitSha, eventCount: run.eventCount, checkCount: run.checkCount, conflictCount: run.conflictCount, resolvedConflictCount: run.resolvedConflictCount, blockedCommandCount: run.blockedCommandCount, hasRebaseEvidence: run.hasRebaseEvidence, createdAt: run.createdAt };
 }
 
 export function App() {
@@ -163,19 +165,15 @@ export function App() {
     };
   }, []);
 
+  const hasActiveWork = actions.some((action) => ["queued", "running", "patch_ready", "checks_running", "awaiting_decision"].includes(action.status));
+
   useEffect(() => {
-    const activeStatuses = new Set(["queued", "running", "patch_ready", "checks_running"]);
-    if (!actions.some((action) => activeStatuses.has(action.status))) return;
-    const timer = window.setInterval(() => {
-      loadAppData().then((payload) => {
-        setData(payload);
-        setRuns(payload.agentRuns);
-        setActions(payload.actions ?? payload.agentRuns.map(actionFromSummary));
-        setActivity(payload.activity ?? []);
-      });
-    }, 750);
-    return () => window.clearInterval(timer);
-  }, [actions]);
+    if (!hasActiveWork) return;
+    const refresh = () => { void loadAppData().then((payload) => { setData(payload); setRuns(payload.agentRuns); setActions(payload.actions ?? payload.agentRuns.map(actionFromSummary)); setActivity(payload.activity ?? []); }); };
+    const unsubscribe = subscribeToAgentEvents(refresh);
+    const timer = window.setInterval(refresh, 5000);
+    return () => { unsubscribe(); window.clearInterval(timer); };
+  }, [hasActiveWork]);
 
   useEffect(() => {
     const resolved = theme === "system"
@@ -238,8 +236,9 @@ export function App() {
   const ThemeIcon = themeIcons[theme];
   const repos = ["all", ...new Set(data.pullRequests.map((pr) => pr.repository))];
 
-  async function startRun(pr: PullRequest) {
-    const run = await createAgentRun({ backendId, pullRequestId: pr.id, action: pr.mergeable === "conflicting" ? "fix_conflicts" : "rebase" });
+  async function startRun(pr: PullRequest, reviewThreadIds: string[] = []) {
+    const action = reviewThreadIds.length ? "address_review" : pr.mergeable === "conflicting" ? "fix_conflicts" : "rebase";
+    const run = await createAgentRun({ backendId, pullRequestId: pr.id, action, reviewThreadIds });
     setRuns((current) => [run, ...current]);
     setActions((current) => [actionFromRun(run), ...current]);
     const refreshed = await loadAppData();
@@ -368,6 +367,24 @@ export function App() {
     setActivity(refreshed.activity ?? []);
   }
 
+  async function retryRun(runId: string) {
+    const run = await retryAgentRun(runId);
+    setRuns((current) => [run, ...current]);
+    setActions((current) => [actionFromRun(run), ...current]);
+  }
+
+  async function inspectRecovery(runId: string) {
+    const run = await inspectRecoveryAgentRun(runId);
+    setRuns((current) => current.map((item) => item.id === run.id ? run : item));
+    setActions((current) => current.map((item) => item.id === run.id ? actionFromRun(run) : item));
+  }
+
+  async function applyReviewFindings(runId: string) {
+    const detail = await loadActionDetails(runId);
+    const findings = "agentOutput" in detail && detail.agentOutput ? detail.agentOutput : "Review findings are recorded in the independent review run details.";
+    await reviseRun(runId, `Apply the independent review findings below to the prepared patch. Preserve unrelated work and report a structured result.\n\n${findings.slice(-12000)}`, "independent review findings");
+  }
+
   async function showRunDetails(action: ActionRecord) {
     setDetailsAction(action);
     setDetails(null);
@@ -474,10 +491,11 @@ export function App() {
             onSelectPr={setSelectedPr}
             dateRange={dateRange}
             onDateRangeChange={setDateRange}
+            actions={actions}
           />
         )}
         {activeView === "team" && <TeamWorkspace members={data.teamMembers} onSaveMember={saveTeamMember} onAddMember={addTeamMember} onDeleteMember={removeTeamMember} />}
-        {activeView === "agents" && <ActionsView actions={actions} onClear={removeAction} onStop={stopRun} onApprove={approveRun} onPush={pushRun} onReviewPatch={reviewRunPatch} onShowDetails={showRunDetails} onLoadEvents={loadActionDetails} />}
+        {activeView === "agents" && <ActionsView actions={actions} onClear={removeAction} onStop={stopRun} onApprove={approveRun} onPush={pushRun} onReviewPatch={reviewRunPatch} onApplyReview={applyReviewFindings} onShowDetails={showRunDetails} onLoadEvents={loadActionDetails} />}
         {activeView === "activity" && <ActivityView events={activity} />}
         {activeView === "settings" && (
           <SettingsView
@@ -502,19 +520,23 @@ export function App() {
       </main>
 
       {selectedPr && (
-        <PrDrawer
+          <PrDrawer
           pr={selectedPr}
           member={teamById.get(selectedPr.ownerMemberId)}
           backend={backend}
-          run={actions.find((action) => action.kind === "agent_run" && action.pullRequestId === selectedPr.id && action.action !== "review_patch")}
+          run={actions.find((action) => action.kind === "agent_run" && action.pullRequestId === selectedPr.id)}
           annotations={annotations}
           canPushPrBranch={Boolean(data.github?.hasToken && selectedPr.headRepositoryFullName)}
           onClose={() => setSelectedPr(null)}
-          onStartRun={() => startRun(selectedPr)}
+            onStartRun={(reviewThreadIds) => startRun(selectedPr, reviewThreadIds)}
           onCheckout={() => checkoutPr(selectedPr)}
-          onApproveRun={approveRun}
-          onPushRun={pushRun}
-          onReviseRun={reviseRun}
+            onApproveRun={approveRun}
+            onPushRun={pushRun}
+            onReviewRun={reviewRunPatch}
+            onReviseRun={reviseRun}
+            onPostReplies={async (runId, replies) => { const updated = await postReviewReplies(runId, replies); setRuns((current) => current.map((item) => item.id === updated.id ? updated : item)); setActions((current) => current.map((item) => item.id === updated.id ? actionFromRun(updated) : item)); }}
+            onRetryRun={retryRun}
+            onInspectRecovery={inspectRecovery}
           onSaveTags={(tags) => savePrTags(selectedPr.id, tags)}
           onSaveNote={async (text) => setAnnotations(await createPrNote(selectedPr.id, text))}
           onDeleteNote={async (noteId) => setAnnotations(await deletePrNote(selectedPr.id, noteId))}
@@ -522,7 +544,7 @@ export function App() {
         />
       )}
       {diffAction ? <DiffDialog action={diffAction} onClose={() => setDiffAction(null)} onReviewPatch={reviewRunPatch} /> : null}
-      {detailsAction ? <RunDetailsDrawer action={detailsAction} details={details} loading={detailsLoading} onClose={() => { setDetailsAction(null); setDetails(null); }} onShowDiff={setDiffAction} onChooseRebaseDecision={chooseRebaseDecision} /> : null}
+      {detailsAction ? <RunDetailsDrawer action={detailsAction} details={details} loading={detailsLoading} onClose={() => { setDetailsAction(null); setDetails(null); }} onShowDiff={setDiffAction} onChooseRebaseDecision={chooseRebaseDecision} onRetryRun={retryRun} onInspectRecovery={inspectRecovery} /> : null}
     </div>
   );
 }
@@ -541,6 +563,7 @@ function Cockpit(props: {
   onSelectPr: (pr: PullRequest) => void;
   dateRange: number | "all";
   onDateRangeChange: (range: number | "all") => void;
+  actions: ActionRecord[];
 }) {
   const { t } = useLocale();
   const [membersCollapsed, setMembersCollapsed] = useState(() => localStorage.getItem("mergeops.cockpit.membersCollapsed") !== "false");
@@ -550,6 +573,9 @@ function Cockpit(props: {
   const conflictCount = props.allPrs.filter((pr) => statusFor(pr) === "conflict").length;
   const reviewCount = props.allPrs.filter((pr) => statusFor(pr) === "review").length;
   const readyCount = props.allPrs.filter((pr) => statusFor(pr) === "ready").length;
+  const [agentActiveOnly, setAgentActiveOnly] = useState(false);
+  const activePrIds = new Set(props.actions.filter((action) => ["queued", "running", "checks_running", "awaiting_decision"].includes(action.status)).map((action) => action.pullRequestId));
+  const visiblePrs = agentActiveOnly ? props.prs.filter((pr) => activePrIds.has(pr.id)) : props.prs;
   const repositoryNames = props.github?.repositories.map((repository) => repository.name).join(", ");
   const lastSynced = props.github?.lastSyncedAt ? new Date(props.github.lastSyncedAt).toLocaleString() : "not synced";
   const filters: Array<{ id: QueueFilter; label: string; count: number }> = [
@@ -558,6 +584,7 @@ function Cockpit(props: {
     { id: "conflict", label: t("cockpit.conflicts"), count: conflictCount },
     { id: "review", label: t("cockpit.review"), count: reviewCount },
     { id: "ready", label: t("cockpit.ready"), count: readyCount },
+    { id: "needs_you", label: t("cockpit.needsYou"), count: props.allPrs.filter((pr) => matchesQueue(pr, "needs_you")).length },
     { id: "merged", label: t("cockpit.merged"), count: mergedCount },
     { id: "closed", label: t("cockpit.closed"), count: closedCount }
   ];
@@ -585,6 +612,7 @@ function Cockpit(props: {
               <span>{filter.label}</span><strong>{filter.count}</strong>
             </button>
           ))}
+          <button type="button" className={`seg filter-chip ${agentActiveOnly ? "is-active" : ""}`} aria-pressed={agentActiveOnly} onClick={() => setAgentActiveOnly((current) => !current)}><span>{t("cockpit.agentActive")}</span><strong>{activePrIds.size}</strong></button>
         </div>
       </div>
       <div className={`member-strip-section ${membersCollapsed ? "is-collapsed" : ""}`}>
@@ -628,19 +656,20 @@ function Cockpit(props: {
       <div className="table-shell">
         <div className="table-toolbar">
           <strong>{t("cockpit.livePrs")}</strong>
-          <span>{t("cockpit.matchingPrs", { count: props.prs.length })}</span>
+          <span>{t("cockpit.matchingPrs", { count: visiblePrs.length })}</span>
         </div>
         <div className="pr-table" role="table" aria-label={t("cockpit.tableLabel")}>
           <div className="pr-row pr-head" role="row">
             <span>{t("cockpit.priority")}</span><span>{t("cockpit.pr")}</span><span>{t("cockpit.owner")}</span><span>{t("cockpit.review")}</span><span>{t("cockpit.checks")}</span><span>{t("cockpit.age")}</span><span>{t("cockpit.action")}</span>
           </div>
-          {props.prs.map((pr) => {
+          {visiblePrs.map((pr) => {
             const member = props.teamById.get(pr.ownerMemberId);
             const status = statusFor(pr);
             const tags = props.prTags[pr.id] ?? [];
+            const needsAttention = matchesQueue(pr, "needs_you");
             return (
               <div className="pr-row" role="row" key={pr.id}>
-                <div className="pr-cell"><span className={`status ${status}`}>{t(({ closed: "status.closed", merged: "status.merged", draft: "status.draft", conflict: "status.conflict", checks: "status.checks", ready: "status.ready", review: "status.review" } as const)[status])}</span></div>
+                <div className="pr-cell"><span className={`status ${status}`}>{needsAttention ? <BellRing size={14} aria-hidden="true" /> : null}{t(({ closed: "status.closed", merged: "status.merged", draft: "status.draft", conflict: "status.conflict", checks: "status.checks", ready: "status.ready", review: "status.review" } as const)[status])}</span></div>
                 <div className="pr-cell"><span className="pr-title"><strong>{pr.title}</strong><span>{pr.repository} #{pr.number} · {pr.state} · {pr.sourceBranch}</span>{tags.length ? <span className="pr-tag-row">{tags.map((tag) => <span className="tag local-tag" key={tag}>{tag}</span>)}</span> : null}</span></div>
                 <div className="pr-cell">{member?.displayName ?? pr.author}</div>
                 <div className="pr-cell">{pr.reviewState.replace("_", " ")}</div>
@@ -650,7 +679,7 @@ function Cockpit(props: {
               </div>
             );
           })}
-          {!props.prs.length && (
+          {!visiblePrs.length && (
             <div className="empty-state">
               <strong>{t("cockpit.noMatch")}</strong>
               <span>{t("cockpit.clearFilters")}</span>
@@ -877,7 +906,7 @@ function draftToNewMember(draft: TeamMemberDraft): Omit<TeamMember, "id"> {
   };
 }
 
-function ActionsView({ actions, onClear, onStop, onApprove, onPush, onReviewPatch, onShowDetails, onLoadEvents }: { actions: ActionRecord[]; onClear: (actionId: string) => Promise<void>; onStop: (runId: string) => Promise<void>; onApprove: (runId: string) => Promise<void>; onPush: (runId: string) => Promise<void>; onReviewPatch: (runId: string) => Promise<void>; onShowDetails: (action: ActionRecord) => Promise<void>; onLoadEvents: (actionId: string) => Promise<AgentRun | ActionRecord> }) {
+function ActionsView({ actions, onClear, onStop, onApprove, onPush, onReviewPatch, onApplyReview, onShowDetails, onLoadEvents }: { actions: ActionRecord[]; onClear: (actionId: string) => Promise<void>; onStop: (runId: string) => Promise<void>; onApprove: (runId: string) => Promise<void>; onPush: (runId: string) => Promise<void>; onReviewPatch: (runId: string) => Promise<void>; onApplyReview: (runId: string) => Promise<void>; onShowDetails: (action: ActionRecord) => Promise<void>; onLoadEvents: (actionId: string) => Promise<AgentRun | ActionRecord> }) {
   const { t } = useLocale();
   const actionStatusKeys = {
     queued: "status.queued",
@@ -928,7 +957,7 @@ function ActionsView({ actions, onClear, onStop, onApprove, onPush, onReviewPatc
               {(eventCount || action.checkCount || action.hasRebaseEvidence) ? <span className="action-meta">{t("actions.eventsMeta", { events: eventCount, checks: action.checkCount ?? 0 })}{action.hasRebaseEvidence ? t("actions.conflictsMeta", { resolved: action.resolvedConflictCount ?? 0, total: action.conflictCount ?? 0 }) : ""}</span> : null}
               {eventCount ? <details className="run-events" onToggle={(event) => { if (event.currentTarget.open) void loadEvents(action.id); }}><summary>{t("actions.recordedEvents", { count: eventCount })}</summary>{eventPanel?.loading ? <p className="event-loading">{t("actions.loadingEvents")}</p> : events ? <RunEventList events={events} /> : <p className="event-loading">{t("actions.eventsUnavailable")}</p>}</details> : null}
             </div>
-            <div className="action-controls"><span className={`status ${action.status === "failed" ? "is-failed" : "agent"}`}>{actionStatusKeys[action.status as keyof typeof actionStatusKeys] ? t(actionStatusKeys[action.status as keyof typeof actionStatusKeys]) : action.status.replace("_", " ")}</span><button className="secondary-btn" type="button" onClick={() => void onShowDetails(action)}><FileSearch size={16} /><span>{t("actions.runDetails")}</span></button>{action.status === "patch_ready" ? <button className="secondary-btn" type="button" onClick={() => onReviewPatch(action.id)}><FileSearch size={16} /><span>{t("actions.reviewPatch")}</span></button> : null}{action.status === "patch_ready" ? <button className="primary-btn" type="button" onClick={() => onApprove(action.id)}>{t("actions.approve")}</button> : null}{action.status === "approved" ? <button className="primary-btn" type="button" onClick={() => onPush(action.id)}>{t("actions.push")}</button> : null}{terminalStatuses.has(action.status) ? <button className="icon-btn" type="button" onClick={() => onClear(action.id)} aria-label={t("actions.clear", { kind: action.kind })} title={t("actions.clear", { kind: action.kind })}><Trash2 size={16} /></button> : <button className="secondary-btn" type="button" onClick={() => onStop(action.id)}>{t("actions.stop")}</button>}</div>
+            <div className="action-controls"><span className={`status ${action.status === "failed" ? "is-failed" : "agent"}`}>{actionStatusKeys[action.status as keyof typeof actionStatusKeys] ? t(actionStatusKeys[action.status as keyof typeof actionStatusKeys]) : action.status.replace("_", " ")}</span><button className="secondary-btn" type="button" onClick={() => void onShowDetails(action)}><FileSearch size={16} /><span>{t("actions.runDetails")}</span></button>{action.status === "patch_ready" ? <button className="secondary-btn" type="button" onClick={() => onReviewPatch(action.id)}><FileSearch size={16} /><span>{t("actions.reviewPatch")}</span></button> : null}{action.status === "review_ready" ? <button className="primary-btn" type="button" onClick={() => void onApplyReview(action.id)}>{t("drawer.applyReviewFindings")}</button> : null}{action.status === "patch_ready" ? <button className="primary-btn" type="button" onClick={() => onApprove(action.id)}>{t("actions.approve")}</button> : null}{action.status === "approved" ? <button className="primary-btn" type="button" onClick={() => onPush(action.id)}>{t("actions.push")}</button> : null}{terminalStatuses.has(action.status) ? <button className="icon-btn" type="button" onClick={() => onClear(action.id)} aria-label={t("actions.clear", { kind: action.kind })} title={t("actions.clear", { kind: action.kind })}><Trash2 size={16} /></button> : <button className="secondary-btn" type="button" onClick={() => onStop(action.id)}>{t("actions.stop")}</button>}</div>
           </article>
         })}
       </div>
@@ -936,7 +965,8 @@ function ActionsView({ actions, onClear, onStop, onApprove, onPush, onReviewPatc
   );
 }
 
-function RunDetailsDrawer({ action, details, loading, onClose, onShowDiff, onChooseRebaseDecision }: { action: ActionRecord; details: AgentRun | ActionRecord | null; loading: boolean; onClose: () => void; onShowDiff: (action: ActionRecord) => void; onChooseRebaseDecision: (runId: string, optionId: "drop_base_sync_merge" | "manual") => Promise<void> }) {
+function RunDetailsDrawer({ action, details, loading, onClose, onShowDiff, onChooseRebaseDecision, onRetryRun, onInspectRecovery }: { action: ActionRecord; details: AgentRun | ActionRecord | null; loading: boolean; onClose: () => void; onShowDiff: (action: ActionRecord) => void; onChooseRebaseDecision: (runId: string, optionId: "drop_base_sync_merge" | "manual") => Promise<void>; onRetryRun: (runId: string) => Promise<void>; onInspectRecovery: (runId: string) => Promise<void> }) {
+  const { t } = useLocale();
   const run = details && "backendId" in details ? details : null;
   const evidence = run?.rebaseEvidence;
   const detailAction: ActionRecord = run ? actionFromRun(run) : action;
@@ -947,7 +977,7 @@ function RunDetailsDrawer({ action, details, loading, onClose, onShowDiff, onCho
       <aside className="run-details-drawer" role="dialog" aria-modal="true" aria-labelledby="runDetailsTitle">
         <header className="drawer-head"><div><span className="eyebrow">Run details</span><h2 id="runDetailsTitle">{action.repository} #{action.pullRequestNumber}</h2><span>{action.id} · {action.action.replace(/_/g, " ")}</span></div><button className="icon-btn" onClick={onClose} aria-label="Close run details"><X size={18} /></button></header>
         {loading ? <div className="drawer-loading">Loading evidence…</div> : !run ? (details ? <div className="run-details-body"><section className="detail-overview"><span className="status agent detail-status">{details.status.replace(/_/g, " ")}</span><p>{details.summary}</p><div className="detail-facts"><span>Workspace <strong>{details.workspacePath ?? "not created"}</strong></span><span>Base commit <strong>{details.baseCommit?.slice(0, 12) ?? "unknown"}</strong></span><span>Events <strong>{events.length}</strong></span></div></section><RunEventsSection events={events} /><p className="empty-state">This action has no agent-owned rebase evidence.</p></div> : <div className="drawer-loading">Details are unavailable for this run.</div>) : <div className="run-details-body">
-          <section className="detail-overview"><span className={`status agent detail-status ${run.status === "failed" ? "is-failed" : ""}`}>{run.status.replace(/_/g, " ")}</span><p>{run.summary}</p><div className="detail-facts"><span>Base commit <strong>{run.baseCommit?.slice(0, 12) ?? "unknown"}</strong></span><span>Workspace <strong>{run.workspacePath ?? "not created"}</strong></span><span>Checks <strong>{run.checks?.filter((check) => check.status === "passed").length ?? 0}/{run.checks?.length ?? 0} passed</strong></span></div></section>
+          <section className="detail-overview"><span className={`status agent detail-status ${run.status === "failed" ? "is-failed" : ""}`}>{run.status.replace(/_/g, " ")}</span><p>{run.summary}</p>{run.status === "recovery_required" || run.status === "interrupted" ? <p className="failure-copy">{run.recoveryNote ?? "Inspect the retained workspace before reuse."}</p> : null}<div className="detail-facts"><span>Base commit <strong>{run.baseCommit?.slice(0, 12) ?? "unknown"}</strong></span><span>Workspace <strong>{run.workspacePath ?? "not created"}</strong></span><span>Checks <strong>{run.checks?.filter((check) => check.status === "passed").length ?? 0}/{run.checks?.length ?? 0} passed</strong></span></div>{run.status === "recovery_required" && !run.recoveryInspected ? <button className="secondary-btn" type="button" onClick={() => void onInspectRecovery(run.id)}>{t("actions.confirmRecovery")}</button> : null}{["failed", "interrupted"].includes(run.status) || (run.status === "recovery_required" && run.recoveryInspected) ? <button className="secondary-btn" type="button" onClick={() => void onRetryRun(run.id)}>{t("actions.retryFresh")}</button> : null}</section>
           {run.feedback ? <section className="detail-section"><div className="section-title"><h3>Human feedback</h3><span>{run.feedback.reason ?? "uncategorized"}</span></div><p>{run.feedback.instruction}</p>{run.parentRunId ? <p className="drawer-meta">Revision of {run.parentRunId}</p> : null}</section> : null}
           <RunEventsSection events={events} />
           {evidence?.plan ? <section className="detail-section"><div className="section-title"><h3>Rebase strategy</h3><span>{evidence.plan.strategy.replace(/_/g, " ")}</span></div><p>{evidence.plan.summary}</p><code>{evidence.plan.command}</code></section> : null}
@@ -1200,11 +1230,15 @@ function PrDrawer(props: {
   annotations: PrAnnotations | null;
   canPushPrBranch: boolean;
   onClose: () => void;
-  onStartRun: () => void;
+  onStartRun: (reviewThreadIds: string[]) => void;
   onCheckout: () => void;
   onApproveRun: (runId: string) => Promise<void>;
   onPushRun: (runId: string, target?: "mergeops_branch" | "pr_branch") => Promise<void>;
+  onReviewRun: (runId: string) => Promise<void>;
   onReviseRun: (runId: string, instruction: string, reason?: string) => Promise<void>;
+  onPostReplies: (runId: string, replies: ReplyDraft[]) => Promise<void>;
+  onRetryRun: (runId: string) => Promise<void>;
+  onInspectRecovery: (runId: string) => Promise<void>;
   onSaveTags: (tags: string[]) => Promise<void>;
   onSaveNote: (text: string) => Promise<void>;
   onDeleteNote: (noteId: string) => Promise<void>;
@@ -1213,7 +1247,13 @@ function PrDrawer(props: {
   const { t } = useLocale();
   const status = statusFor(props.pr);
   const statusKeys: Record<string, TranslationKey> = { closed: "status.closed", merged: "status.merged", draft: "status.draft", conflict: "status.conflict", checks: "status.checks", ready: "status.ready", review: "status.review" };
-  const plan = drawerPlan(status);
+  const needsAttention = matchesQueue(props.pr, "needs_you");
+  const plan = status === "review" && !needsAttention ? {
+    title: t("drawer.reviewStatusTitle"),
+    explanation: t("drawer.reviewStatusExplanation"),
+    steps: [t("drawer.reviewStatusStepInspect"), t("drawer.reviewStatusStepChecks"), t("drawer.reviewStatusStepWait")],
+    action: null
+  } : drawerPlan(status);
   const isOpen = props.pr.state === "open";
   const [feedbackOpen, setFeedbackOpen] = useState(false);
   const [feedback, setFeedback] = useState("");
@@ -1221,8 +1261,60 @@ function PrDrawer(props: {
   const [tagDraft, setTagDraft] = useState("");
   const [noteDraft, setNoteDraft] = useState("");
   const [message, setMessage] = useState("");
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [reviewThreads, setReviewThreads] = useState<ReviewThreadSnapshot | null>(null);
+  const [reviewLoading, setReviewLoading] = useState(false);
+  const [selectedThreadIds, setSelectedThreadIds] = useState<string[]>([]);
+  const [replyDrafts, setReplyDrafts] = useState<ReplyDraft[]>([]);
+  const [replySending, setReplySending] = useState(false);
+  const selectAllRef = useRef<HTMLInputElement>(null);
   const annotations = props.annotations ?? { pullRequestId: props.pr.id, tags: [], notes: [] };
-  const canRevise = isOpen && !!props.run?.workspacePath && ["patch_ready", "approved"].includes(props.run.status);
+  const canRevise = isOpen && !!props.run?.workspacePath && ["patch_ready", "approved", "review_ready"].includes(props.run.status);
+  const unresolvedThreads = reviewThreads?.threads.filter((thread) => !thread.isResolved && !thread.isOutdated) ?? [];
+  const validSelectedIds = selectedThreadIds.filter((id) => unresolvedThreads.some((thread) => thread.id === id));
+  const allSelected = unresolvedThreads.length > 0 && validSelectedIds.length === unresolvedThreads.length;
+
+  useEffect(() => { setReplyDrafts(props.run?.replyDrafts ?? []); }, [props.run?.id, props.run?.replyDrafts]);
+
+  useEffect(() => {
+    setFeedbackOpen(false);
+    setFeedback("");
+    setReason("");
+    setTagDraft("");
+    setNoteDraft("");
+    setMessage("");
+    setReviewOpen(false);
+    setReviewThreads(null);
+    setReviewLoading(false);
+    setSelectedThreadIds([]);
+    setReplyDrafts([]);
+    setReplySending(false);
+  }, [props.pr.id]);
+
+  useEffect(() => {
+    if (selectAllRef.current) selectAllRef.current.indeterminate = validSelectedIds.length > 0 && !allSelected;
+  }, [allSelected, validSelectedIds.length]);
+
+  async function loadThreads() {
+    setReviewLoading(true);
+    try { setReviewThreads(await loadReviewThreads(props.pr.id)); }
+    catch (error) { setReviewThreads({ pullRequestId: props.pr.id, fetchedAt: "", stale: true, error: error instanceof Error ? error.message : "Unable to load review threads", threads: [] }); }
+    finally { setReviewLoading(false); }
+  }
+
+  function toggleReview(open: boolean) {
+    setReviewOpen(open);
+    if (open && !reviewThreads) void loadThreads();
+  }
+
+  function toggleThread(thread: ReviewThread) {
+    if (thread.isResolved || thread.isOutdated) return;
+    setSelectedThreadIds((current) => current.includes(thread.id) ? current.filter((id) => id !== thread.id) : [...current, thread.id]);
+  }
+
+  function toggleAllThreads() {
+    setSelectedThreadIds(allSelected ? [] : unresolvedThreads.map((thread) => thread.id));
+  }
 
   async function submitFeedback() {
     if (!props.run || !feedback.trim()) return;
@@ -1243,6 +1335,14 @@ function PrDrawer(props: {
     if (!tag || annotations.tags.includes(tag)) return;
     await props.onSaveTags([...annotations.tags, tag]);
     setTagDraft("");
+  }
+
+  async function submitReplies() {
+    if (!props.run || !replyDrafts.length) return;
+    setReplySending(true);
+    try { await props.onPostReplies(props.run.id, replyDrafts.filter((draft) => draft.status !== "posted")); setMessage("Review reply outcomes recorded."); }
+    catch (error) { setMessage(error instanceof Error ? error.message : "Could not post replies."); }
+    finally { setReplySending(false); }
   }
   return (
     <>
@@ -1274,6 +1374,19 @@ function PrDrawer(props: {
             </div>
             <p className="drawer-meta"><strong>{props.pr.repositoryFullName ?? props.pr.repository}</strong> · {props.pr.sourceBranch} → {props.pr.baseBranch} · {props.pr.changedFilesCount} changed files</p>
           </section>
+          <details className="detail-block review-feedback" open={reviewOpen} onToggle={(event) => toggleReview(event.currentTarget.open)}>
+            <summary className="panel-title"><span><h3>{t("drawer.reviewFeedback")}</h3><small>{t("drawer.unresolvedCount", { count: reviewThreads?.threads.filter((thread) => !thread.isResolved && !thread.isOutdated).length ?? props.pr.unresolvedCommentCount })}</small></span><span className="review-summary-actions">{reviewThreads ? <button className="text-btn" type="button" onClick={(event) => { event.preventDefault(); void loadThreads(); }}>{t("drawer.refreshThreads")}</button> : null}</span></summary>
+            {reviewLoading ? <p className="drawer-meta">{t("drawer.loadThreads")}…</p> : reviewThreads?.stale ? <p className="stale-note">{t("drawer.staleSnapshot", { error: reviewThreads.error ?? "refresh failed" })}</p> : null}
+            {!reviewLoading && reviewThreads && !reviewThreads.threads.length ? <p className="empty-state compact">{t("drawer.noThreads")}</p> : null}
+            {reviewThreads?.threads.map((thread) => {
+              const unavailable = thread.isResolved || thread.isOutdated;
+              return <article className={`review-thread ${unavailable ? "is-unavailable" : ""}`} key={thread.id}>
+                <label className="review-thread-select"><input type="checkbox" checked={validSelectedIds.includes(thread.id)} disabled={unavailable} onChange={() => toggleThread(thread)} aria-label={`${t("drawer.reviewThread")} ${thread.id}`} /><span /></label>
+                <div className="review-thread-copy"><div className="review-thread-meta"><strong>{thread.author}</strong><span>{thread.authorType === "bot" ? "bot" : "human"}</span>{thread.path ? <code>{thread.path}{thread.line ? `:${thread.line}` : ""}</code> : null}<time dateTime={thread.createdAt}>{new Date(thread.createdAt).toLocaleString()}</time>{thread.isResolved ? <span className="thread-state">{t("drawer.resolved")}</span> : thread.isOutdated ? <span className="thread-state">{t("drawer.outdated")}</span> : null}</div><p>{thread.excerpt || thread.body}</p><details><summary>{t("drawer.reviewThread")}</summary><pre>{thread.body}</pre>{thread.diffHunk ? <pre>{thread.diffHunk}</pre> : null}</details></div>
+              </article>;
+            })}
+            {reviewThreads && unresolvedThreads.length ? <div className="review-selection-bar"><label><input ref={selectAllRef} type="checkbox" checked={allSelected} onChange={toggleAllThreads} /> {t("drawer.selectAllUnresolved")}</label><button className="primary-btn" type="button" disabled={!validSelectedIds.length} onClick={() => props.onStartRun(validSelectedIds)}>{t("drawer.fixSelected", { count: validSelectedIds.length })}</button></div> : null}
+          </details>
           {plan ? (
             <section className="detail-block recommendation-panel">
               <div className="recommendation-head"><h3>{plan.title}</h3><span className={`status ${status}`}>{t(statusKeys[status])}</span></div>
@@ -1294,7 +1407,7 @@ function PrDrawer(props: {
             {isOpen ? (
               <div className="button-row">
                 <button className="secondary-btn" onClick={props.onCheckout}><FolderGit2 size={18} /><span>Checkout</span></button>
-                {plan?.action ? <button className="primary-btn" onClick={props.onStartRun}><Play size={18} /><span>{plan.action}</span></button> : null}
+                {plan?.action ? <button className="primary-btn" onClick={() => status === "review" ? toggleReview(true) : props.onStartRun([])}>{status === "review" ? <FileSearch size={18} /> : <Play size={18} />}<span>{status === "review" ? t("drawer.selectReviewComments") : plan.action}</span></button> : null}
               </div>
             ) : null}
             {props.checkoutMessage ? <p className="sync-status" role="status">{props.checkoutMessage}</p> : null}
@@ -1317,10 +1430,16 @@ function PrDrawer(props: {
               {props.run.checks?.map((check) => <div className="check-row" key={check.name}><span>{check.name}</span><strong className={check.status}>{check.status}</strong></div>)}
               {props.run.diff ? <details className="diff-details"><summary>View patch diff</summary><pre>{props.run.diff}</pre></details> : null}
               <div className="button-row">
+                {isOpen && props.run.status === "patch_ready" ? <button className="secondary-btn" type="button" onClick={() => void props.onReviewRun(props.run!.id)}><FileSearch size={16} />{t("drawer.runIndependentReview")}</button> : null}
+                {isOpen && props.run.status === "review_ready" ? <button className="primary-btn" type="button" onClick={() => { setFeedback(`Apply the independent review findings below to the prepared patch:\n\n${props.run?.agentOutput ?? "Review findings are in the run details."}`); setFeedbackOpen(true); }}>{t("drawer.applyReviewFindings")}</button> : null}
                 {isOpen && props.run.status === "patch_ready" ? <button className="primary-btn" type="button" onClick={() => props.onApproveRun(props.run!.id)}>Approve patch</button> : null}
                 {isOpen && props.run.status === "approved" ? <div className="push-choice"><select aria-label="Push target" defaultValue="mergeops_branch"><option value="mergeops_branch">New MergeOps branch</option>{props.canPushPrBranch ? <option value="pr_branch">Update PR branch</option> : null}</select><button className="primary-btn" type="button" onClick={(event) => { const select = event.currentTarget.parentElement?.querySelector("select") as HTMLSelectElement | null; void props.onPushRun(props.run!.id, select?.value === "pr_branch" ? "pr_branch" : "mergeops_branch"); }}>Push approved patch</button></div> : null}
                 {props.run.pushRef ? <span className="action-meta">Pushed to {props.run.pushRef}</span> : null}
               </div>
+              {props.run.status === "pushed" && replyDrafts.length ? <div className="reply-drafts"><div className="section-title"><h4>{t("drawer.postReplies")}</h4><span>{props.run.pushedCommitSha?.slice(0, 12)}</span></div>{replyDrafts.map((draft, index) => <label className="reply-draft" key={draft.id}><span>{t("drawer.replyDraft")} · {draft.threadId}</span><textarea value={draft.body} disabled={draft.status === "posted"} onChange={(event) => setReplyDrafts((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, body: event.target.value, status: "selected" } : item))} rows={3} />{draft.status === "posted" ? <small>{t("drawer.replyPosted")}{draft.replyUrl ? ` · ${draft.replyUrl}` : ""}</small> : draft.status === "ambiguous" ? <small className="failure-copy">{t("drawer.replyAmbiguous")}</small> : draft.error ? <small className="failure-copy">{draft.error}</small> : null}</label>)}<button className="primary-btn" type="button" disabled={replySending || !replyDrafts.some((draft) => draft.status !== "posted")} onClick={() => void submitReplies()}>{replySending ? "Posting…" : t("drawer.postReplies")}</button></div> : null}
+              {props.run.dispositions?.length ? <details className="dispositions"><summary>{t("drawer.dispositions")}</summary>{props.run.dispositions.map((item) => <div className="disposition-row" key={item.threadId}><strong>{item.disposition.replace(/_/g, " ")}</strong><span>{item.explanation}</span></div>)}</details> : null}
+              {props.run.status === "recovery_required" && !props.run.recoveryInspected ? <button className="secondary-btn" type="button" onClick={() => void props.onInspectRecovery(props.run!.id)}>{t("actions.confirmRecovery")}</button> : null}
+              {props.run.status === "failed" || props.run.status === "interrupted" || (props.run.status === "recovery_required" && props.run.recoveryInspected) ? <button className="secondary-btn" type="button" onClick={() => void props.onRetryRun(props.run!.id)}>{t("actions.retry")}</button> : null}
               {canRevise ? <div className="feedback-panel"><button className="secondary-btn" type="button" onClick={() => setFeedbackOpen((value) => !value)}>Revise with feedback</button>{feedbackOpen ? <div className="feedback-form"><label>Instruction<textarea value={feedback} onChange={(event) => setFeedback(event.target.value)} placeholder="Tell the agent what to change or preserve" rows={4} /></label><label>Reason <input value={reason} onChange={(event) => setReason(event.target.value)} placeholder="Optional, e.g. scope correction" /></label><button className="primary-btn" type="button" disabled={!feedback.trim()} onClick={() => void submitFeedback()}>Start revision</button></div> : null}</div> : null}
               {message ? <p className="sync-status" role="status">{message}</p> : null}
             </section>
