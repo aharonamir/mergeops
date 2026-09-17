@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 import json
 import base64
 import os
@@ -539,6 +540,8 @@ class SubprocessAgentAdapter:
             ours = conflict.get("ours", {}).get("text", "") if isinstance(conflict.get("ours"), dict) else ""
             theirs = conflict.get("theirs", {}).get("text", "") if isinstance(conflict.get("theirs"), dict) else ""
             conflict["result"] = result
+            result_hunk = RunWorkspace._resolved_hunk(ours, theirs, result.get("text", ""))
+            conflict["resultHunk"] = SubprocessAgentAdapter._bounded(result_hunk)
             conflict["classification"] = RunWorkspace.classify_resolution(ours, theirs, result.get("text", ""))
             conflict["validationState"] = "failed" if "<<<<<<<" in result.get("text", "") or "=======" in result.get("text", "") or ">>>>>>>" in result.get("text", "") else "passed"
             if conflict["validationState"] == "passed":
@@ -612,6 +615,19 @@ class SubprocessAgentAdapter:
 
 
 class RunWorkspace:
+    # These paths are created by the local agent/tooling environment, not by a
+    # PR patch. They may exist untracked in a checkout, but must never become
+    # part of an approved commit.
+    RUNTIME_PATH_PREFIXES = (
+        ".config/",
+        ".local/",
+        ".npm/",
+        ".cache/",
+        "node_modules/",
+        ".venv/",
+    )
+    RUNTIME_FILE_SUFFIXES = (".db", ".db-wal", ".db-shm", ".sqlite", ".sqlite3", ".sqlite3-wal", ".sqlite3-shm")
+
     """Creates an independent, detached clone for one agent run."""
 
     root = Path("~/.mergeops/workspace").expanduser()
@@ -775,8 +791,30 @@ class RunWorkspace:
 
     @classmethod
     def merge_commits(cls, workspace: "RunWorkspace") -> set[str]:
-        result = subprocess.run(["git", "rev-list", "--merges", "--all"], cwd=workspace.path, capture_output=True, text=True, check=False, timeout=30)
+        # Do not use --all here: stash refs are merge commits too, and are not
+        # part of the branch being rebased.
+        result = subprocess.run(["git", "rev-list", "--merges", "HEAD"], cwd=workspace.path, capture_output=True, text=True, check=False, timeout=30)
         return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+    @classmethod
+    def runtime_files_in_diff(cls, workspace: "RunWorkspace | Path", base_ref: str) -> list[str]:
+        workspace_path = workspace.path if isinstance(workspace, RunWorkspace) else workspace
+        result = subprocess.run(
+            ["git", "diff", "--name-only", "--diff-filter=ACMRTUXB", f"{base_ref}...HEAD"],
+            cwd=workspace_path,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            return []
+        return sorted(path for path in result.stdout.splitlines() if path and cls.is_runtime_path(path))
+
+    @classmethod
+    def is_runtime_path(cls, path: str) -> bool:
+        normalized = path.lstrip("./")
+        return normalized.startswith(cls.RUNTIME_PATH_PREFIXES) or normalized.endswith(cls.RUNTIME_FILE_SUFFIXES)
 
     @classmethod
     def validate_rebase(cls, workspace: "RunWorkspace", base_ref: str | None, initial_merges: set[str]) -> dict[str, object]:
@@ -794,6 +832,9 @@ class RunWorkspace:
         new_merges = cls.merge_commits(workspace) - initial_merges
         if new_merges:
             messages.append(f"merge commit introduced: {', '.join(sorted(new_merges))}")
+        runtime_files = cls.runtime_files_in_diff(workspace, base_ref) if base_ref else []
+        if runtime_files:
+            messages.append(f"generated runtime files committed: {', '.join(runtime_files[:20])}{' ...' if len(runtime_files) > 20 else ''}")
         ok = not messages
         if ok:
             messages.append(f"rebase state clear; HEAD is based on {base_ref}; no unresolved files or new merge commits detected")
@@ -839,7 +880,41 @@ class RunWorkspace:
         ours = cls.read_snapshot(path, "2", workspace)
         theirs = cls.read_snapshot(path, "3", workspace)
         result = cls.read_snapshot(path, "worktree", workspace)
-        return {"id": f"{commit_sha or 'unknown'}:{path}", "commitSha": commit_sha, "commitSubject": commit_subject, "filePath": path, "ours": ours, "theirs": theirs, "result": result, "classification": cls.classify_resolution(ours["text"], theirs["text"], result["text"]), "validationState": "failed" if "<<<<<<<" in result["text"] else "unknown", "agentExplanation": "Git snapshots captured by MergeOps; agent transcript is supplementary.", "createdAt": utc_now()}
+        ours_hunk, theirs_hunk, result_hunk = cls._conflict_hunks(ours["text"], theirs["text"], result["text"])
+        return {"id": f"{commit_sha or 'unknown'}:{path}", "commitSha": commit_sha, "commitSubject": commit_subject, "filePath": path, "ours": ours, "theirs": theirs, "result": result, "oursHunk": SubprocessAgentAdapter._bounded(ours_hunk), "theirsHunk": SubprocessAgentAdapter._bounded(theirs_hunk), "resultHunk": SubprocessAgentAdapter._bounded(result_hunk), "classification": cls.classify_resolution(ours["text"], theirs["text"], result["text"]), "validationState": "failed" if "<<<<<<<" in result["text"] else "unknown", "agentExplanation": "Git snapshots captured by MergeOps; agent transcript is supplementary.", "createdAt": utc_now()}
+
+    @classmethod
+    def _conflict_hunks(cls, ours: str, theirs: str, result: str, context: int = 3) -> tuple[str, str, str]:
+        """Return focused excerpts while retaining full snapshots for auditability."""
+        result_lines = result.splitlines(keepends=True)
+        ranges: list[tuple[int, int]] = []
+        start: int | None = None
+        for index, line in enumerate(result_lines):
+            if line.startswith("<<<<<<<"):
+                start = index
+            elif start is not None and line.startswith(">>>>>>>"):
+                ranges.append((max(0, start - context), min(len(result_lines), index + context + 1)))
+                start = None
+        if not ranges:
+            return ours, theirs, result
+        result_excerpt = "".join("".join(result_lines[start:end]) for start, end in ranges)
+        ours_lines, theirs_lines = ours.splitlines(keepends=True), theirs.splitlines(keepends=True)
+        changed = [(max(0, a - context), min(len(ours_lines), b + context), max(0, c - context), min(len(theirs_lines), d + context)) for tag, a, b, c, d in SequenceMatcher(None, ours_lines, theirs_lines).get_opcodes() if tag != "equal"]
+        ours_excerpt = "".join("".join(ours_lines[start:end]) for start, end, _, _ in changed) or ours
+        theirs_excerpt = "".join("".join(theirs_lines[start:end]) for _, _, start, end in changed) or theirs
+        return ours_excerpt, theirs_excerpt, result_excerpt
+
+    @classmethod
+    def _resolved_hunk(cls, ours: str, theirs: str, result: str, context: int = 3) -> str:
+        result_lines = result.splitlines(keepends=True)
+        ranges: list[tuple[int, int]] = []
+        for other in (ours, theirs):
+            for tag, _a, _b, c, d in SequenceMatcher(None, other.splitlines(keepends=True), result_lines).get_opcodes():
+                if tag != "equal":
+                    ranges.append((max(0, c - context), min(len(result_lines), d + context)))
+        if not ranges:
+            return result
+        return "".join("".join(result_lines[start:end]) for start, end in ranges)
 
     @staticmethod
     def classify_resolution(ours: str, theirs: str, result: str) -> str:
@@ -873,11 +948,17 @@ class RunWorkspace:
         return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
 
     @staticmethod
-    def _git(cwd: Path, *args: str, token: str | None = None) -> str:
-        result = subprocess.run(
-            ["git", *args], cwd=cwd, capture_output=True, text=True, check=True, timeout=120,
-            env=RunWorkspace._git_environment(token),
-        )
+    def _git(cwd: Path, *args: str, token: str | None = None, timeout_seconds: int = 120) -> str:
+        try:
+            result = subprocess.run(
+                ["git", *args], cwd=cwd, capture_output=True, text=True, check=True, timeout=timeout_seconds,
+                env=RunWorkspace._git_environment(token),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"git {' '.join(args)} timed out after {timeout_seconds} seconds; check GitHub connectivity and credentials") from exc
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or "git command failed").strip()
+            raise RuntimeError(f"git {' '.join(args)} failed: {detail}") from exc
         return result.stdout
 
     @staticmethod
@@ -891,6 +972,12 @@ class RunWorkspace:
     @staticmethod
     def _git_environment(token: str | None) -> dict[str, str]:
         environment = os.environ.copy()
+        # Agent-run pushes must never wait for an interactive username/password prompt.
+        environment.update({
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_HTTP_LOW_SPEED_LIMIT": "1000",
+            "GIT_HTTP_LOW_SPEED_TIME": "20",
+        })
         if token:
             credentials = base64.b64encode(f"x-access-token:{token}".encode()).decode()
             environment.update({

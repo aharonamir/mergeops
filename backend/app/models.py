@@ -276,6 +276,9 @@ class ConflictEvidence(BaseModel):
     ours: BoundedText = Field(default_factory=BoundedText)
     theirs: BoundedText = Field(default_factory=BoundedText)
     result: BoundedText = Field(default_factory=BoundedText)
+    oursHunk: BoundedText = Field(default_factory=BoundedText)
+    theirsHunk: BoundedText = Field(default_factory=BoundedText)
+    resultHunk: BoundedText = Field(default_factory=BoundedText)
     classification: Literal["ours", "theirs", "combined", "manual", "added", "deleted", "unknown"] = "unknown"
     validationState: Literal["passed", "failed", "unknown"] = "unknown"
     agentExplanation: str | None = None
@@ -412,6 +415,7 @@ class ActionSummary(BaseModel):
     pushRef: str | None = None
     diffHash: str | None = None
     pushedCommitSha: str | None = None
+    recoveryInspected: bool = False
 
 
 class ActivityEvent(BaseModel):

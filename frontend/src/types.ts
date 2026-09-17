@@ -135,6 +135,7 @@ export type AgentRunSummary = {
   resolvedConflictCount?: number;
   blockedCommandCount?: number;
   hasRebaseEvidence?: boolean;
+  recoveryInspected?: boolean;
 };
 
 export type AgentRunEvent = {
@@ -167,6 +168,9 @@ export type ConflictEvidence = {
   ours: BoundedText;
   theirs: BoundedText;
   result: BoundedText;
+  oursHunk?: BoundedText;
+  theirsHunk?: BoundedText;
+  resultHunk?: BoundedText;
   classification: "ours" | "theirs" | "combined" | "manual" | "added" | "deleted" | "unknown";
   validationState: "passed" | "failed" | "unknown";
   agentExplanation?: string | null;

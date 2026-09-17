@@ -62,13 +62,13 @@ async def health() -> dict[str, str]:
 
 @app.get("/api/app-data")
 async def get_app_data() -> AppData:
-    return store.app_data()
+    return await _run_blocking(store.app_data)
 
 
 @app.get("/api/actions/{action_id}/details")
 async def get_action_details(action_id: str):
     try:
-        return store.action_details(action_id)
+        return await _run_blocking(store.action_details, action_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -141,6 +141,14 @@ async def post_agent_run_retry(run_id: str) -> AgentRun:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+@app.post("/api/agent-runs/{run_id}/revalidate")
+async def post_agent_run_revalidate(run_id: str) -> AgentRun:
+    try:
+        return await _run_blocking(store.revalidate_manual_run, run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.post("/api/agent-runs/{run_id}/review-replies")
 async def post_agent_run_review_replies(run_id: str, payload: PostReviewRepliesRequest) -> AgentRun:
     try:
@@ -193,7 +201,7 @@ async def get_review_threads(pull_request_id: str):
 @app.get("/api/pull-requests/{pull_request_id}/annotations", response_model=PrAnnotations)
 async def get_pr_annotations(pull_request_id: str) -> PrAnnotations:
     try:
-        return store.pr_annotations(pull_request_id)
+        return await _run_blocking(store.pr_annotations, pull_request_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -201,7 +209,7 @@ async def get_pr_annotations(pull_request_id: str) -> PrAnnotations:
 @app.put("/api/pull-requests/{pull_request_id}/annotations/tags", response_model=PrAnnotations)
 async def put_pr_tags(pull_request_id: str, payload: UpdatePrTagsRequest) -> PrAnnotations:
     try:
-        return store.update_pr_tags(pull_request_id, payload.tags)
+        return await _run_blocking(store.update_pr_tags, pull_request_id, payload.tags)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -209,7 +217,7 @@ async def put_pr_tags(pull_request_id: str, payload: UpdatePrTagsRequest) -> PrA
 @app.post("/api/pull-requests/{pull_request_id}/annotations/notes", response_model=PrAnnotations)
 async def post_pr_note(pull_request_id: str, payload: CreatePrNoteRequest) -> PrAnnotations:
     try:
-        return store.create_pr_note(pull_request_id, payload)
+        return await _run_blocking(store.create_pr_note, pull_request_id, payload)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -217,7 +225,7 @@ async def post_pr_note(pull_request_id: str, payload: CreatePrNoteRequest) -> Pr
 @app.patch("/api/pull-requests/{pull_request_id}/annotations/notes/{note_id}", response_model=PrAnnotations)
 async def patch_pr_note(pull_request_id: str, note_id: str, payload: UpdatePrNoteRequest) -> PrAnnotations:
     try:
-        return store.update_pr_note(pull_request_id, note_id, payload)
+        return await _run_blocking(store.update_pr_note, pull_request_id, note_id, payload)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -225,7 +233,7 @@ async def patch_pr_note(pull_request_id: str, note_id: str, payload: UpdatePrNot
 @app.delete("/api/pull-requests/{pull_request_id}/annotations/notes/{note_id}", response_model=PrAnnotations)
 async def delete_pr_note(pull_request_id: str, note_id: str) -> PrAnnotations:
     try:
-        return store.delete_pr_note(pull_request_id, note_id)
+        return await _run_blocking(store.delete_pr_note, pull_request_id, note_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -233,7 +241,7 @@ async def delete_pr_note(pull_request_id: str, note_id: str) -> PrAnnotations:
 @app.post("/api/checkouts")
 async def post_checkout(payload: CreateCheckoutRequest) -> CheckoutResult:
     try:
-        return store.create_checkout(payload.pullRequestId)
+        return await _run_blocking(store.create_checkout, payload.pullRequestId)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -241,20 +249,25 @@ async def post_checkout(payload: CreateCheckoutRequest) -> CheckoutResult:
 @app.delete("/api/actions/{action_id}", status_code=204)
 async def delete_action(action_id: str) -> None:
     try:
-        store.clear_action(action_id)
+        await _run_blocking(store.clear_action, action_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@app.delete("/api/agent-runs", status_code=200)
+async def delete_all_agent_runs() -> dict[str, int]:
+    return await _run_blocking(store.clear_all_agent_runs)
+
+
 @app.post("/api/team-members")
 async def post_team_member(payload: CreateTeamMemberRequest) -> TeamMember:
-    return store.create_team_member(payload)
+    return await _run_blocking(store.create_team_member, payload)
 
 
 @app.patch("/api/team-members/{member_id}")
 async def patch_team_member(member_id: str, payload: UpdateTeamMemberRequest) -> TeamMember:
     try:
-        return store.update_team_member(member_id, payload)
+        return await _run_blocking(store.update_team_member, member_id, payload)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -262,19 +275,19 @@ async def patch_team_member(member_id: str, payload: UpdateTeamMemberRequest) ->
 @app.delete("/api/team-members/{member_id}", status_code=204)
 async def delete_team_member(member_id: str) -> None:
     try:
-        store.delete_team_member(member_id)
+        await _run_blocking(store.delete_team_member, member_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.patch("/api/settings/github")
 async def patch_github_settings(payload: UpdateGitHubSettingsRequest) -> GitHubSettingsPublic:
-    return store.update_github_settings(payload)
+    return await _run_blocking(store.update_github_settings, payload)
 
 
 @app.patch("/api/settings/agent")
 async def patch_agent_settings(payload: UpdateAgentSettingsRequest) -> AgentSettings:
-    return store.update_agent_settings(payload)
+    return await _run_blocking(store.update_agent_settings, payload)
 
 
 @app.post("/api/sync/github")

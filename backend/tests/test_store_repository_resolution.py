@@ -67,6 +67,84 @@ class FailedWorkspaceAdapter(CapturingAdapter):
 
 
 class StoreRepositoryResolutionTest(unittest.TestCase):
+    def test_clearing_agent_action_removes_its_run_and_releases_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            workspace = root / "runs" / "run-clear" / "checkout"
+            workspace.mkdir(parents=True)
+            pull_request = PullRequest(
+                id="pr-clear", repository="service", repositoryFullName="owner/service", number=42,
+                title="Clear", author="dev", ownerMemberId="dev", sourceBranch="feature", baseBranch="main",
+                state="open", mergeable="conflicting", reviewState="approved", unresolvedCommentCount=0,
+                requestedReviewers=[], checkState="pending", linkedIssueIds=[], changedFilesCount=1, ageDays=1,
+                summary="Clear", searchText="clear",
+            )
+            run = AgentRun(
+                id="run-clear", backendId="opencode", repository="service", pullRequestId=pull_request.id,
+                pullRequestNumber=pull_request.number, action="fix_conflicts", status="patch_ready", requester="test",
+                summary="Prepared with no patch.", workspacePath=str(workspace), createdAt="2026-01-01T00:00:00Z",
+            )
+            data = self._data(pull_request)
+            data.agentRuns = [run]
+            data.actions = [ActionRecord(id=run.id, kind="agent_run", repository=run.repository, pullRequestId=run.pullRequestId, pullRequestNumber=run.pullRequestNumber, action=run.action, status=run.status, summary=run.summary, workspacePath=run.workspacePath, createdAt=run.createdAt)]
+            store = LocalJsonStore(root / "mergeops.local.json")
+            store._save(data)
+
+            with patch.object(RunWorkspace, "root", root / "runs"):
+                store.clear_action(run.id)
+
+            persisted = store.persisted_data()
+            self.assertFalse(persisted.agentRuns)
+            self.assertFalse(persisted.actions)
+            self.assertFalse(workspace.parent.exists())
+
+    def test_clear_all_agent_runs_keeps_active_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            pull_request = PullRequest(
+                id="pr-clear-all", repository="service", repositoryFullName="owner/service", number=42,
+                title="Clear all", author="dev", ownerMemberId="dev", sourceBranch="feature", baseBranch="main",
+                state="open", mergeable="conflicting", reviewState="approved", unresolvedCommentCount=0,
+                requestedReviewers=[], checkState="pending", linkedIssueIds=[], changedFilesCount=1, ageDays=1,
+                summary="Clear all", searchText="clear all",
+            )
+            failed = AgentRun(id="run-clear-failed", backendId="opencode", repository="service", pullRequestId=pull_request.id, pullRequestNumber=42, action="fix_conflicts", status="failed", requester="test", summary="Failed", createdAt="2026-01-01T00:00:00Z")
+            running = AgentRun(id="run-clear-running", backendId="opencode", repository="service", pullRequestId=pull_request.id, pullRequestNumber=42, action="fix_conflicts", status="running", requester="test", summary="Running", createdAt="2026-01-02T00:00:00Z")
+            data = self._data(pull_request)
+            data.agentRuns = [running, failed]
+            data.actions = [ActionRecord(id=run.id, kind="agent_run", repository=run.repository, pullRequestId=run.pullRequestId, pullRequestNumber=run.pullRequestNumber, action=run.action, status=run.status, summary=run.summary, createdAt=run.createdAt) for run in data.agentRuns]
+            store = LocalJsonStore(root / "mergeops.local.json")
+            store._save(data)
+
+            result = store.clear_all_agent_runs()
+
+            self.assertEqual(result, {"cleared": 1, "remaining": 1})
+            self.assertEqual([run.id for run in store.persisted_data().agentRuns], [running.id])
+            self.assertEqual([action.id for action in store.persisted_data().actions], [running.id])
+
+    def test_agent_run_details_survive_missing_legacy_action_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pull_request = PullRequest(
+                id="pr-details", repository="service", repositoryFullName="owner/service", number=42,
+                title="Details", author="dev", ownerMemberId="dev", sourceBranch="feature", baseBranch="main",
+                state="open", mergeable="conflicting", reviewState="approved", unresolvedCommentCount=0,
+                requestedReviewers=[], checkState="pending", linkedIssueIds=[], changedFilesCount=1, ageDays=1,
+                summary="Details", searchText="details",
+            )
+            run = AgentRun(
+                id="run-details", backendId="opencode", repository="service", pullRequestId=pull_request.id,
+                pullRequestNumber=pull_request.number, action="fix_conflicts", status="failed", requester="test",
+                summary="Conflict resolution failed.", createdAt="2026-01-01T00:00:00Z",
+            )
+            data = self._data(pull_request)
+            data.agentRuns = [run]
+            data.actions = []
+            store = LocalJsonStore(Path(tmpdir) / "mergeops.local.json")
+            store._save(data)
+
+            self.assertEqual(store.action_details(run.id), run)
+            self.assertEqual(store.app_data().actions[0].id, run.id)
+
     def test_review_thread_refresh_preserves_concurrent_run_completion(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -810,6 +888,44 @@ class StoreRepositoryResolutionTest(unittest.TestCase):
             self.assertFalse(validation["ok"])
             self.assertIn("HEAD is not based on main", validation["messages"])
 
+    def test_rebase_validation_ignores_stash_merge_commits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._git(repo, "init", "-b", "main")
+            self._git(repo, "config", "user.email", "test@example.com")
+            self._git(repo, "config", "user.name", "test")
+            (repo / "README.md").write_text("base\n", encoding="utf-8")
+            self._git(repo, "add", "README.md")
+            self._git(repo, "commit", "-m", "base")
+            (repo / "README.md").write_text("stashed\n", encoding="utf-8")
+            self._git(repo, "stash", "push", "-m", "mergeops-runtime-files")
+
+            workspace = RunWorkspace(repo, self._git(repo, "rev-parse", "HEAD").strip())
+
+            self.assertEqual(RunWorkspace.merge_commits(workspace), set())
+
+    def test_rebase_validation_rejects_committed_runtime_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._git(repo, "init", "-b", "main")
+            self._git(repo, "config", "user.email", "test@example.com")
+            self._git(repo, "config", "user.name", "test")
+            (repo / "README.md").write_text("base\n", encoding="utf-8")
+            self._git(repo, "add", "README.md")
+            self._git(repo, "commit", "-m", "base")
+            self._git(repo, "checkout", "-b", "feature")
+            runtime_file = repo / ".local" / "share" / "opencode" / "opencode.db"
+            runtime_file.parent.mkdir(parents=True)
+            runtime_file.write_text("runtime\n", encoding="utf-8")
+            self._git(repo, "add", str(runtime_file.relative_to(repo)))
+            self._git(repo, "commit", "-m", "accidental runtime")
+
+            workspace = RunWorkspace(repo, self._git(repo, "rev-parse", "HEAD").strip())
+            validation = RunWorkspace.validate_rebase(workspace, "main", RunWorkspace.merge_commits(workspace))
+
+            self.assertFalse(validation["ok"])
+            self.assertTrue(any("generated runtime files committed" in message for message in validation["messages"]))
+
     def test_conflict_finalization_freezes_previously_resolved_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -841,6 +957,26 @@ class StoreRepositoryResolutionTest(unittest.TestCase):
             conflict = evidence["conflicts"][0]
             self.assertEqual(conflict["result"]["text"], "first resolved\n")
             self.assertEqual(conflict["validationState"], "passed")
+
+    def test_conflict_capture_keeps_focused_hunks(self) -> None:
+        prefix = "one\ntwo\nthree\nfour\n"
+        suffix = "five\nsix\nseven\neight\n"
+        ours = prefix + "ours line\n" + suffix
+        theirs = prefix + "theirs line\n" + suffix
+        result = prefix + "<<<<<<< HEAD\nours line\n=======\ntheirs line\n>>>>>>> commit\n" + suffix
+        focused_ours, focused_theirs, focused_result = RunWorkspace._conflict_hunks(ours, theirs, result)
+        self.assertIn("ours line", focused_ours)
+        self.assertIn("theirs line", focused_theirs)
+        self.assertNotIn("eight", focused_ours)
+        self.assertNotIn("eight", focused_theirs)
+        self.assertIn("<<<<<<< HEAD", focused_result)
+        self.assertNotIn("eight", focused_result)
+
+    def test_resolved_conflict_hunk_excludes_unrelated_file_content(self) -> None:
+        result = "one\ntwo\nthree\nfour\nresolved line\nfive\nsix\nseven\neight\n"
+        focused = RunWorkspace._resolved_hunk("one\ntwo\nthree\nfour\nours line\nfive\nsix\nseven\neight\n", "one\ntwo\nthree\nfour\ntheirs line\nfive\nsix\nseven\neight\n", result)
+        self.assertIn("resolved line", focused)
+        self.assertNotIn("eight", focused)
 
     def _data(self, pull_request: PullRequest) -> PersistedAppData:
         repositories = [

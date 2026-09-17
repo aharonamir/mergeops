@@ -14,3 +14,7 @@ frontend/vite.config.d.ts
 frontend/vite.config.js
 agent-runner/node_modules/
 agent-runner/dist/
+.mergeops-runtime/
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/

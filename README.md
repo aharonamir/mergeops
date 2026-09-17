@@ -16,6 +16,20 @@ The original static prototype is still available at `index.html`. The real app s
 
 ## Run The React/FastAPI App
 
+Start both services together:
+
+```bash
+./start.sh
+```
+
+Stop both services and their reload processes:
+
+```bash
+./stop.sh
+```
+
+Logs and PID files are kept in the ignored `.mergeops-runtime/` directory.
+
 Backend:
 
 ```bash

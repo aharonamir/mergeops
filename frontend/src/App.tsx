@@ -21,7 +21,7 @@ import {
   ChevronUp,
   BellRing
 } from "lucide-react";
-import { approveAgentRun, cancelAgentRun, checkBackendHealth, clearAction, createAgentRun, createCheckout, createPrNote, createTeamMember, deletePrNote, deleteTeamMember, inspectRecoveryAgentRun, loadActionDetails, loadAppData, loadPrAnnotations, loadReviewThreads, postReviewReplies, pushAgentRun, reviseAgentRun, retryAgentRun, reviewPatch, selectRebaseDecision, subscribeToAgentEvents, syncGitHub, updateAgentSettings, updateGitHubSettings, updatePrTags, updateTeamMember } from "./api";
+import { approveAgentRun, cancelAgentRun, checkBackendHealth, clearAction, clearAllAgentRuns, createAgentRun, createCheckout, createPrNote, createTeamMember, deletePrNote, deleteTeamMember, inspectRecoveryAgentRun, loadActionDetails, loadAppData, loadPrAnnotations, loadReviewThreads, postReviewReplies, pushAgentRun, revalidateManualRun, reviseAgentRun, retryAgentRun, reviewPatch, selectRebaseDecision, subscribeToAgentEvents, syncGitHub, updateAgentSettings, updateGitHubSettings, updatePrTags, updateTeamMember } from "./api";
 import type { ActionRecord, ActivityEvent, AgentBackend, AgentRun, AgentRunEvent, AgentRunSummary, AgentSettings, AppData, ConflictEvidence, GitHubSettings, GitHubSyncResult, PrAnnotations, PullRequest, QueueFilter, ReplyDraft, RepositoryConfig, ReviewThread, ReviewThreadSnapshot, TeamMember, ThemePreference, View } from "./types";
 import { useLocale, type TranslationKey } from "./i18n";
 
@@ -114,7 +114,14 @@ function actionFromRun(run: AgentRun): ActionRecord {
 }
 
 function actionFromSummary(run: AgentRunSummary): ActionRecord {
-  return { id: run.id, kind: "agent_run", repository: run.repository, pullRequestId: run.pullRequestId, pullRequestNumber: run.pullRequestNumber, action: run.action, status: run.status, summary: run.summary, rootRunId: run.rootRunId, parentRunId: run.parentRunId, supersededByRunId: run.supersededByRunId, workspacePath: run.workspacePath, baseCommit: run.baseCommit, diffHash: run.diffHash, pushedCommitSha: run.pushedCommitSha, eventCount: run.eventCount, checkCount: run.checkCount, conflictCount: run.conflictCount, resolvedConflictCount: run.resolvedConflictCount, blockedCommandCount: run.blockedCommandCount, hasRebaseEvidence: run.hasRebaseEvidence, createdAt: run.createdAt };
+  return { id: run.id, kind: "agent_run", repository: run.repository, pullRequestId: run.pullRequestId, pullRequestNumber: run.pullRequestNumber, action: run.action, status: run.status, summary: run.summary, rootRunId: run.rootRunId, parentRunId: run.parentRunId, supersededByRunId: run.supersededByRunId, workspacePath: run.workspacePath, baseCommit: run.baseCommit, diffHash: run.diffHash, pushedCommitSha: run.pushedCommitSha, eventCount: run.eventCount, checkCount: run.checkCount, conflictCount: run.conflictCount, resolvedConflictCount: run.resolvedConflictCount, blockedCommandCount: run.blockedCommandCount, hasRebaseEvidence: run.hasRebaseEvidence, recoveryInspected: run.recoveryInspected, createdAt: run.createdAt };
+}
+
+function drawerRunForPr(actions: ActionRecord[], pullRequestId: string): ActionRecord | undefined {
+  const runs = actions.filter((action) => action.kind === "agent_run" && action.pullRequestId === pullRequestId);
+  const writableStatuses = new Set(["queued", "running", "checks_running", "awaiting_decision", "patch_ready", "awaiting_approval", "approved"]);
+  return runs.filter((action) => writableStatuses.has(action.status)).sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0]
+    ?? runs.sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
 }
 
 export function App() {
@@ -140,6 +147,7 @@ export function App() {
   const [detailsLoading, setDetailsLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [syncMessage, setSyncMessage] = useState("");
+  const [actionsMessage, setActionsMessage] = useState("");
   const [backendStatus, setBackendStatus] = useState<"checking" | "online" | "offline">("checking");
 
   useEffect(() => {
@@ -169,7 +177,7 @@ export function App() {
 
   useEffect(() => {
     if (!hasActiveWork) return;
-    const refresh = () => { void loadAppData().then((payload) => { setData(payload); setRuns(payload.agentRuns); setActions(payload.actions ?? payload.agentRuns.map(actionFromSummary)); setActivity(payload.activity ?? []); }); };
+    const refresh = () => { void loadAppData(false).then((payload) => { setData(payload); setRuns(payload.agentRuns); setActions(payload.actions ?? payload.agentRuns.map(actionFromSummary)); setActivity(payload.activity ?? []); }).catch(() => undefined); };
     const unsubscribe = subscribeToAgentEvents(refresh);
     const timer = window.setInterval(refresh, 5000);
     return () => { unsubscribe(); window.clearInterval(timer); };
@@ -238,11 +246,17 @@ export function App() {
 
   async function startRun(pr: PullRequest, reviewThreadIds: string[] = []) {
     const action = reviewThreadIds.length ? "address_review" : pr.mergeable === "conflicting" ? "fix_conflicts" : "rebase";
-    const run = await createAgentRun({ backendId, pullRequestId: pr.id, action, reviewThreadIds });
-    setRuns((current) => [run, ...current]);
-    setActions((current) => [actionFromRun(run), ...current]);
-    const refreshed = await loadAppData();
-    setActivity(refreshed.activity ?? []);
+    setCheckoutMessage("Queueing agent run...");
+    try {
+      const run = await createAgentRun({ backendId, pullRequestId: pr.id, action, reviewThreadIds });
+      setRuns((current) => [run, ...current]);
+      setActions((current) => [actionFromRun(run), ...current]);
+      const refreshed = await loadAppData();
+      setActivity(refreshed.activity ?? []);
+      setCheckoutMessage(run.summary);
+    } catch (error) {
+      setCheckoutMessage(error instanceof Error ? error.message : "Could not queue agent run");
+    }
   }
 
   async function checkoutPr(pr: PullRequest) {
@@ -320,8 +334,24 @@ export function App() {
   async function removeAction(actionId: string) {
     await clearAction(actionId);
     setActions((current) => current.filter((action) => action.id !== actionId));
+    setRuns((current) => current.filter((run) => run.id !== actionId));
     const refreshed = await loadAppData();
     setActivity(refreshed.activity ?? []);
+  }
+
+  async function removeAllAgentRuns() {
+    if (!window.confirm("Clear all completed agent runs? Active runs will be kept.")) return;
+    try {
+      const result = await clearAllAgentRuns();
+      const refreshed = await loadAppData();
+      setData(refreshed);
+      setRuns(refreshed.agentRuns);
+      setActions(refreshed.actions ?? refreshed.agentRuns.map(actionFromSummary));
+      setActivity(refreshed.activity ?? []);
+      setActionsMessage(`Cleared ${result.cleared} completed agent run${result.cleared === 1 ? "" : "s"}.`);
+    } catch (error) {
+      setActionsMessage(error instanceof Error ? error.message : "Could not clear agent runs.");
+    }
   }
 
   async function stopRun(runId: string) {
@@ -331,15 +361,27 @@ export function App() {
   }
 
   async function approveRun(runId: string) {
-    const run = await approveAgentRun(runId);
-    setRuns((current) => current.map((item) => item.id === run.id ? run : item));
-    setActions((current) => current.map((item) => item.id === run.id ? actionFromRun(run) : item));
+    setCheckoutMessage("");
+    try {
+      const run = await approveAgentRun(runId);
+      setRuns((current) => current.map((item) => item.id === run.id ? run : item));
+      setActions((current) => current.map((item) => item.id === run.id ? actionFromRun(run) : item));
+      setCheckoutMessage(run.summary);
+    } catch (error) {
+      setCheckoutMessage(error instanceof Error ? error.message : "Could not approve the patch.");
+    }
   }
 
   async function pushRun(runId: string, target: "mergeops_branch" | "pr_branch" = "mergeops_branch") {
-    const run = await pushAgentRun(runId, target);
-    setRuns((current) => current.map((item) => item.id === run.id ? run : item));
-    setActions((current) => current.map((item) => item.id === run.id ? actionFromRun(run) : item));
+    setCheckoutMessage("");
+    try {
+      const run = await pushAgentRun(runId, target);
+      setRuns((current) => current.map((item) => item.id === run.id ? run : item));
+      setActions((current) => current.map((item) => item.id === run.id ? actionFromRun(run) : item));
+      setCheckoutMessage(run.summary);
+    } catch (error) {
+      setCheckoutMessage(error instanceof Error ? error.message : "Could not push the approved patch.");
+    }
   }
 
   async function reviseRun(runId: string, instruction: string, reason?: string) {
@@ -371,6 +413,12 @@ export function App() {
     const run = await retryAgentRun(runId);
     setRuns((current) => [run, ...current]);
     setActions((current) => [actionFromRun(run), ...current]);
+  }
+
+  async function fixManually(runId: string) {
+    const run = await revalidateManualRun(runId);
+    setRuns((current) => current.map((item) => item.id === run.id ? run : item));
+    setActions((current) => current.map((item) => item.id === run.id ? actionFromRun(run) : item));
   }
 
   async function inspectRecovery(runId: string) {
@@ -495,7 +543,7 @@ export function App() {
           />
         )}
         {activeView === "team" && <TeamWorkspace members={data.teamMembers} onSaveMember={saveTeamMember} onAddMember={addTeamMember} onDeleteMember={removeTeamMember} />}
-        {activeView === "agents" && <ActionsView actions={actions} onClear={removeAction} onStop={stopRun} onApprove={approveRun} onPush={pushRun} onReviewPatch={reviewRunPatch} onApplyReview={applyReviewFindings} onShowDetails={showRunDetails} onLoadEvents={loadActionDetails} />}
+        {activeView === "agents" && <ActionsView actions={actions} onClear={removeAction} onClearAll={removeAllAgentRuns} message={actionsMessage} onStop={stopRun} onApprove={approveRun} onPush={pushRun} onReviewPatch={reviewRunPatch} onApplyReview={applyReviewFindings} onRetry={retryRun} onFixManually={fixManually} onShowDetails={showRunDetails} onLoadEvents={loadActionDetails} />}
         {activeView === "activity" && <ActivityView events={activity} />}
         {activeView === "settings" && (
           <SettingsView
@@ -524,7 +572,7 @@ export function App() {
           pr={selectedPr}
           member={teamById.get(selectedPr.ownerMemberId)}
           backend={backend}
-          run={actions.find((action) => action.kind === "agent_run" && action.pullRequestId === selectedPr.id)}
+          run={drawerRunForPr(actions, selectedPr.id)}
           annotations={annotations}
           canPushPrBranch={Boolean(data.github?.hasToken && selectedPr.headRepositoryFullName)}
           onClose={() => setSelectedPr(null)}
@@ -532,11 +580,21 @@ export function App() {
           onCheckout={() => checkoutPr(selectedPr)}
             onApproveRun={approveRun}
             onPushRun={pushRun}
-            onReviewRun={reviewRunPatch}
+          onReviewRun={reviewRunPatch}
             onReviseRun={reviseRun}
             onPostReplies={async (runId, replies) => { const updated = await postReviewReplies(runId, replies); setRuns((current) => current.map((item) => item.id === updated.id ? updated : item)); setActions((current) => current.map((item) => item.id === updated.id ? actionFromRun(updated) : item)); }}
-            onRetryRun={retryRun}
+          onRetryRun={retryRun}
+          onFixManually={fixManually}
+            onClearRun={removeAction}
             onInspectRecovery={inspectRecovery}
+            onReviewThreadsRefreshed={async () => {
+              const refreshed = await loadAppData();
+              setData(refreshed);
+              setRuns(refreshed.agentRuns);
+              setActions(refreshed.actions ?? refreshed.agentRuns.map(actionFromSummary));
+              setActivity(refreshed.activity ?? []);
+              setSelectedPr((current) => current ? refreshed.pullRequests.find((item) => item.id === current.id) ?? current : null);
+            }}
           onSaveTags={(tags) => savePrTags(selectedPr.id, tags)}
           onSaveNote={async (text) => setAnnotations(await createPrNote(selectedPr.id, text))}
           onDeleteNote={async (noteId) => setAnnotations(await deletePrNote(selectedPr.id, noteId))}
@@ -544,7 +602,7 @@ export function App() {
         />
       )}
       {diffAction ? <DiffDialog action={diffAction} onClose={() => setDiffAction(null)} onReviewPatch={reviewRunPatch} /> : null}
-      {detailsAction ? <RunDetailsDrawer action={detailsAction} details={details} loading={detailsLoading} onClose={() => { setDetailsAction(null); setDetails(null); }} onShowDiff={setDiffAction} onChooseRebaseDecision={chooseRebaseDecision} onRetryRun={retryRun} onInspectRecovery={inspectRecovery} /> : null}
+      {detailsAction ? <RunDetailsDrawer action={detailsAction} details={details} loading={detailsLoading} onClose={() => { setDetailsAction(null); setDetails(null); }} onShowDiff={setDiffAction} onChooseRebaseDecision={chooseRebaseDecision} onRetryRun={retryRun} onFixManually={fixManually} onInspectRecovery={inspectRecovery} /> : null}
     </div>
   );
 }
@@ -906,7 +964,7 @@ function draftToNewMember(draft: TeamMemberDraft): Omit<TeamMember, "id"> {
   };
 }
 
-function ActionsView({ actions, onClear, onStop, onApprove, onPush, onReviewPatch, onApplyReview, onShowDetails, onLoadEvents }: { actions: ActionRecord[]; onClear: (actionId: string) => Promise<void>; onStop: (runId: string) => Promise<void>; onApprove: (runId: string) => Promise<void>; onPush: (runId: string) => Promise<void>; onReviewPatch: (runId: string) => Promise<void>; onApplyReview: (runId: string) => Promise<void>; onShowDetails: (action: ActionRecord) => Promise<void>; onLoadEvents: (actionId: string) => Promise<AgentRun | ActionRecord> }) {
+function ActionsView({ actions, onClear, onClearAll, message, onStop, onApprove, onPush, onReviewPatch, onApplyReview, onRetry, onFixManually, onShowDetails, onLoadEvents }: { actions: ActionRecord[]; onClear: (actionId: string) => Promise<void>; onClearAll: () => Promise<void>; message: string; onStop: (runId: string) => Promise<void>; onApprove: (runId: string) => Promise<void>; onPush: (runId: string) => Promise<void>; onReviewPatch: (runId: string) => Promise<void>; onApplyReview: (runId: string) => Promise<void>; onRetry: (runId: string) => Promise<void>; onFixManually: (runId: string) => Promise<void>; onShowDetails: (action: ActionRecord) => Promise<void>; onLoadEvents: (actionId: string) => Promise<AgentRun | ActionRecord> }) {
   const { t } = useLocale();
   const actionStatusKeys = {
     queued: "status.queued",
@@ -921,8 +979,9 @@ function ActionsView({ actions, onClear, onStop, onApprove, onPush, onReviewPatc
     failed: "status.failed",
     cancelled: "status.cancelled"
   } as const;
-  const terminalStatuses = new Set(["ready", "failed", "cancelled", "pushed", "approved", "awaiting_approval", "patch_ready", "review_ready"]);
+  const terminalStatuses = new Set(["ready", "failed", "cancelled", "pushed", "approved", "awaiting_approval", "patch_ready", "review_ready", "recovery_required"]);
   const [eventPanels, setEventPanels] = useState<Record<string, { events?: AgentRunEvent[]; loading: boolean }>>({});
+  const sortedActions = [...actions].sort((left, right) => right.createdAt.localeCompare(left.createdAt));
 
   async function loadEvents(actionId: string) {
     if (eventPanels[actionId]) return;
@@ -941,10 +1000,12 @@ function ActionsView({ actions, onClear, onStop, onApprove, onPush, onReviewPatc
         <div>
           <h1 id="agentsTitle">{t("actions.title")}</h1>
           <p>{t("actions.subtitle")}</p>
+          {message ? <p className="sync-status" role="status">{message}</p> : null}
         </div>
+        <button className="secondary-btn" type="button" onClick={() => void onClearAll()} disabled={!actions.some((action) => action.kind === "agent_run" && ["failed", "cancelled", "pushed", "approved", "awaiting_approval", "patch_ready", "review_ready", "recovery_required"].includes(action.status) && (action.status !== "recovery_required" || action.recoveryInspected))}>{t("actions.clearAll")}</button>
       </div>
       <div className="runs-list">
-        {actions.length === 0 ? <p className="empty-state">{t("actions.noActions")}</p> : actions.map((action) => {
+        {sortedActions.length === 0 ? <p className="empty-state">{t("actions.noActions")}</p> : sortedActions.map((action) => {
           const eventCount = action.eventCount ?? action.events?.length ?? 0;
           const eventPanel = eventPanels[action.id];
           const events = action.events ?? eventPanel?.events;
@@ -952,12 +1013,13 @@ function ActionsView({ actions, onClear, onStop, onApprove, onPush, onReviewPatc
             <div>
               <strong>{action.kind === "checkout" ? t("actions.checkout") : t("actions.agentRun")} · {action.repository} #{action.pullRequestNumber}</strong>
               <p>{action.summary}</p>
+              <time className="action-meta" dateTime={action.createdAt}>{t("actions.startedAt", { timestamp: new Date(action.createdAt).toLocaleString() })}</time>
               {action.workspacePath ? <span className="action-meta">{t("actions.workspace", { path: action.workspacePath, base: action.baseCommit?.slice(0, 12) ?? "unknown" })}</span> : null}
               {action.parentRunId ? <span className="action-meta">{t("actions.reviewOf", { id: action.parentRunId })}</span> : null}
               {(eventCount || action.checkCount || action.hasRebaseEvidence) ? <span className="action-meta">{t("actions.eventsMeta", { events: eventCount, checks: action.checkCount ?? 0 })}{action.hasRebaseEvidence ? t("actions.conflictsMeta", { resolved: action.resolvedConflictCount ?? 0, total: action.conflictCount ?? 0 }) : ""}</span> : null}
               {eventCount ? <details className="run-events" onToggle={(event) => { if (event.currentTarget.open) void loadEvents(action.id); }}><summary>{t("actions.recordedEvents", { count: eventCount })}</summary>{eventPanel?.loading ? <p className="event-loading">{t("actions.loadingEvents")}</p> : events ? <RunEventList events={events} /> : <p className="event-loading">{t("actions.eventsUnavailable")}</p>}</details> : null}
             </div>
-            <div className="action-controls"><span className={`status ${action.status === "failed" ? "is-failed" : "agent"}`}>{actionStatusKeys[action.status as keyof typeof actionStatusKeys] ? t(actionStatusKeys[action.status as keyof typeof actionStatusKeys]) : action.status.replace("_", " ")}</span><button className="secondary-btn" type="button" onClick={() => void onShowDetails(action)}><FileSearch size={16} /><span>{t("actions.runDetails")}</span></button>{action.status === "patch_ready" ? <button className="secondary-btn" type="button" onClick={() => onReviewPatch(action.id)}><FileSearch size={16} /><span>{t("actions.reviewPatch")}</span></button> : null}{action.status === "review_ready" ? <button className="primary-btn" type="button" onClick={() => void onApplyReview(action.id)}>{t("drawer.applyReviewFindings")}</button> : null}{action.status === "patch_ready" ? <button className="primary-btn" type="button" onClick={() => onApprove(action.id)}>{t("actions.approve")}</button> : null}{action.status === "approved" ? <button className="primary-btn" type="button" onClick={() => onPush(action.id)}>{t("actions.push")}</button> : null}{terminalStatuses.has(action.status) ? <button className="icon-btn" type="button" onClick={() => onClear(action.id)} aria-label={t("actions.clear", { kind: action.kind })} title={t("actions.clear", { kind: action.kind })}><Trash2 size={16} /></button> : <button className="secondary-btn" type="button" onClick={() => onStop(action.id)}>{t("actions.stop")}</button>}</div>
+            <div className="action-controls"><span className={`status ${action.status === "failed" ? "is-failed" : "agent"}`}>{actionStatusKeys[action.status as keyof typeof actionStatusKeys] ? t(actionStatusKeys[action.status as keyof typeof actionStatusKeys]) : action.status.replace("_", " ")}</span><button className="secondary-btn" type="button" onClick={() => void onShowDetails(action)}><FileSearch size={16} /><span>{t("actions.runDetails")}</span></button>{action.status === "patch_ready" ? <button className="secondary-btn" type="button" onClick={() => onReviewPatch(action.id)}><FileSearch size={16} /><span>{t("actions.reviewPatch")}</span></button> : null}{action.status === "review_ready" ? <button className="primary-btn" type="button" onClick={() => void onApplyReview(action.id)}>{t("drawer.applyReviewFindings")}</button> : null}{action.status === "patch_ready" ? <button className="primary-btn" type="button" onClick={() => onApprove(action.id)}>{t("actions.approve")}</button> : null}{action.status === "approved" ? <button className="primary-btn" type="button" onClick={() => onPush(action.id)}>{t("actions.push")}</button> : null}{action.status === "failed" && ["fix_conflicts", "rebase"].includes(action.action) ? <button className="secondary-btn" type="button" onClick={() => void onFixManually(action.id)}>{t("actions.fixedManually")}</button> : null}{["failed", "interrupted"].includes(action.status) ? <button className="secondary-btn" type="button" onClick={() => void onRetry(action.id)}>{t("actions.retryFresh")}</button> : null}{action.status === "recovery_required" && !action.recoveryInspected ? <button className="secondary-btn" type="button" onClick={() => void onShowDetails(action)}>{t("actions.confirmRecovery")}</button> : null}{terminalStatuses.has(action.status) && (action.status !== "recovery_required" || action.recoveryInspected) ? <button className="icon-btn" type="button" onClick={() => onClear(action.id)} aria-label={t("actions.clear", { kind: action.kind })} title={t("actions.clear", { kind: action.kind })}><Trash2 size={16} /></button> : <button className="secondary-btn" type="button" onClick={() => onStop(action.id)}>{t("actions.stop")}</button>}</div>
           </article>
         })}
       </div>
@@ -965,7 +1027,7 @@ function ActionsView({ actions, onClear, onStop, onApprove, onPush, onReviewPatc
   );
 }
 
-function RunDetailsDrawer({ action, details, loading, onClose, onShowDiff, onChooseRebaseDecision, onRetryRun, onInspectRecovery }: { action: ActionRecord; details: AgentRun | ActionRecord | null; loading: boolean; onClose: () => void; onShowDiff: (action: ActionRecord) => void; onChooseRebaseDecision: (runId: string, optionId: "drop_base_sync_merge" | "manual") => Promise<void>; onRetryRun: (runId: string) => Promise<void>; onInspectRecovery: (runId: string) => Promise<void> }) {
+function RunDetailsDrawer({ action, details, loading, onClose, onShowDiff, onChooseRebaseDecision, onRetryRun, onFixManually, onInspectRecovery }: { action: ActionRecord; details: AgentRun | ActionRecord | null; loading: boolean; onClose: () => void; onShowDiff: (action: ActionRecord) => void; onChooseRebaseDecision: (runId: string, optionId: "drop_base_sync_merge" | "manual") => Promise<void>; onRetryRun: (runId: string) => Promise<void>; onFixManually: (runId: string) => Promise<void>; onInspectRecovery: (runId: string) => Promise<void> }) {
   const { t } = useLocale();
   const run = details && "backendId" in details ? details : null;
   const evidence = run?.rebaseEvidence;
@@ -977,7 +1039,7 @@ function RunDetailsDrawer({ action, details, loading, onClose, onShowDiff, onCho
       <aside className="run-details-drawer" role="dialog" aria-modal="true" aria-labelledby="runDetailsTitle">
         <header className="drawer-head"><div><span className="eyebrow">Run details</span><h2 id="runDetailsTitle">{action.repository} #{action.pullRequestNumber}</h2><span>{action.id} · {action.action.replace(/_/g, " ")}</span></div><button className="icon-btn" onClick={onClose} aria-label="Close run details"><X size={18} /></button></header>
         {loading ? <div className="drawer-loading">Loading evidence…</div> : !run ? (details ? <div className="run-details-body"><section className="detail-overview"><span className="status agent detail-status">{details.status.replace(/_/g, " ")}</span><p>{details.summary}</p><div className="detail-facts"><span>Workspace <strong>{details.workspacePath ?? "not created"}</strong></span><span>Base commit <strong>{details.baseCommit?.slice(0, 12) ?? "unknown"}</strong></span><span>Events <strong>{events.length}</strong></span></div></section><RunEventsSection events={events} /><p className="empty-state">This action has no agent-owned rebase evidence.</p></div> : <div className="drawer-loading">Details are unavailable for this run.</div>) : <div className="run-details-body">
-          <section className="detail-overview"><span className={`status agent detail-status ${run.status === "failed" ? "is-failed" : ""}`}>{run.status.replace(/_/g, " ")}</span><p>{run.summary}</p>{run.status === "recovery_required" || run.status === "interrupted" ? <p className="failure-copy">{run.recoveryNote ?? "Inspect the retained workspace before reuse."}</p> : null}<div className="detail-facts"><span>Base commit <strong>{run.baseCommit?.slice(0, 12) ?? "unknown"}</strong></span><span>Workspace <strong>{run.workspacePath ?? "not created"}</strong></span><span>Checks <strong>{run.checks?.filter((check) => check.status === "passed").length ?? 0}/{run.checks?.length ?? 0} passed</strong></span></div>{run.status === "recovery_required" && !run.recoveryInspected ? <button className="secondary-btn" type="button" onClick={() => void onInspectRecovery(run.id)}>{t("actions.confirmRecovery")}</button> : null}{["failed", "interrupted"].includes(run.status) || (run.status === "recovery_required" && run.recoveryInspected) ? <button className="secondary-btn" type="button" onClick={() => void onRetryRun(run.id)}>{t("actions.retryFresh")}</button> : null}</section>
+          <section className="detail-overview"><span className={`status agent detail-status ${run.status === "failed" ? "is-failed" : ""}`}>{run.status.replace(/_/g, " ")}</span><p>{run.summary}</p>{run.status === "recovery_required" || run.status === "interrupted" ? <p className="failure-copy">{run.recoveryNote ?? "Inspect the retained workspace before reuse."}</p> : null}<div className="detail-facts"><span>Base commit <strong>{run.baseCommit?.slice(0, 12) ?? "unknown"}</strong></span><span>Workspace <strong>{run.workspacePath ?? "not created"}</strong></span><span>Checks <strong>{run.checks?.filter((check) => check.status === "passed").length ?? 0}/{run.checks?.length ?? 0} passed</strong></span></div>{run.status === "recovery_required" && !run.recoveryInspected ? <button className="secondary-btn" type="button" onClick={() => void onInspectRecovery(run.id)}>{t("actions.confirmRecovery")}</button> : null}{run.status === "failed" && ["fix_conflicts", "rebase"].includes(run.action) ? <button className="secondary-btn" type="button" onClick={() => void onFixManually(run.id)}>{t("actions.fixedManually")}</button> : null}{["failed", "interrupted"].includes(run.status) || (run.status === "recovery_required" && run.recoveryInspected) ? <button className="secondary-btn" type="button" onClick={() => void onRetryRun(run.id)}>{t("actions.retryFresh")}</button> : null}</section>
           {run.feedback ? <section className="detail-section"><div className="section-title"><h3>Human feedback</h3><span>{run.feedback.reason ?? "uncategorized"}</span></div><p>{run.feedback.instruction}</p>{run.parentRunId ? <p className="drawer-meta">Revision of {run.parentRunId}</p> : null}</section> : null}
           <RunEventsSection events={events} />
           {evidence?.plan ? <section className="detail-section"><div className="section-title"><h3>Rebase strategy</h3><span>{evidence.plan.strategy.replace(/_/g, " ")}</span></div><p>{evidence.plan.summary}</p><code>{evidence.plan.command}</code></section> : null}
@@ -989,7 +1051,7 @@ function RunDetailsDrawer({ action, details, loading, onClose, onShowDiff, onCho
             {evidence.blockedCommands.length ? <section className="detail-section"><div className="section-title"><h3>Blocked commands</h3></div><p className="blocked-note">{evidence.blockedCommands.map((command) => `git ${command}`).join(" · ")}</p></section> : null}
           </> : null}
           <section className="detail-section"><div className="section-title"><h3>Patch, checks, risk, and approval</h3>{detailAction.diff ? <button className="secondary-btn" type="button" onClick={() => onShowDiff(detailAction)}><GitCompare size={15} /> Show patch</button> : null}</div>{run.patchSummary ? <p>{run.patchSummary}</p> : null}{run.riskSummary ? <p className="risk-copy">Risk: {run.riskSummary}</p> : null}{run.approval ? <p>Approved by <strong>{run.approval.reviewer}</strong> on {new Date(run.approval.createdAt).toLocaleString()}.</p> : <p className="drawer-meta">No approval recorded.</p>}{run.pushRef ? <p>Pushed to <code>{run.pushRef}</code>.</p> : null}<div className="check-list">{run.checks?.map((check) => <div className="check-row" key={check.name}><span className={`check-result ${check.status}`}>{check.status}</span><strong>{check.name}</strong><span>{check.summary}</span></div>)}</div></section>
-          {transcript ? <section className="detail-section"><details className="agent-output"><summary>Raw agent transcript</summary><pre>{transcript}</pre>{evidence?.transcript.truncated ? <small>Transcript truncated · {evidence.transcript.originalLength.toLocaleString()} chars</small> : null}</details></section> : null}
+          {transcript ? <section className="detail-section"><details className="agent-output"><summary>Raw agent transcript (technical)</summary><p className="drawer-meta">Use the run events and timestamps above for the readable execution history. The transcript is retained for audit and troubleshooting.</p><pre>{transcript}</pre>{evidence?.transcript.truncated ? <small>Transcript truncated · {evidence.transcript.originalLength.toLocaleString()} chars</small> : null}</details></section> : null}
         </div>}
       </aside><button className="drawer-scrim" type="button" aria-label="Close run details" onClick={onClose} />
     </div>
@@ -1005,10 +1067,11 @@ function RunEventList({ events }: { events: AgentRunEvent[] }) {
 }
 
 function ConflictRow({ conflict }: { conflict: ConflictEvidence }) {
-  return <details className="conflict-row"><summary><span>{conflict.filePath}</span><span className={`classification ${conflict.classification}`}>{conflict.classification}</span><span className={`validation-state ${conflict.validationState}`}>{conflict.validationState}</span></summary><div className="conflict-meta">{conflict.commitSubject ?? "Commit unavailable"} {conflict.commitSha ? `· ${conflict.commitSha.slice(0, 12)}` : ""}</div><div className="comparison-grid">{(["ours", "theirs", "result"] as const).map((key) => <div className="comparison-pane" key={key}><strong>{key[0].toUpperCase() + key.slice(1)}</strong><pre>{conflict[key].text || (key === "result" ? "(deleted)" : "(empty)")}</pre>{conflict[key].truncated ? <small>Snapshot truncated · {conflict[key].originalLength.toLocaleString()} chars</small> : null}</div>)}</div>{conflict.agentExplanation ? <p className="agent-explanation">{conflict.agentExplanation}</p> : null}</details>;
+  return <details className="conflict-row"><summary><span>{conflict.filePath}</span><span className={`classification ${conflict.classification}`}>{conflict.classification}</span><span className={`validation-state ${conflict.validationState}`}>{conflict.validationState}</span></summary><div className="conflict-meta">{conflict.commitSubject ?? "Commit unavailable"} {conflict.commitSha ? `· ${conflict.commitSha.slice(0, 12)}` : ""}</div><p className="drawer-meta">Focused conflict hunk. Full snapshots remain available for audit.</p><div className="comparison-grid">{(["ours", "theirs", "result"] as const).map((key) => { const snapshot = conflict[`${key}Hunk` as "oursHunk" | "theirsHunk" | "resultHunk"] ?? conflict[key]; return <div className="comparison-pane" key={key}><strong>{key[0].toUpperCase() + key.slice(1)}</strong><pre>{snapshot.text || (key === "result" ? "(deleted)" : "(empty)")}</pre></div>; })}</div><details className="full-snapshots"><summary>Show full file snapshots</summary><div className="comparison-grid">{(["ours", "theirs", "result"] as const).map((key) => <div className="comparison-pane" key={key}><strong>{key[0].toUpperCase() + key.slice(1)} full file</strong><pre>{conflict[key].text || "(empty)"}</pre></div>)}</div></details>{conflict.agentExplanation ? <p className="agent-explanation">{conflict.agentExplanation}</p> : null}</details>;
 }
 
 function DiffDialog({ action, onClose, onReviewPatch }: { action: ActionRecord; onClose: () => void; onReviewPatch: (runId: string) => Promise<void> }) {
+  const { t } = useLocale();
   const changedFiles = parseDiffFiles(action.diff ?? "");
   return (
     <div className="modal-layer" role="presentation">
@@ -1028,7 +1091,7 @@ function DiffDialog({ action, onClose, onReviewPatch }: { action: ActionRecord; 
         </div>
         <footer className="diff-dialog-foot">
           <button className="secondary-btn" type="button" onClick={onClose}>Close</button>
-          {action.status === "patch_ready" ? <button className="primary-btn" type="button" onClick={() => { void onReviewPatch(action.id); onClose(); }}><FileSearch size={16} /><span>Review patch</span></button> : null}
+          {action.status === "patch_ready" ? <button className="primary-btn" type="button" title={t("actions.reviewPatchHelp")} onClick={() => { void onReviewPatch(action.id); onClose(); }}><FileSearch size={16} /><span>Review patch</span></button> : null}
         </footer>
       </section>
       <button className="modal-scrim" type="button" aria-label="Close changes dialog" onClick={onClose} />
@@ -1238,7 +1301,10 @@ function PrDrawer(props: {
   onReviseRun: (runId: string, instruction: string, reason?: string) => Promise<void>;
   onPostReplies: (runId: string, replies: ReplyDraft[]) => Promise<void>;
   onRetryRun: (runId: string) => Promise<void>;
+  onFixManually: (runId: string) => Promise<void>;
+  onClearRun: (runId: string) => Promise<void>;
   onInspectRecovery: (runId: string) => Promise<void>;
+  onReviewThreadsRefreshed: () => Promise<void>;
   onSaveTags: (tags: string[]) => Promise<void>;
   onSaveNote: (text: string) => Promise<void>;
   onDeleteNote: (noteId: string) => Promise<void>;
@@ -1297,7 +1363,10 @@ function PrDrawer(props: {
 
   async function loadThreads() {
     setReviewLoading(true);
-    try { setReviewThreads(await loadReviewThreads(props.pr.id)); }
+    try {
+      setReviewThreads(await loadReviewThreads(props.pr.id));
+      void props.onReviewThreadsRefreshed();
+    }
     catch (error) { setReviewThreads({ pullRequestId: props.pr.id, fetchedAt: "", stale: true, error: error instanceof Error ? error.message : "Unable to load review threads", threads: [] }); }
     finally { setReviewLoading(false); }
   }
@@ -1344,6 +1413,39 @@ function PrDrawer(props: {
     catch (error) { setMessage(error instanceof Error ? error.message : "Could not post replies."); }
     finally { setReplySending(false); }
   }
+
+  async function retryCurrentRun() {
+    if (!props.run) return;
+    setMessage("");
+    try {
+      await props.onRetryRun(props.run.id);
+      setMessage("Retry queued.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not queue the retry.");
+    }
+  }
+
+  async function fixManuallyCurrentRun() {
+    if (!props.run) return;
+    setMessage("");
+    try {
+      await props.onFixManually(props.run.id);
+      setMessage("Manual resolution validated. Review the patch, then approve it before pushing.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not validate the manual resolution.");
+    }
+  }
+
+  async function discardEmptyPreparedRun() {
+    if (!props.run) return;
+    setMessage("");
+    try {
+      await props.onClearRun(props.run.id);
+      setMessage("Empty prepared run discarded. You can start a new remediation run.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not discard the prepared run.");
+    }
+  }
   return (
     <>
       <aside className="drawer is-open" aria-labelledby="drawerTitle">
@@ -1377,12 +1479,11 @@ function PrDrawer(props: {
           <details className="detail-block review-feedback" open={reviewOpen} onToggle={(event) => toggleReview(event.currentTarget.open)}>
             <summary className="panel-title"><span><h3>{t("drawer.reviewFeedback")}</h3><small>{t("drawer.unresolvedCount", { count: reviewThreads?.threads.filter((thread) => !thread.isResolved && !thread.isOutdated).length ?? props.pr.unresolvedCommentCount })}</small></span><span className="review-summary-actions">{reviewThreads ? <button className="text-btn" type="button" onClick={(event) => { event.preventDefault(); void loadThreads(); }}>{t("drawer.refreshThreads")}</button> : null}</span></summary>
             {reviewLoading ? <p className="drawer-meta">{t("drawer.loadThreads")}…</p> : reviewThreads?.stale ? <p className="stale-note">{t("drawer.staleSnapshot", { error: reviewThreads.error ?? "refresh failed" })}</p> : null}
-            {!reviewLoading && reviewThreads && !reviewThreads.threads.length ? <p className="empty-state compact">{t("drawer.noThreads")}</p> : null}
-            {reviewThreads?.threads.map((thread) => {
-              const unavailable = thread.isResolved || thread.isOutdated;
-              return <article className={`review-thread ${unavailable ? "is-unavailable" : ""}`} key={thread.id}>
-                <label className="review-thread-select"><input type="checkbox" checked={validSelectedIds.includes(thread.id)} disabled={unavailable} onChange={() => toggleThread(thread)} aria-label={`${t("drawer.reviewThread")} ${thread.id}`} /><span /></label>
-                <div className="review-thread-copy"><div className="review-thread-meta"><strong>{thread.author}</strong><span>{thread.authorType === "bot" ? "bot" : "human"}</span>{thread.path ? <code>{thread.path}{thread.line ? `:${thread.line}` : ""}</code> : null}<time dateTime={thread.createdAt}>{new Date(thread.createdAt).toLocaleString()}</time>{thread.isResolved ? <span className="thread-state">{t("drawer.resolved")}</span> : thread.isOutdated ? <span className="thread-state">{t("drawer.outdated")}</span> : null}</div><p>{thread.excerpt || thread.body}</p><details><summary>{t("drawer.reviewThread")}</summary><pre>{thread.body}</pre>{thread.diffHunk ? <pre>{thread.diffHunk}</pre> : null}</details></div>
+            {!reviewLoading && reviewThreads && !unresolvedThreads.length ? <p className="empty-state compact">{t("drawer.noThreads")}</p> : null}
+            {unresolvedThreads.map((thread) => {
+              return <article className="review-thread" key={thread.id}>
+                <label className="review-thread-select"><input type="checkbox" checked={validSelectedIds.includes(thread.id)} onChange={() => toggleThread(thread)} aria-label={`${t("drawer.reviewThread")} ${thread.id}`} /><span /></label>
+                <div className="review-thread-copy"><div className="review-thread-meta"><strong>{thread.author}</strong><span>{thread.authorType === "bot" ? "bot" : "human"}</span>{thread.path ? <code>{thread.path}{thread.line ? `:${thread.line}` : ""}</code> : null}<time dateTime={thread.createdAt}>{new Date(thread.createdAt).toLocaleString()}</time></div><p>{thread.excerpt || thread.body}</p><details><summary>{t("drawer.reviewThread")}</summary><pre>{thread.body}</pre>{thread.diffHunk ? <pre>{thread.diffHunk}</pre> : null}</details></div>
               </article>;
             })}
             {reviewThreads && unresolvedThreads.length ? <div className="review-selection-bar"><label><input ref={selectAllRef} type="checkbox" checked={allSelected} onChange={toggleAllThreads} /> {t("drawer.selectAllUnresolved")}</label><button className="primary-btn" type="button" disabled={!validSelectedIds.length} onClick={() => props.onStartRun(validSelectedIds)}>{t("drawer.fixSelected", { count: validSelectedIds.length })}</button></div> : null}
@@ -1433,13 +1534,15 @@ function PrDrawer(props: {
                 {isOpen && props.run.status === "patch_ready" ? <button className="secondary-btn" type="button" onClick={() => void props.onReviewRun(props.run!.id)}><FileSearch size={16} />{t("drawer.runIndependentReview")}</button> : null}
                 {isOpen && props.run.status === "review_ready" ? <button className="primary-btn" type="button" onClick={() => { setFeedback(`Apply the independent review findings below to the prepared patch:\n\n${props.run?.agentOutput ?? "Review findings are in the run details."}`); setFeedbackOpen(true); }}>{t("drawer.applyReviewFindings")}</button> : null}
                 {isOpen && props.run.status === "patch_ready" ? <button className="primary-btn" type="button" onClick={() => props.onApproveRun(props.run!.id)}>Approve patch</button> : null}
+                {isOpen && props.run.status === "patch_ready" && !props.run.diff ? <button className="secondary-btn" type="button" onClick={() => void discardEmptyPreparedRun()}>{t("drawer.discardEmptyRun")}</button> : null}
                 {isOpen && props.run.status === "approved" ? <div className="push-choice"><select aria-label="Push target" defaultValue="mergeops_branch"><option value="mergeops_branch">New MergeOps branch</option>{props.canPushPrBranch ? <option value="pr_branch">Update PR branch</option> : null}</select><button className="primary-btn" type="button" onClick={(event) => { const select = event.currentTarget.parentElement?.querySelector("select") as HTMLSelectElement | null; void props.onPushRun(props.run!.id, select?.value === "pr_branch" ? "pr_branch" : "mergeops_branch"); }}>Push approved patch</button></div> : null}
                 {props.run.pushRef ? <span className="action-meta">Pushed to {props.run.pushRef}</span> : null}
               </div>
               {props.run.status === "pushed" && replyDrafts.length ? <div className="reply-drafts"><div className="section-title"><h4>{t("drawer.postReplies")}</h4><span>{props.run.pushedCommitSha?.slice(0, 12)}</span></div>{replyDrafts.map((draft, index) => <label className="reply-draft" key={draft.id}><span>{t("drawer.replyDraft")} · {draft.threadId}</span><textarea value={draft.body} disabled={draft.status === "posted"} onChange={(event) => setReplyDrafts((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, body: event.target.value, status: "selected" } : item))} rows={3} />{draft.status === "posted" ? <small>{t("drawer.replyPosted")}{draft.replyUrl ? ` · ${draft.replyUrl}` : ""}</small> : draft.status === "ambiguous" ? <small className="failure-copy">{t("drawer.replyAmbiguous")}</small> : draft.error ? <small className="failure-copy">{draft.error}</small> : null}</label>)}<button className="primary-btn" type="button" disabled={replySending || !replyDrafts.some((draft) => draft.status !== "posted")} onClick={() => void submitReplies()}>{replySending ? "Posting…" : t("drawer.postReplies")}</button></div> : null}
               {props.run.dispositions?.length ? <details className="dispositions"><summary>{t("drawer.dispositions")}</summary>{props.run.dispositions.map((item) => <div className="disposition-row" key={item.threadId}><strong>{item.disposition.replace(/_/g, " ")}</strong><span>{item.explanation}</span></div>)}</details> : null}
               {props.run.status === "recovery_required" && !props.run.recoveryInspected ? <button className="secondary-btn" type="button" onClick={() => void props.onInspectRecovery(props.run!.id)}>{t("actions.confirmRecovery")}</button> : null}
-              {props.run.status === "failed" || props.run.status === "interrupted" || (props.run.status === "recovery_required" && props.run.recoveryInspected) ? <button className="secondary-btn" type="button" onClick={() => void props.onRetryRun(props.run!.id)}>{t("actions.retry")}</button> : null}
+              {props.run.status === "failed" || props.run.status === "interrupted" || (props.run.status === "recovery_required" && props.run.recoveryInspected) ? <button className="secondary-btn" type="button" onClick={() => void retryCurrentRun()}>{t("actions.retry")}</button> : null}
+              {isOpen && props.run.status === "failed" && ["fix_conflicts", "rebase"].includes(props.run.action) ? <button className="secondary-btn" type="button" onClick={() => void fixManuallyCurrentRun()}>{t("actions.fixedManually")}</button> : null}
               {canRevise ? <div className="feedback-panel"><button className="secondary-btn" type="button" onClick={() => setFeedbackOpen((value) => !value)}>Revise with feedback</button>{feedbackOpen ? <div className="feedback-form"><label>Instruction<textarea value={feedback} onChange={(event) => setFeedback(event.target.value)} placeholder="Tell the agent what to change or preserve" rows={4} /></label><label>Reason <input value={reason} onChange={(event) => setReason(event.target.value)} placeholder="Optional, e.g. scope correction" /></label><button className="primary-btn" type="button" disabled={!feedback.trim()} onClick={() => void submitFeedback()}>Start revision</button></div> : null}</div> : null}
               {message ? <p className="sync-status" role="status">{message}</p> : null}
             </section>

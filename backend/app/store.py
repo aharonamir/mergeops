@@ -14,7 +14,7 @@ from uuid import uuid4
 
 from pydantic import Field
 
-from .adapters import AgentRunRequest, AgentRunResult, RunWorkspace, adapter_registry, inspect_workspace, utc_now
+from .adapters import AgentRunRequest, AgentRunResult, RunWorkspace, SubprocessAgentAdapter, adapter_registry, inspect_workspace, utc_now
 from .fixtures import agent_backends, agent_runs, github_settings, pull_requests, team_members
 from .ledger import ExecutionLedger
 from .models import ActionRecord, ActionSummary, ActivityEvent, AgentFeedback, AgentRun, AgentRunEvent, AgentRunSummary, AgentSettings, AppData, ApprovalRecord, BoundedText, CheckResult, CheckoutResult, CreatePrNoteRequest, CreateRevisionRequest, CreateTeamMemberRequest, GitHubSettings, GitHubSettingsPublic, PostReviewRepliesRequest, PrAnnotations, PrNote, PullRequest, RebaseEvidence, ReplyDraft, ReplyResult, RepositoryConfig, ReviewThread, ReviewThreadComment, ReviewThreadSnapshot, ReviewDisposition, SelectedReviewThread, TeamMember, UpdateAgentSettingsRequest, UpdateGitHubSettingsRequest, UpdatePrNoteRequest, UpdateTeamMemberRequest
@@ -831,6 +831,45 @@ class LocalJsonStore:
         self.ledger.event(retry.id, "retry_queued", retry.summary, created_at)
         return retry
 
+    def revalidate_manual_run(self, run_id: str) -> AgentRun:
+        """Validate a manually completed rebase without rerunning the agent."""
+        with self._write_lock:
+            data = self._load()
+            run = next((item for item in data.agentRuns if item.id == run_id), None)
+            if run is None:
+                raise ValueError("Unknown agent run")
+            if run.status != "failed" or run.action not in {"fix_conflicts", "rebase"}:
+                raise ValueError("Only failed conflict-fix or rebase runs can be fixed manually")
+            if not run.workspacePath or not Path(run.workspacePath).is_dir():
+                raise ValueError("The retained workspace is no longer available")
+            workspace = RunWorkspace(Path(run.workspacePath), run.baseCommit or "")
+            unresolved = RunWorkspace.unmerged_files(workspace)
+            if RunWorkspace.rebase_in_progress(workspace) or unresolved:
+                detail = f"; unresolved files remain: {', '.join(unresolved)}" if unresolved else ""
+                raise ValueError(f"Manual rebase is not complete{detail}")
+            pull_request = next((item for item in data.pullRequests if item.id == run.pullRequestId), None)
+            if pull_request is None:
+                raise ValueError("Pull request no longer exists")
+            repository = self._repository_config(data, pull_request.repositoryFullName or pull_request.repository)
+            review_base = f"origin/{pull_request.baseBranch}...HEAD" if pull_request.baseBranch else None
+            patch_summary, raw_diff, raw_checks, risk_summary = inspect_workspace(workspace.path, repository.requiredChecks if repository else None, review_base)
+            diff = raw_diff[:50000] if raw_diff else raw_diff
+            checks = [CheckResult.model_validate(check) for check in raw_checks]
+            if not diff or not diff.strip():
+                raise ValueError("The manually resolved workspace has no patch to approve")
+            if any(check.status != "passed" for check in checks):
+                raise ValueError("Manual workspace checks must all pass before approval")
+            evidence = run.rebaseEvidence.model_copy(update={"state": "completed", "finalHead": RunWorkspace._git(workspace.path, "rev-parse", "HEAD").strip()}) if run.rebaseEvidence else None
+            now = utc_now()
+            event = AgentRunEvent(sequence=len(run.events) + 1, type="manual_revalidated", message="Manual conflict resolution validated; patch is ready for human approval.", createdAt=now)
+            updated = run.model_copy(update={"status": "patch_ready", "summary": f"Manually resolved patch ready for approval. {patch_summary}", "events": [*run.events, event], "patchSummary": patch_summary, "diff": diff, "checks": checks, "riskSummary": risk_summary, "diffHash": hashlib.sha256(diff.encode("utf-8")).hexdigest(), "approval": None, "rebaseEvidence": evidence})
+            data.agentRuns = [updated if item.id == run_id else item for item in data.agentRuns]
+            data.actions = [item.model_copy(update={"status": updated.status, "summary": updated.summary, "events": updated.events, "patchSummary": updated.patchSummary, "diff": updated.diff, "checks": updated.checks, "riskSummary": updated.riskSummary, "diffHash": updated.diffHash, "approval": None, "rebaseEvidence": updated.rebaseEvidence}) if item.id == run_id else item for item in data.actions]
+            data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="agent_run", message=f"Manual conflict resolution validated for {updated.repository}#{updated.pullRequestNumber}; approval is required.", actionId=updated.id, createdAt=now))
+            self._save(data)
+            self.ledger.event(updated.id, "patch_ready", updated.summary, now)
+            return updated
+
     def inspect_recovery(self, run_id: str, confirmed: bool) -> AgentRun:
         if not confirmed:
             raise ValueError("Recovery inspection must be explicitly confirmed")
@@ -926,9 +965,28 @@ class LocalJsonStore:
         try:
             workspace = Path(run.workspacePath)
             if run.diff:
-                RunWorkspace._git(workspace, "add", "-A")
+                # Agent tools can leave large local caches/databases in the checkout. Never
+                # include those runtime artifacts in an approved source patch.
+                excludes = [f":(exclude){prefix}**" for prefix in RunWorkspace.RUNTIME_PATH_PREFIXES]
+                excludes.extend(f":(exclude)**/*{suffix}" for suffix in RunWorkspace.RUNTIME_FILE_SUFFIXES)
+                RunWorkspace._git(workspace, "add", "-A", "--", ".", *excludes)
+                staged_runtime = RunWorkspace._git(workspace, "diff", "--cached", "--name-only").splitlines()
+                staged_runtime = sorted(path for path in staged_runtime if RunWorkspace.is_runtime_path(path))
+                if staged_runtime:
+                    raise ValueError(
+                        "Generated runtime files are not allowed in an approved patch: "
+                        + ", ".join(staged_runtime[:20])
+                        + (" ..." if len(staged_runtime) > 20 else "")
+                    )
                 if RunWorkspace._git_optional(workspace, "diff", "--cached", "--quiet") is False:
                     RunWorkspace._git(workspace, "commit", "-m", f"MergeOps prepare {run.repository}#{run.pullRequestNumber}")
+            committed_runtime = RunWorkspace.runtime_files_in_diff(workspace, run.baseCommit or "HEAD")
+            if committed_runtime:
+                raise ValueError(
+                    "Generated runtime files are already committed in this run: "
+                    + ", ".join(committed_runtime[:20])
+                    + (" ..." if len(committed_runtime) > 20 else "")
+                )
             if target == "pr_branch":
                 if not pull_request.headRepositoryFullName or not pull_request.sourceBranch:
                     raise ValueError("The PR head repository and source branch are required for a direct PR-branch push")
@@ -936,12 +994,12 @@ class LocalJsonStore:
                 RunWorkspace._git(workspace, "remote", "remove", "mergeops-pr-head") if RunWorkspace._git_optional(workspace, "remote", "get-url", "mergeops-pr-head") else None
                 RunWorkspace._git(workspace, "remote", "add", "mergeops-pr-head", remote_url)
                 RunWorkspace._git(workspace, "fetch", "--no-tags", "mergeops-pr-head", pull_request.sourceBranch, token=data.githubPrivate.token)
-                remote_ref = "FETCH_HEAD"
-                if not RunWorkspace._git_optional(workspace, "merge-base", "--is-ancestor", remote_ref, "HEAD"):
-                    raise ValueError("The PR branch changed or is not an ancestor of the prepared workspace; refresh and revise again")
-                RunWorkspace._git(workspace, "push", "--porcelain", "mergeops-pr-head", f"HEAD:refs/heads/{push_ref}", token=data.githubPrivate.token)
+                remote_tip = RunWorkspace._git(workspace, "rev-parse", "FETCH_HEAD").strip()
+                # A rebase intentionally rewrites the PR branch. The lease protects against
+                # someone else updating it after our fetch without requiring a fast-forward.
+                RunWorkspace._git(workspace, "push", "--porcelain", f"--force-with-lease=refs/heads/{push_ref}:{remote_tip}", "mergeops-pr-head", f"HEAD:refs/heads/{push_ref}", token=data.githubPrivate.token, timeout_seconds=30)
             else:
-                RunWorkspace._git(workspace, "push", "origin", f"HEAD:refs/heads/{push_ref}", token=data.githubPrivate.token)
+                RunWorkspace._git(workspace, "push", "origin", f"HEAD:refs/heads/{push_ref}", token=data.githubPrivate.token, timeout_seconds=30)
         except Exception as exc:
             data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="push", message=f"Push failed for {run.repository}#{run.pullRequestNumber}: {exc}", actionId=run.id, createdAt=utc_now()))
             self._save(data)
@@ -1041,13 +1099,12 @@ class LocalJsonStore:
 
     def action_details(self, action_id: str) -> AgentRun | ActionRecord:
         data = self._load()
+        run = next((item for item in data.agentRuns if item.id == action_id), None)
+        if run is not None:
+            return run
         action = next((item for item in data.actions if item.id == action_id), None)
         if action is None:
             raise ValueError("Unknown action")
-        if action.kind == "agent_run":
-            run = next((item for item in data.agentRuns if item.id == action_id), None)
-            if run is not None:
-                return run
         return action
 
     def pr_annotations(self, pull_request_id: str) -> PrAnnotations:
@@ -1159,24 +1216,49 @@ class LocalJsonStore:
         return f"https://github.com/{full_name}.git" if full_name else None
 
     def clear_action(self, action_id: str) -> None:
-        data = self._load()
-        action = next((item for item in data.actions if item.id == action_id), None)
-        if action is None:
-            raise ValueError("Unknown action")
-        if action.status == "recovery_required" and not action.recoveryInspected:
-            raise ValueError("Recovery-required actions must be inspected before cleanup")
-        if action.workspacePath and not any(item.id != action.id and item.workspacePath == action.workspacePath for item in data.actions):
-            workspace = Path(action.workspacePath).resolve()
-            root = RunWorkspace.root.resolve()
-            if root not in workspace.parents:
-                raise ValueError("Action workspace is outside the MergeOps workspace root")
-            run_root = workspace.parent
-            if run_root.exists():
-                import shutil
-                shutil.rmtree(run_root)
-        data.actions = [item for item in data.actions if item.id != action_id]
-        data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="action_cleared", message=f"Cleared {action.kind} for {action.repository}#{action.pullRequestNumber}.", actionId=action.id, createdAt=utc_now()))
-        self._save(data)
+        with self._write_lock:
+            data = self._load()
+            action = next((item for item in data.actions if item.id == action_id), None)
+            if action is None:
+                raise ValueError("Unknown action")
+            self._clear_actions(data, [action])
+            self._save(data)
+
+    def clear_all_agent_runs(self) -> dict[str, int]:
+        with self._write_lock:
+            data = self._load()
+            terminal_statuses = {"failed", "cancelled", "pushed", "approved", "awaiting_approval", "patch_ready", "review_ready", "recovery_required"}
+            clearable = [
+                action for action in data.actions
+                if action.kind == "agent_run"
+                and action.status in terminal_statuses
+                and not (action.status == "recovery_required" and not action.recoveryInspected)
+            ]
+            self._clear_actions(data, clearable)
+            if clearable:
+                self._save(data)
+            return {"cleared": len(clearable), "remaining": len(data.agentRuns)}
+
+    def _clear_actions(self, data: PersistedAppData, actions: list[ActionRecord]) -> None:
+        if not actions:
+            return
+        clear_ids = {action.id for action in actions}
+        remaining_actions = [item for item in data.actions if item.id not in clear_ids]
+        import shutil
+        for action in actions:
+            if action.status == "recovery_required" and not action.recoveryInspected:
+                raise ValueError("Recovery-required actions must be inspected before cleanup")
+            if action.workspacePath and not any(item.workspacePath == action.workspacePath for item in remaining_actions):
+                workspace = Path(action.workspacePath).resolve()
+                root = RunWorkspace.root.resolve()
+                if root not in workspace.parents:
+                    raise ValueError("Action workspace is outside the MergeOps workspace root")
+                run_root = workspace.parent
+                if run_root.exists():
+                    shutil.rmtree(run_root)
+        data.actions = remaining_actions
+        data.agentRuns = [item for item in data.agentRuns if item.id not in clear_ids]
+        data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="action_cleared", message=f"Cleared {len(actions)} agent run action(s).", createdAt=utc_now()))
 
     def create_team_member(self, payload: CreateTeamMemberRequest) -> TeamMember:
         data = self._load()
@@ -1323,8 +1405,57 @@ class LocalJsonStore:
             payload["prAnnotations"] = []
         payload["github"] = self._public_github(GitHubSettings.model_validate(payload["githubPrivate"])).model_dump(mode="json")
         data = PersistedAppData.model_validate(payload)
+        action_ids = {action.id for action in data.actions}
+        missing_run_actions = [
+            ActionRecord(
+                id=run.id,
+                kind="agent_run",
+                repository=run.repository,
+                pullRequestId=run.pullRequestId,
+                pullRequestNumber=run.pullRequestNumber,
+                action=run.action,
+                status=run.status,
+                summary=run.summary,
+                rootRunId=run.rootRunId,
+                parentRunId=run.parentRunId,
+                feedback=run.feedback,
+                workspacePath=run.workspacePath,
+                baseCommit=run.baseCommit,
+                events=run.events,
+                createdAt=run.createdAt,
+            )
+            for run in data.agentRuns
+            if run.id not in action_ids
+        ]
+        if missing_run_actions:
+            data.actions = [*missing_run_actions, *data.actions]
+        evidence_migrated = False
+        migrated_runs: list[AgentRun] = []
+        for run in data.agentRuns:
+            evidence = run.rebaseEvidence
+            if evidence is None:
+                migrated_runs.append(run)
+                continue
+            conflicts = []
+            run_changed = False
+            for conflict in evidence.conflicts:
+                if conflict.oursHunk.text or conflict.theirsHunk.text or conflict.resultHunk.text:
+                    conflicts.append(conflict)
+                    continue
+                ours, theirs, result = conflict.ours.text, conflict.theirs.text, conflict.result.text
+                result_hunk = RunWorkspace._resolved_hunk(ours, theirs, result) if conflict.validationState == "passed" else result
+                ours_hunk, theirs_hunk, unresolved_hunk = RunWorkspace._conflict_hunks(ours, theirs, result)
+                conflicts.append(conflict.model_copy(update={"oursHunk": BoundedText.model_validate(SubprocessAgentAdapter._bounded(ours_hunk)), "theirsHunk": BoundedText.model_validate(SubprocessAgentAdapter._bounded(theirs_hunk)), "resultHunk": BoundedText.model_validate(SubprocessAgentAdapter._bounded(result_hunk or unresolved_hunk))}))
+                run_changed = True
+            if run_changed:
+                migrated_runs.append(run.model_copy(update={"rebaseEvidence": evidence.model_copy(update={"conflicts": conflicts})}))
+                evidence_migrated = True
+            else:
+                migrated_runs.append(run)
+        if evidence_migrated:
+            data.agentRuns = migrated_runs
         normalized = [self._normalize_pull_request(pull_request, data) for pull_request in data.pullRequests]
-        if normalized != data.pullRequests or legacy_repository_path_fixed:
+        if normalized != data.pullRequests or legacy_repository_path_fixed or missing_run_actions or evidence_migrated:
             data.pullRequests = normalized
             self._save(data)
         return data
@@ -1379,6 +1510,7 @@ class LocalJsonStore:
             resolvedConflictCount=sum(1 for item in evidence.conflicts if item.validationState == "passed") if evidence else 0,
             blockedCommandCount=len(evidence.blockedCommands) if evidence else 0,
             hasRebaseEvidence=evidence is not None,
+            recoveryInspected=run.recoveryInspected,
         )
 
     @staticmethod
@@ -1405,6 +1537,7 @@ class LocalJsonStore:
             resolvedConflictCount=sum(1 for item in evidence.conflicts if item.validationState == "passed") if evidence else 0,
             blockedCommandCount=len(evidence.blockedCommands) if evidence else 0,
             hasRebaseEvidence=evidence is not None,
+            recoveryInspected=action.recoveryInspected,
             pushRef=action.pushRef,
             diffHash=action.diffHash,
             pushedCommitSha=action.pushedCommitSha,

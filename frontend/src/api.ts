@@ -15,13 +15,18 @@ export async function checkBackendHealth(): Promise<boolean> {
   }
 }
 
-export async function loadAppData(): Promise<AppData> {
+export async function loadAppData(useFixtureFallback = true): Promise<AppData> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 8000);
   try {
-    const response = await fetch(`${API_BASE}/api/app-data`);
+    const response = await fetch(`${API_BASE}/api/app-data`, { signal: controller.signal });
     if (!response.ok) throw new Error(`API returned ${response.status}`);
     return await response.json();
   } catch {
+    if (!useFixtureFallback) throw new Error("Could not refresh application data");
     return fixtureData;
+  } finally {
+    window.clearTimeout(timeout);
   }
 }
 
@@ -31,29 +36,13 @@ export async function createAgentRun(input: {
   action: AgentRun["action"];
   reviewThreadIds?: string[];
 }): Promise<AgentRun> {
-  try {
-    const response = await fetch(`${API_BASE}/api/agent-runs`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(input)
-    });
-    if (!response.ok) throw new Error(`API returned ${response.status}`);
-    return await response.json();
-  } catch {
-    const pr = fixtureData.pullRequests.find((item) => item.id === input.pullRequestId);
-    return {
-      id: `local-${Date.now()}`,
-      backendId: input.backendId,
-      repository: pr?.repository ?? "unknown",
-      pullRequestId: input.pullRequestId,
-      pullRequestNumber: pr?.number ?? 0,
-      action: input.action,
-      status: "awaiting_approval",
-      requester: "local user",
-      summary: "Local fixture run queued. No push will happen without approval.",
-      createdAt: new Date().toISOString()
-    };
-  }
+  const response = await fetch(`${API_BASE}/api/agent-runs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input)
+  });
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
+  return await response.json();
 }
 
 export async function createCheckout(pullRequestId: string): Promise<CheckoutResult> {
@@ -69,6 +58,12 @@ export async function createCheckout(pullRequestId: string): Promise<CheckoutRes
 export async function clearAction(actionId: string): Promise<void> {
   const response = await fetch(`${API_BASE}/api/actions/${actionId}`, { method: "DELETE" });
   if (!response.ok) throw new Error(`API returned ${response.status}`);
+}
+
+export async function clearAllAgentRuns(): Promise<{ cleared: number; remaining: number }> {
+  const response = await fetch(`${API_BASE}/api/agent-runs`, { method: "DELETE" });
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
+  return await response.json();
 }
 
 export async function loadActionDetails(actionId: string): Promise<AgentRun | ActionRecord> {
@@ -119,6 +114,12 @@ export async function reviseAgentRun(runId: string, input: { backendId: string; 
 
 export async function retryAgentRun(runId: string): Promise<AgentRun> {
   const response = await fetch(`${API_BASE}/api/agent-runs/${runId}/retry`, { method: "POST" });
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
+  return await response.json();
+}
+
+export async function revalidateManualRun(runId: string): Promise<AgentRun> {
+  const response = await fetch(`${API_BASE}/api/agent-runs/${runId}/revalidate`, { method: "POST" });
   if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
   return await response.json();
 }
