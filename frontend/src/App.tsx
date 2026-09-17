@@ -19,7 +19,8 @@ import {
   GitCompare,
   ChevronDown,
   ChevronUp,
-  BellRing
+  BellRing,
+  CircleAlert
 } from "lucide-react";
 import { approveAgentRun, cancelAgentRun, checkBackendHealth, clearAction, clearAllAgentRuns, createAgentRun, createCheckout, createPrNote, createTeamMember, deletePrNote, deleteTeamMember, inspectRecoveryAgentRun, loadActionDetails, loadAppData, loadPrAnnotations, loadReviewThreads, postReviewReplies, pushAgentRun, revalidateManualRun, reviseAgentRun, retryAgentRun, reviewPatch, selectRebaseDecision, subscribeToAgentEvents, syncGitHub, updateAgentSettings, updateGitHubSettings, updatePrTags, updateTeamMember } from "./api";
 import type { ActionRecord, ActivityEvent, AgentBackend, AgentRun, AgentRunEvent, AgentRunSummary, AgentSettings, AppData, ConflictEvidence, GitHubSettings, GitHubSyncResult, PrAnnotations, PullRequest, QueueFilter, ReplyDraft, RepositoryConfig, ReviewThread, ReviewThreadSnapshot, TeamMember, ThemePreference, View } from "./types";
@@ -731,7 +732,9 @@ function Cockpit(props: {
                 <div className="pr-cell"><span className="pr-title"><strong>{pr.title}</strong><span>{pr.repository} #{pr.number} · {pr.state} · {pr.sourceBranch}</span>{tags.length ? <span className="pr-tag-row">{tags.map((tag) => <span className="tag local-tag" key={tag}>{tag}</span>)}</span> : null}</span></div>
                 <div className="pr-cell">{member?.displayName ?? pr.author}</div>
                 <div className="pr-cell">{pr.reviewState.replace("_", " ")}</div>
-                <div className="pr-cell">{pr.checkState.replace("_", " ")}</div>
+                <div className={`pr-cell checks-cell ${pr.checkState === "failing" ? "is-failing" : ""}`}>
+                  {pr.checkState === "failing" ? <span className="check-indicator" title={t("checks.failed")}><CircleAlert size={15} aria-hidden="true" /><span>{t("checks.failed")}</span></span> : pr.checkState.replace("_", " ")}
+                </div>
                 <div className="pr-cell">{pr.ageDays}d</div>
                 <div className="pr-cell"><button className="text-btn" onClick={() => props.onSelectPr(pr)}>{t("cockpit.inspect")}</button></div>
               </div>
@@ -1470,10 +1473,11 @@ function PrDrawer(props: {
             <h3>Operational state</h3>
             <div className="kv-grid">
               <div className="kv"><span>Review</span><strong>{props.pr.reviewState.replace("_", " ")}</strong></div>
-              <div className="kv"><span>Checks</span><strong>{props.pr.checkState.replace("_", " ")}</strong></div>
+              <div className="kv"><span>Checks</span><strong className={props.pr.checkState === "failing" ? "failure-copy" : ""}>{props.pr.checkState === "failing" ? <span className="check-indicator"><CircleAlert size={15} aria-hidden="true" />{t("checks.failed")}</span> : props.pr.checkState.replace("_", " ")}</strong></div>
               <div className="kv"><span>Age</span><strong>{props.pr.ageDays} days</strong></div>
               <div className="kv"><span>Comments</span><strong>{props.pr.unresolvedCommentCount}</strong></div>
             </div>
+            {props.pr.checkState === "failing" ? <div className="ci-alert" role="alert"><CircleAlert size={18} aria-hidden="true" /><span><strong>{t("checks.failed")}</strong><small>{t("checks.failedHelp")}</small></span></div> : null}
             <p className="drawer-meta"><strong>{props.pr.repositoryFullName ?? props.pr.repository}</strong> · {props.pr.sourceBranch} → {props.pr.baseBranch} · {props.pr.changedFilesCount} changed files</p>
           </section>
           <details className="detail-block review-feedback" open={reviewOpen} onToggle={(event) => toggleReview(event.currentTarget.open)}>

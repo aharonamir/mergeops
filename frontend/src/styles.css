@@ -923,6 +923,41 @@ label span {
   color: var(--red);
 }
 
+.checks-cell.is-failing {
+  color: var(--red);
+  font-weight: 700;
+}
+
+.check-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--red);
+  font-weight: 700;
+}
+
+.ci-alert {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin-top: 12px;
+  padding: 11px 12px;
+  color: var(--red);
+  border: 1px solid color-mix(in srgb, var(--red) 42%, var(--line));
+  background: color-mix(in srgb, var(--red) 8%, var(--surface));
+  border-radius: 10px;
+}
+
+.ci-alert > span {
+  display: grid;
+  gap: 3px;
+}
+
+.ci-alert small {
+  color: var(--ink-muted);
+  line-height: 1.45;
+}
+
 .table-shell {
   overflow: hidden;
 }
