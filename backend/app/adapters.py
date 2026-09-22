@@ -161,7 +161,7 @@ class SubprocessAgentAdapter:
             try:
                 base_ref = RunWorkspace.resolve_base_ref(workspace.path, request.base_branch)
                 RunWorkspace.configure_rebase(workspace)
-                initial_merges = RunWorkspace.merge_commits(workspace)
+                initial_merges = RunWorkspace.merge_commits(workspace, f"{base_ref}..HEAD")
             except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
                 event = self._event("error", f"Could not prepare agent-owned rebase: {exc}")
                 result = AgentRunResult(status="failed", summary=f"Could not prepare agent-owned rebase: {exc}", workspace_path=str(workspace.path), base_commit=workspace.base_commit, events=[event], rebase_evidence={"baseRef": base_ref, "state": "failed", "validation": [str(exc)]})
@@ -790,10 +790,11 @@ class RunWorkspace:
         return sha, subject
 
     @classmethod
-    def merge_commits(cls, workspace: "RunWorkspace") -> set[str]:
-        # Do not use --all here: stash refs are merge commits too, and are not
-        # part of the branch being rebased.
-        result = subprocess.run(["git", "rev-list", "--merges", "HEAD"], cwd=workspace.path, capture_output=True, text=True, check=False, timeout=30)
+    def merge_commits(cls, workspace: "RunWorkspace", revision: str = "HEAD") -> set[str]:
+        # Restrict the scan to the requested revision. In particular, do not use
+        # --all: stash refs are merge commits too, and are not part of the branch
+        # being rebased.
+        result = subprocess.run(["git", "rev-list", "--merges", revision], cwd=workspace.path, capture_output=True, text=True, check=False, timeout=30)
         return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
     @classmethod
@@ -829,7 +830,7 @@ class RunWorkspace:
             messages.append("base ref is unavailable")
         elif not cls._git_optional(workspace.path, "merge-base", "--is-ancestor", base_ref, "HEAD"):
             messages.append(f"HEAD is not based on {base_ref}")
-        new_merges = cls.merge_commits(workspace) - initial_merges
+        new_merges = cls.merge_commits(workspace, f"{base_ref}..HEAD") - initial_merges if base_ref else set()
         if new_merges:
             messages.append(f"merge commit introduced: {', '.join(sorted(new_merges))}")
         runtime_files = cls.runtime_files_in_diff(workspace, base_ref) if base_ref else []

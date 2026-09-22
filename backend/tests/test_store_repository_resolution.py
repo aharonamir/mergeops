@@ -904,6 +904,33 @@ class StoreRepositoryResolutionTest(unittest.TestCase):
 
             self.assertEqual(RunWorkspace.merge_commits(workspace), set())
 
+    def test_rebase_validation_ignores_merges_already_in_base_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._git(repo, "init", "-b", "main")
+            self._git(repo, "config", "user.email", "test@example.com")
+            self._git(repo, "config", "user.name", "test")
+            (repo / "README.md").write_text("base\n", encoding="utf-8")
+            self._git(repo, "add", "README.md")
+            self._git(repo, "commit", "-m", "base")
+            self._git(repo, "checkout", "-b", "side")
+            (repo / "side.txt").write_text("side\n", encoding="utf-8")
+            self._git(repo, "add", "side.txt")
+            self._git(repo, "commit", "-m", "side")
+            self._git(repo, "checkout", "main")
+            (repo / "main.txt").write_text("main\n", encoding="utf-8")
+            self._git(repo, "add", "main.txt")
+            self._git(repo, "commit", "-m", "main")
+            self._git(repo, "merge", "--no-ff", "side", "-m", "base branch merge")
+            (repo / "feature.txt").write_text("feature\n", encoding="utf-8")
+            self._git(repo, "add", "feature.txt")
+            self._git(repo, "commit", "-m", "feature")
+
+            workspace = RunWorkspace(repo, self._git(repo, "rev-parse", "HEAD").strip())
+            validation = RunWorkspace.validate_rebase(workspace, "main", set())
+
+            self.assertTrue(validation["ok"], validation["messages"])
+
     def test_rebase_validation_rejects_committed_runtime_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
