@@ -160,6 +160,13 @@ export type BoundedText = {
   originalLength: number;
 };
 
+export type ConflictSection = {
+  index: number;
+  ours: BoundedText;
+  theirs: BoundedText;
+  result: BoundedText;
+};
+
 export type ConflictEvidence = {
   id: string;
   commitSha?: string | null;
@@ -171,6 +178,7 @@ export type ConflictEvidence = {
   oursHunk?: BoundedText;
   theirsHunk?: BoundedText;
   resultHunk?: BoundedText;
+  sections?: ConflictSection[];
   classification: "ours" | "theirs" | "combined" | "manual" | "added" | "deleted" | "unknown";
   validationState: "passed" | "failed" | "unknown";
   agentExplanation?: string | null;

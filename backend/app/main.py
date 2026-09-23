@@ -128,7 +128,7 @@ async def post_agent_run_approve(run_id: str) -> AgentRun:
 @app.post("/api/agent-runs/{run_id}/push")
 async def post_agent_run_push(run_id: str, payload: PushAgentRunRequest | None = None) -> AgentRun:
     try:
-        return await _run_blocking(store.push_agent_run, run_id, payload.target if payload else "mergeops_branch")
+        return await _run_blocking(store.push_agent_run, run_id, payload.target if payload else "pr_branch")
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -137,6 +137,14 @@ async def post_agent_run_push(run_id: str, payload: PushAgentRunRequest | None =
 async def post_agent_run_retry(run_id: str) -> AgentRun:
     try:
         return await _run_blocking(store.retry_agent_run, run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/agent-runs/{run_id}/continue-rebase")
+async def post_agent_run_continue_rebase(run_id: str) -> AgentRun:
+    try:
+        return await _run_blocking(store.continue_rebase, run_id)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -257,6 +265,11 @@ async def delete_action(action_id: str) -> None:
 @app.delete("/api/agent-runs", status_code=200)
 async def delete_all_agent_runs() -> dict[str, int]:
     return await _run_blocking(store.clear_all_agent_runs)
+
+
+@app.delete("/api/activity", status_code=200)
+async def delete_all_activity() -> dict[str, int]:
+    return await _run_blocking(store.clear_all_activity)
 
 
 @app.post("/api/team-members")

@@ -66,6 +66,12 @@ export async function clearAllAgentRuns(): Promise<{ cleared: number; remaining:
   return await response.json();
 }
 
+export async function clearAllActivity(): Promise<{ cleared: number }> {
+  const response = await fetch(`${API_BASE}/api/activity`, { method: "DELETE" });
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
+  return await response.json();
+}
+
 export async function loadActionDetails(actionId: string): Promise<AgentRun | ActionRecord> {
   const response = await fetch(`${API_BASE}/api/actions/${actionId}/details`);
   if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
@@ -100,7 +106,7 @@ export async function approveAgentRun(runId: string): Promise<AgentRun> {
   return await response.json();
 }
 
-export async function pushAgentRun(runId: string, target: "mergeops_branch" | "pr_branch" = "mergeops_branch"): Promise<AgentRun> {
+export async function pushAgentRun(runId: string, target: "mergeops_branch" | "pr_branch" = "pr_branch"): Promise<AgentRun> {
   const response = await fetch(`${API_BASE}/api/agent-runs/${runId}/push`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ target }) });
   if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
   return await response.json();
@@ -114,6 +120,12 @@ export async function reviseAgentRun(runId: string, input: { backendId: string; 
 
 export async function retryAgentRun(runId: string): Promise<AgentRun> {
   const response = await fetch(`${API_BASE}/api/agent-runs/${runId}/retry`, { method: "POST" });
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
+  return await response.json();
+}
+
+export async function continueRebaseAgentRun(runId: string): Promise<AgentRun> {
+  const response = await fetch(`${API_BASE}/api/agent-runs/${runId}/continue-rebase`, { method: "POST" });
   if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
   return await response.json();
 }

@@ -13,7 +13,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.adapters import AgentRunRequest, AgentRunResult, RunWorkspace, SubprocessAgentAdapter, inspect_workspace
-from app.models import ActionRecord, AgentBackend, AgentRun, AgentRunEvent, ApprovalRecord, CheckResult, CreatePrNoteRequest, CreateRevisionRequest, GitHubSettings, GitHubSettingsPublic, PullRequest, RebaseDecision, RebaseDecisionOption, RebaseEvidence, RebasePlan, RepositoryConfig, TeamMember
+from app.models import ActionRecord, AgentBackend, AgentRun, AgentRunEvent, ActivityEvent, ApprovalRecord, CheckResult, CreatePrNoteRequest, CreateRevisionRequest, GitHubSettings, GitHubSettingsPublic, PullRequest, PushAgentRunRequest, RebaseDecision, RebaseDecisionOption, RebaseEvidence, RebasePlan, RepositoryConfig, TeamMember
 from app.store import LocalJsonStore, PersistedAppData
 
 
@@ -67,6 +67,36 @@ class FailedWorkspaceAdapter(CapturingAdapter):
 
 
 class StoreRepositoryResolutionTest(unittest.TestCase):
+    def test_push_request_defaults_to_pr_branch(self) -> None:
+        self.assertEqual(PushAgentRunRequest().target, "pr_branch")
+
+    def test_inspect_workspace_handles_non_utf8_diff_and_excludes_runtime_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            self._git(workspace, "init", "-b", "main")
+            self._git(workspace, "config", "user.email", "test@example.com")
+            self._git(workspace, "config", "user.name", "MergeOps Test")
+            (workspace / "README.md").write_text("original\n", encoding="utf-8")
+            self._git(workspace, "add", "README.md")
+            self._git(workspace, "commit", "-m", "initial")
+            base_commit = self._git(workspace, "rev-parse", "HEAD").strip()
+            (workspace / "README.md").write_bytes(b"changed with invalid byte \\xca\n")
+            runtime = workspace / ".local" / "share" / "opencode" / "snapshot.bin"
+            runtime.parent.mkdir(parents=True)
+            runtime.write_bytes(b"runtime \\xca\n")
+            self._git(workspace, "add", "README.md", ".local")
+            self._git(workspace, "commit", "-m", "patch")
+
+            summary, diff, checks, _risk = inspect_workspace(workspace, committed_base=f"{base_commit}..HEAD")
+
+        self.assertIn("README.md", summary)
+        self.assertIn("invalid byte", diff)
+        self.assertNotIn(".local/share/opencode", diff)
+        self.assertTrue(all(check["status"] == "passed" for check in checks))
+        self.assertTrue(RunWorkspace.is_runtime_path(".local/share/opencode/snapshot.bin"))
+        self.assertTrue(RunWorkspace.is_runtime_path("./.cache/opencode/models.json"))
+        self.assertFalse(RunWorkspace.is_runtime_path("local/source.py"))
+
     def test_clearing_agent_action_removes_its_run_and_releases_lineage(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -121,6 +151,24 @@ class StoreRepositoryResolutionTest(unittest.TestCase):
             self.assertEqual(result, {"cleared": 1, "remaining": 1})
             self.assertEqual([run.id for run in store.persisted_data().agentRuns], [running.id])
             self.assertEqual([action.id for action in store.persisted_data().actions], [running.id])
+
+    def test_clear_all_activity_removes_events_without_creating_a_new_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pull_request = PullRequest(
+                id="pr-clear-activity", repository="service", repositoryFullName="owner/service", number=43,
+                title="Clear activity", author="dev", ownerMemberId="dev", sourceBranch="feature", baseBranch="main",
+                state="open", mergeable="mergeable", reviewState="approved", unresolvedCommentCount=0,
+                requestedReviewers=[], checkState="passing", linkedIssueIds=[], changedFilesCount=1, ageDays=1,
+                summary="Clear activity", searchText="clear activity",
+            )
+            data = self._data(pull_request)
+            data.activity = [ActivityEvent(id="activity-1", kind="sync", message="Imported", createdAt="2026-01-01T00:00:00Z")]
+            store = LocalJsonStore(Path(tmpdir) / "mergeops.local.json")
+            store._save(data)
+
+            self.assertEqual(store.clear_all_activity(), {"cleared": 1})
+            self.assertEqual(store.persisted_data().activity, [])
+            self.assertEqual(store.clear_all_activity(), {"cleared": 0})
 
     def test_agent_run_details_survive_missing_legacy_action_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -474,7 +522,11 @@ class StoreRepositoryResolutionTest(unittest.TestCase):
 
             self.assertEqual(result.status, "awaiting_approval")
             self.assertIsNotNone(result.workspace_path)
-            self.assertIn(f"{result.workspace_path}|1|{result.workspace_path}", result.summary)
+            workspace_path = Path(result.workspace_path or "")
+            expected_home = workspace_path.parent / ".opencode-home"
+            self.assertIn(f"{result.workspace_path}|1|{expected_home}", result.summary)
+            self.assertTrue((expected_home / ".local" / "share" / "opencode" / "log").is_dir())
+            self.assertFalse((workspace_path / ".local").exists())
             self.assertEqual([event["type"] for event in result.events or []], ["log", "final"])
 
     def test_subprocess_agent_streams_progress_and_can_be_cancelled(self) -> None:
@@ -777,7 +829,7 @@ class StoreRepositoryResolutionTest(unittest.TestCase):
             store = LocalJsonStore(root / "mergeops.local.json")
             store._save(data)
 
-            pushed = store.push_agent_run(run.id)
+            pushed = store.push_agent_run(run.id, "mergeops_branch")
             self.assertEqual(pushed.status, "pushed")
             self.assertEqual(pushed.pushRef, "mergeops/run-push")
             self.assertEqual(store.persisted_data().actions[0].pushRef, "mergeops/run-push")
@@ -860,6 +912,92 @@ class StoreRepositoryResolutionTest(unittest.TestCase):
             self.assertEqual(merge.returncode, 64)
             self.assertEqual(push.returncode, 64)
             self.assertEqual(log.read_text(encoding="utf-8").splitlines(), ["merge", "push"])
+
+    def test_git_guard_unstages_runtime_files_after_git_add(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repository = root / "repository"
+            repository.mkdir()
+            self._git(repository, "init", "-b", "main")
+            self._git(repository, "config", "user.email", "test@example.com")
+            self._git(repository, "config", "user.name", "MergeOps Test")
+            (repository / "README.md").write_text("source\n", encoding="utf-8")
+            (repository / ".local" / "share").mkdir(parents=True)
+            (repository / ".local" / "share" / "opencode.log").write_text("runtime\n", encoding="utf-8")
+            (repository / "database.sqlite3-wal").write_bytes(b"runtime")
+            guard = SubprocessAgentAdapter._prepare_git_guard(root)
+
+            result = subprocess.run([str(guard), "add", "-A"], cwd=repository, capture_output=True, text=True)
+
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(self._git(repository, "diff", "--cached", "--name-only").splitlines(), ["README.md"])
+
+    def test_runtime_files_are_ignored_in_workspace_git_excludes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repository = Path(tmpdir) / "repository"
+            repository.mkdir()
+            self._git(repository, "init", "-b", "main")
+            workspace = RunWorkspace(repository, "initial")
+            RunWorkspace.configure_runtime_excludes(workspace)
+            (repository / ".local").mkdir()
+            (repository / ".local" / "runtime.log").write_text("runtime\n", encoding="utf-8")
+            (repository / "README.md").write_text("source\n", encoding="utf-8")
+            self._git(repository, "add", "-A")
+
+            self.assertEqual(self._git(repository, "diff", "--cached", "--name-only").splitlines(), ["README.md"])
+            self._git(repository, "commit", "-m", "source")
+            self.assertEqual(self._git(repository, "ls-files").splitlines(), ["README.md"])
+
+    def test_rebase_continue_hook_removes_force_staged_runtime_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repository = Path(tmpdir) / "repository"
+            repository.mkdir()
+            self._git(repository, "init", "-b", "main")
+            self._git(repository, "config", "user.email", "test@example.com")
+            self._git(repository, "config", "user.name", "MergeOps Test")
+            (repository / "README.md").write_text("base\n", encoding="utf-8")
+            self._git(repository, "add", "README.md")
+            self._git(repository, "commit", "-m", "base")
+            self._git(repository, "checkout", "-b", "feature")
+            (repository / "README.md").write_text("feature\n", encoding="utf-8")
+            self._git(repository, "commit", "-am", "feature")
+            self._git(repository, "checkout", "main")
+            (repository / "README.md").write_text("main\n", encoding="utf-8")
+            self._git(repository, "commit", "-am", "main")
+            self._git(repository, "checkout", "feature")
+            RunWorkspace.configure_runtime_excludes(RunWorkspace(repository, "feature"))
+
+            self.assertNotEqual(subprocess.run(["git", "rebase", "main"], cwd=repository, capture_output=True, text=True).returncode, 0)
+            (repository / "README.md").write_text("resolved\n", encoding="utf-8")
+            (repository / ".local").mkdir()
+            (repository / ".local" / "runtime.log").write_text("runtime\n", encoding="utf-8")
+            self._git(repository, "add", "README.md")
+            self._git(repository, "add", "-f", ".local/runtime.log")
+            continued = subprocess.run(["git", "-c", "core.editor=true", "rebase", "--continue"], cwd=repository, capture_output=True, text=True)
+
+            self.assertEqual(continued.returncode, 0, continued.stderr)
+            self.assertEqual(RunWorkspace.strip_runtime_from_head(RunWorkspace(repository, "feature")), [".local/runtime.log"])
+            self.assertEqual(self._git(repository, "show", "--format=", "--name-only", "HEAD").splitlines(), ["README.md"])
+
+    def test_strip_runtime_only_head_drops_the_empty_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repository = Path(tmpdir) / "repository"
+            repository.mkdir()
+            self._git(repository, "init", "-b", "main")
+            self._git(repository, "config", "user.email", "test@example.com")
+            self._git(repository, "config", "user.name", "MergeOps Test")
+            (repository / "README.md").write_text("base\n", encoding="utf-8")
+            self._git(repository, "add", "README.md")
+            self._git(repository, "commit", "-m", "base")
+            base = self._git(repository, "rev-parse", "HEAD").strip()
+            (repository / ".local").mkdir()
+            (repository / ".local" / "runtime.log").write_text("runtime\n", encoding="utf-8")
+            self._git(repository, "add", "-f", ".local/runtime.log")
+            self._git(repository, "commit", "--no-verify", "-m", "runtime")
+
+            self.assertEqual(RunWorkspace.strip_runtime_from_head(RunWorkspace(repository, base)), [".local/runtime.log"])
+            self.assertEqual(self._git(repository, "rev-parse", "HEAD").strip(), base)
+            self.assertEqual(self._git(repository, "status", "--short"), "")
 
     def test_rebase_validation_rejects_head_not_based_on_base_ref(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -985,6 +1123,36 @@ class StoreRepositoryResolutionTest(unittest.TestCase):
             self.assertEqual(conflict["result"]["text"], "first resolved\n")
             self.assertEqual(conflict["validationState"], "passed")
 
+    def test_conflict_finalization_revalidates_failed_snapshot_after_rebase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._git(repo, "init", "-b", "main")
+            self._git(repo, "config", "user.email", "test@example.com")
+            self._git(repo, "config", "user.name", "MergeOps Test")
+            (repo / "README.md").write_text("resolved\n", encoding="utf-8")
+            self._git(repo, "add", "README.md")
+            self._git(repo, "commit", "-m", "resolution")
+            workspace = RunWorkspace(repo, self._git(repo, "rev-parse", "HEAD").strip())
+            evidence = {
+                "stages": [],
+                "conflicts": [{
+                    "id": "commit-one:README.md",
+                    "filePath": "README.md",
+                    "ours": {"text": "ours\n", "truncated": False, "originalLength": 5},
+                    "theirs": {"text": "theirs\n", "truncated": False, "originalLength": 7},
+                    "result": {"text": "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> commit\n", "truncated": False, "originalLength": 49},
+                    "classification": "unknown",
+                    "validationState": "failed",
+                    "createdAt": "2026-01-01T00:00:00Z",
+                }],
+            }
+
+            SubprocessAgentAdapter._finalize_conflicts(workspace, evidence, result_source="worktree")
+
+            conflict = evidence["conflicts"][0]
+            self.assertEqual(conflict["result"]["text"], "resolved\n")
+            self.assertEqual(conflict["validationState"], "passed")
+
     def test_conflict_capture_keeps_focused_hunks(self) -> None:
         prefix = "one\ntwo\nthree\nfour\n"
         suffix = "five\nsix\nseven\neight\n"
@@ -998,6 +1166,16 @@ class StoreRepositoryResolutionTest(unittest.TestCase):
         self.assertNotIn("eight", focused_theirs)
         self.assertIn("<<<<<<< HEAD", focused_result)
         self.assertNotIn("eight", focused_result)
+
+    def test_conflict_sections_preserve_each_marker_block(self) -> None:
+        result = """before\n<<<<<<< HEAD\nours one\n=======\ntheirs one\n>>>>>>> first\nmiddle\n<<<<<<< HEAD\nours two\n=======\ntheirs two\n>>>>>>> second\nafter\n"""
+
+        sections = RunWorkspace._conflict_sections(result)
+
+        self.assertEqual(len(sections), 2)
+        self.assertEqual(sections[0]["index"], 1)
+        self.assertEqual(sections[0]["ours"]["text"], "ours one\n")
+        self.assertEqual(sections[1]["theirs"]["text"], "theirs two\n")
 
     def test_resolved_conflict_hunk_excludes_unrelated_file_content(self) -> None:
         result = "one\ntwo\nthree\nfour\nresolved line\nfive\nsix\nseven\neight\n"

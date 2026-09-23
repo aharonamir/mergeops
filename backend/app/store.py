@@ -598,13 +598,17 @@ class LocalJsonStore:
         self._save(data)
         existing_workspace_path = None
         rebase_plan = None
+        continue_rebase = False
         if action in {"fix_conflicts", "rebase"}:
             try:
-                if run.workspacePath and run.rebaseEvidence and run.rebaseEvidence.plan and run.rebaseEvidence.decision and run.rebaseEvidence.decision.selectedOption:
-                    if not run.workspacePath or not run.rebaseEvidence or not run.rebaseEvidence.plan:
-                        raise ValueError("Rebase decision has no prepared workspace or plan")
+                active_workspace = RunWorkspace(Path(run.workspacePath), run.baseCommit or "") if run.workspacePath and Path(run.workspacePath).is_dir() else None
+                if run.workspacePath and run.rebaseEvidence and run.rebaseEvidence.plan and active_workspace and (
+                    RunWorkspace.rebase_in_progress(active_workspace)
+                    or (run.rebaseEvidence.decision and run.rebaseEvidence.decision.selectedOption)
+                ):
                     existing_workspace_path = run.workspacePath
                     rebase_plan = run.rebaseEvidence.plan.model_dump(mode="json")
+                    continue_rebase = RunWorkspace.rebase_in_progress(active_workspace)
                 else:
                     workspace = RunWorkspace.create(AgentRunRequest(
                         run_id=run_id, pull_request_id=pull_request.id, repository=pull_request.repositoryFullName or pull_request.repository,
@@ -661,6 +665,8 @@ class LocalJsonStore:
                 feedback_instruction=run.feedback.instruction if run.feedback else None,
                 feedback_reason=run.feedback.reason if run.feedback else None,
                 selected_review_threads=[thread.model_dump(mode="json") for thread in run.selectedReviewThreads],
+                continue_rebase=continue_rebase,
+                previous_rebase_evidence=run.rebaseEvidence.model_dump(mode="json") if continue_rebase and run.rebaseEvidence else None,
                 process_identity=lambda pid, group: self.ledger.heartbeat(run_id, self._worker_owner, process_pid=pid, process_group=group),
             ), on_event=lambda event: self.append_agent_event(run_id, event), cancel_event=cancel_event)
         except Exception as exc:
@@ -847,6 +853,7 @@ class LocalJsonStore:
             if RunWorkspace.rebase_in_progress(workspace) or unresolved:
                 detail = f"; unresolved files remain: {', '.join(unresolved)}" if unresolved else ""
                 raise ValueError(f"Manual rebase is not complete{detail}")
+            RunWorkspace.strip_runtime_from_head(workspace)
             pull_request = next((item for item in data.pullRequests if item.id == run.pullRequestId), None)
             if pull_request is None:
                 raise ValueError("Pull request no longer exists")
@@ -869,6 +876,38 @@ class LocalJsonStore:
             self._save(data)
             self.ledger.event(updated.id, "patch_ready", updated.summary, now)
             return updated
+
+    def continue_rebase(self, run_id: str) -> AgentRun:
+        """Queue OpenCode to continue an active rebase in the retained workspace."""
+        with self._write_lock:
+            data = self._load()
+            run = next((item for item in data.agentRuns if item.id == run_id), None)
+            if run is None:
+                raise ValueError("Unknown agent run")
+            if run.status != "failed" or run.action not in {"fix_conflicts", "rebase"}:
+                raise ValueError("Only failed conflict-fix or rebase runs can be continued")
+            if not run.workspacePath or not Path(run.workspacePath).is_dir():
+                raise ValueError("The retained workspace is no longer available")
+            workspace = RunWorkspace.from_existing(run.workspacePath)
+            if not RunWorkspace.rebase_in_progress(workspace):
+                raise ValueError("The retained workspace has no active rebase; use Fixed manually or retry with a fresh workspace")
+            if not run.rebaseEvidence or not run.rebaseEvidence.plan:
+                raise ValueError("The retained run has no rebase plan to continue")
+            now = utc_now()
+            continued = run.model_copy(update={
+                "status": "queued",
+                "summary": "Rebase continuation queued; OpenCode will continue the active rebase in the retained workspace.",
+                "rebaseEvidence": run.rebaseEvidence.model_copy(update={"state": "running"}),
+                "events": [*run.events, AgentRunEvent(sequence=len(run.events) + 1, type="rebase_continue_queued", message="Queued OpenCode to continue the active rebase in the retained workspace.", createdAt=now)],
+            })
+            data.agentRuns = [continued if item.id == run_id else item for item in data.agentRuns]
+            data.actions = [item.model_copy(update={"status": continued.status, "summary": continued.summary, "events": continued.events, "rebaseEvidence": continued.rebaseEvidence}) if item.id == run_id else item for item in data.actions]
+            data.activity.insert(0, ActivityEvent(id=f"activity-{uuid4().hex[:12]}", kind="agent_run", message=continued.summary, actionId=continued.id, createdAt=now))
+            self._cancel_events[run_id] = Event()
+            self._save(data)
+            self.ledger.enqueue(run_id, self._job_payload(continued), now)
+            self.ledger.event(run_id, "rebase_continue_queued", continued.summary, now)
+            return continued
 
     def inspect_recovery(self, run_id: str, confirmed: bool) -> AgentRun:
         if not confirmed:
@@ -938,7 +977,7 @@ class LocalJsonStore:
             self.ledger.event(run.id, "approved", approved.summary, approval.createdAt)
             return approved
 
-    def push_agent_run(self, run_id: str, target: str = "mergeops_branch") -> AgentRun:
+    def push_agent_run(self, run_id: str, target: str = "pr_branch") -> AgentRun:
         data = self._load()
         run = next((item for item in data.agentRuns if item.id == run_id), None)
         if run is None:
@@ -1238,6 +1277,15 @@ class LocalJsonStore:
             if clearable:
                 self._save(data)
             return {"cleared": len(clearable), "remaining": len(data.agentRuns)}
+
+    def clear_all_activity(self) -> dict[str, int]:
+        with self._write_lock:
+            data = self._load()
+            cleared = len(data.activity)
+            if cleared:
+                data.activity = []
+                self._save(data)
+            return {"cleared": cleared}
 
     def _clear_actions(self, data: PersistedAppData, actions: list[ActionRecord]) -> None:
         if not actions:

@@ -41,6 +41,8 @@ class AgentRunRequest:
     selected_review_threads: list[dict[str, object]] | None = None
     process_identity: Callable[[int, int], None] | None = None
     rebase_plan: dict[str, object] | None = None
+    continue_rebase: bool = False
+    previous_rebase_evidence: dict[str, object] | None = None
     runner_timeout_seconds: int = 600
 
 
@@ -154,6 +156,8 @@ class SubprocessAgentAdapter:
                     on_event(result.events[0])
                 return result
 
+        RunWorkspace.configure_runtime_excludes(workspace)
+
         rebase_mode = request.action in {"fix_conflicts", "rebase"}
         base_ref = None
         initial_merges: set[str] = set()
@@ -169,7 +173,12 @@ class SubprocessAgentAdapter:
                     on_event(event)
                 return result
 
-        opencode_profile_files = self._prepare_opencode_profile(workspace.path)
+        # Keep OpenCode's mutable profile outside the git checkout. OpenCode
+        # writes logs, model caches, and snapshots below HOME; placing HOME in
+        # the checkout lets a normal `git add -A` accidentally commit them
+        # during `git rebase --continue`.
+        opencode_home = workspace.path.parent / ".opencode-home"
+        opencode_profile_files = self._prepare_opencode_profile(workspace.path, opencode_home)
         review_baseline = self._workspace_fingerprint(workspace.path) if request.action == "review_patch" else None
         git_guard = self._prepare_git_guard(workspace.path.parent)
         payload = {
@@ -184,6 +193,7 @@ class SubprocessAgentAdapter:
             "runnerTimeoutSeconds": request.runner_timeout_seconds,
             "baseRef": base_ref,
             "rebasePlan": request.rebase_plan,
+            "continueRebase": request.continue_rebase,
             "conflictFiles": [],
             "reviewDiff": request.review_diff,
             "previousAgentOutput": request.previous_agent_output,
@@ -202,7 +212,7 @@ class SubprocessAgentAdapter:
             }
             environment["PATH"] = os.pathsep.join(entry for entry in path_entries if entry)
             environment.update({
-                "HOME": str(workspace.path),
+                "HOME": str(opencode_home),
                 "MERGEOPS_RUN_ID": request.run_id,
                 "MERGEOPS_NO_PUSH": "1",
                 "MERGEOPS_GIT_GUARD_LOG": str(git_guard.parent / "git-guard.log"),
@@ -237,17 +247,23 @@ class SubprocessAgentAdapter:
             stderr_lines: list[str] = []
             streams_closed = 0
             deadline = time.monotonic() + request.runner_timeout_seconds
-            evidence: dict[str, object] | None = {
-                "baseRef": base_ref,
-                "initialHead": workspace.base_commit,
-                "state": "running",
-                "stages": [],
-                "conflicts": [],
-                "blockedCommands": [],
-                "validation": [],
-                "plan": request.rebase_plan,
-            } if rebase_mode else None
-            seen_conflict_keys: set[str] = set()
+            evidence: dict[str, object] | None = dict(request.previous_rebase_evidence or {}) if rebase_mode else None
+            if evidence is not None:
+                evidence.update({
+                    "baseRef": base_ref,
+                    "state": "running",
+                    "plan": request.rebase_plan,
+                })
+                evidence.setdefault("initialHead", workspace.base_commit)
+                evidence.setdefault("stages", [])
+                evidence.setdefault("conflicts", [])
+                evidence.setdefault("blockedCommands", [])
+                evidence.setdefault("validation", [])
+            seen_conflict_keys: set[str] = {
+                f"{conflict.get('commitSha') or 'unknown'}:{conflict.get('filePath')}"
+                for conflict in (evidence or {}).get("conflicts", [])
+                if isinstance(conflict, dict) and conflict.get("filePath")
+            }
             guard_cursor = 0
             rebase_progress = self._rebase_progress_fingerprint(workspace) if rebase_mode else None
             rebase_progress_at = time.monotonic()
@@ -255,12 +271,13 @@ class SubprocessAgentAdapter:
                 if rebase_mode:
                     self._record_rebase_state(workspace, evidence, seen_conflict_keys, on_event)
                     current_progress = self._rebase_progress_fingerprint(workspace)
+                    no_progress_limit = self.rebase_no_progress_seconds * (3 if request.continue_rebase else 1)
                     if current_progress != rebase_progress:
                         rebase_progress = current_progress
                         rebase_progress_at = time.monotonic()
-                    elif current_progress[0] and current_progress[1] and time.monotonic() - rebase_progress_at > self.rebase_no_progress_seconds:
+                    elif current_progress[0] and current_progress[1] and time.monotonic() - rebase_progress_at > no_progress_limit:
                         self._terminate_process_group(process)
-                        message = f"Agent made no rebase progress for {self.rebase_no_progress_seconds} seconds while {len(current_progress[1])} conflict file(s) remained; its process group was terminated."
+                        message = f"Agent made no rebase progress for {no_progress_limit} seconds while {len(current_progress[1])} conflict file(s) remained; its process group was terminated."
                         failure = self._event("no_rebase_progress", message)
                         if on_event:
                             on_event(failure)
@@ -359,6 +376,30 @@ class SubprocessAgentAdapter:
         result, events = self._parse_result(stdout)
         if rebase_mode:
             self._record_rebase_state(workspace, evidence, seen_conflict_keys, on_event)
+            try:
+                sanitized_runtime = RunWorkspace.strip_runtime_from_head(workspace)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                message = f"Could not remove generated runtime files from the rebased commit: {exc}"
+                failure = self._event("runtime_sanitization_failed", message)
+                events.append(failure)
+                if on_event:
+                    on_event(failure)
+                return AgentRunResult(
+                    status="failed",
+                    summary=message,
+                    output=result.output if result else None,
+                    backend_session_id=result.backend_session_id if result else None,
+                    workspace_path=str(workspace.path),
+                    base_commit=workspace.base_commit,
+                    events=events,
+                    rebase_evidence=evidence,
+                )
+            if sanitized_runtime:
+                message = f"Removed {len(sanitized_runtime)} generated runtime file(s) from the rebased commit."
+                event = self._event("runtime_files_sanitized", message)
+                events.append(event)
+                if on_event:
+                    on_event(event)
             validation = RunWorkspace.validate_rebase(workspace, base_ref, initial_merges)
             if evidence is not None:
                 evidence["validation"] = [*evidence.get("validation", []), *validation["messages"]]
@@ -423,16 +464,17 @@ class SubprocessAgentAdapter:
         return {"type": event_type, "message": message, "createdAt": utc_now()}
 
     @staticmethod
-    def _prepare_opencode_profile(workspace: Path) -> list[Path]:
-        """Stage only OpenCode's config/auth files inside the isolated HOME."""
-        (workspace / ".local" / "share" / "opencode" / "log").mkdir(parents=True, exist_ok=True)
+    def _prepare_opencode_profile(workspace: Path, opencode_home: Path | None = None) -> list[Path]:
+        """Stage OpenCode config/auth under a run-local home outside the checkout."""
+        home = opencode_home or workspace.parent / ".opencode-home"
+        (home / ".local" / "share" / "opencode" / "log").mkdir(parents=True, exist_ok=True)
         user_home = Path.home()
         mappings = [
-            (user_home / ".local" / "share" / "opencode" / "auth.json", workspace / ".local" / "share" / "opencode" / "auth.json"),
-            (user_home / ".config" / "opencode" / "opencode.json", workspace / ".config" / "opencode" / "opencode.json"),
-            (user_home / ".config" / "opencode" / "opencode.jsonc", workspace / ".config" / "opencode" / "opencode.jsonc"),
-            (user_home / ".opencode" / "opencode.json", workspace / ".opencode" / "opencode.json"),
-            (user_home / ".opencode" / "opencode.jsonc", workspace / ".opencode" / "opencode.jsonc"),
+            (user_home / ".local" / "share" / "opencode" / "auth.json", home / ".local" / "share" / "opencode" / "auth.json"),
+            (user_home / ".config" / "opencode" / "opencode.json", home / ".config" / "opencode" / "opencode.json"),
+            (user_home / ".config" / "opencode" / "opencode.jsonc", home / ".config" / "opencode" / "opencode.jsonc"),
+            (user_home / ".opencode" / "opencode.json", home / ".opencode" / "opencode.json"),
+            (user_home / ".opencode" / "opencode.jsonc", home / ".opencode" / "opencode.jsonc"),
         ]
         copied: list[Path] = []
         for source, destination in mappings:
@@ -463,18 +505,59 @@ class SubprocessAgentAdapter:
             "#!/bin/sh\n"
             "command=''\n"
             "skip_next=0\n"
+            "broad_add=0\n"
+            "has_separator=0\n"
+            "continue_rebase=0\n"
             "for arg in \"$@\"; do\n"
             "  if [ \"$skip_next\" = 1 ]; then skip_next=0; continue; fi\n"
             "  case \"$arg\" in\n"
             "    -C|-c|--git-dir|--work-tree) skip_next=1 ;;\n"
+            "    --) has_separator=1 ;;\n"
+            "    -A|--all|.) broad_add=1 ;;\n"
             "    -*) ;;\n"
             "    *) command=\"$arg\"; break ;;\n"
             "  esac\n"
             "done\n"
+            "for arg in \"$@\"; do\n"
+            "  [ \"$arg\" = \"--continue\" ] && continue_rebase=1\n"
+            "done\n"
+            "if [ \"$command\" = \"add\" ]; then\n"
+            "  for arg in \"$@\"; do\n"
+            "    case \"$arg\" in\n"
+            "      --) has_separator=1 ;;\n"
+            "      -A|--all|.) broad_add=1 ;;\n"
+            "    esac\n"
+            "  done\n"
+            "fi\n"
+            "if [ \"$command\" = \"rebase\" ] && [ \"$continue_rebase\" = 1 ]; then\n"
+            "  # OpenCode may stage through its own process boundary; clean the index\n"
+            "  # immediately before rebase creates the commit.\n"
+            f"  {shlex.quote(git_path)} reset --quiet -- .config .local .npm .cache node_modules .venv \\\n"
+            "    ':(glob)**/*.db' ':(glob)**/*.db-wal' ':(glob)**/*.db-shm' \\\n"
+            "    ':(glob)**/*.sqlite' ':(glob)**/*.sqlite3' ':(glob)**/*.sqlite3-wal' ':(glob)**/*.sqlite3-shm'\n"
+            "fi\n"
             "if [ \"$command\" = \"merge\" ] || [ \"$command\" = \"push\" ]; then\n"
             "  printf '%s\\n' \"$command\" >> \"${MERGEOPS_GIT_GUARD_LOG:-/dev/null}\"\n"
             "  echo \"MergeOps guard: git $command is disabled inside agent runs.\" >&2\n"
             "  exit 64\n"
+            "fi\n"
+            "if [ \"$command\" = \"add\" ]; then\n"
+            "  if [ \"$broad_add\" = 1 ] && [ \"$has_separator\" = 0 ]; then\n"
+            f"    {shlex.quote(git_path)} \"$@\" -- . \\\n"
+            "      ':(exclude).config/**' ':(exclude).local/**' ':(exclude).npm/**' ':(exclude).cache/**' \\\n"
+            "      ':(exclude)node_modules/**' ':(exclude).venv/**' \\\n"
+            "      ':(exclude)**/*.db' ':(exclude)**/*.db-wal' ':(exclude)**/*.db-shm' \\\n"
+            "      ':(exclude)**/*.sqlite' ':(exclude)**/*.sqlite3' ':(exclude)**/*.sqlite3-wal' ':(exclude)**/*.sqlite3-shm'\n"
+            "  else\n"
+            f"    {shlex.quote(git_path)} \"$@\"\n"
+            "  fi\n"
+            "  status=$?\n"
+            "  if [ $status -eq 0 ]; then\n"
+            f"    {shlex.quote(git_path)} reset --quiet -- .config .local .npm .cache node_modules .venv \\\n"
+            "      ':(glob)**/*.db' ':(glob)**/*.db-wal' ':(glob)**/*.db-shm' \\\n"
+            "      ':(glob)**/*.sqlite' ':(glob)**/*.sqlite3' ':(glob)**/*.sqlite3-wal' ':(glob)**/*.sqlite3-shm'\n"
+            "  fi\n"
+            "  exit $status\n"
             "fi\n"
             f"exec {shlex.quote(git_path)} \"$@\"\n",
             encoding="utf-8",
@@ -534,7 +617,14 @@ class SubprocessAgentAdapter:
         for conflict in evidence.get("conflicts", []):  # type: ignore[union-attr]
             if not isinstance(conflict, dict):
                 continue
-            if conflict.get("validationState") != "unknown":
+            # A failed snapshot may have been taken while the rebase was
+            # paused with conflict markers still present. Once the rebase has
+            # moved on, validate it again against the final worktree. Keep a
+            # previously passed snapshot immutable so a later unrelated edit
+            # cannot rewrite the evidence for an earlier resolution.
+            if conflict.get("validationState") == "passed" or (
+                conflict.get("validationState") == "failed" and result_source != "worktree"
+            ):
                 continue
             result = RunWorkspace.read_snapshot(str(conflict.get("filePath", "")), result_source, workspace)
             ours = conflict.get("ours", {}).get("text", "") if isinstance(conflict.get("ours"), dict) else ""
@@ -611,7 +701,8 @@ class SubprocessAgentAdapter:
         unresolved = tuple(RunWorkspace.unmerged_files(workspace)) if active else ()
         head = RunWorkspace._git_optional_value(workspace.path, "rev-parse", "HEAD") or ""
         staged = RunWorkspace._git_optional_value(workspace.path, "diff", "--cached", "--name-only") or ""
-        return active, unresolved, head, staged
+        worktree = RunWorkspace._git_optional_value(workspace.path, "hash-object", "--", *unresolved) if unresolved else ""
+        return active, unresolved, head, f"{staged}\n{worktree or ''}"
 
 
 class RunWorkspace:
@@ -700,6 +791,51 @@ class RunWorkspace:
             raise RuntimeError(f"Existing workspace is not a repository root: {workspace}")
         base_commit = cls._git(workspace, "rev-parse", "HEAD").strip()
         return cls(workspace, base_commit)
+
+    @classmethod
+    def configure_runtime_excludes(cls, workspace: "RunWorkspace") -> None:
+        """Ignore tool-runtime files even when the agent bypasses MergeOps' git wrapper."""
+        git_dir = workspace.path / ".git"
+        if git_dir.is_file():
+            git_dir = Path((git_dir.read_text(encoding="utf-8").strip().split("gitdir:", 1)[-1]).strip())
+            if not git_dir.is_absolute():
+                git_dir = (workspace.path / git_dir).resolve()
+        exclude_file = git_dir / "info" / "exclude"
+        exclude_file.parent.mkdir(parents=True, exist_ok=True)
+        existing = exclude_file.read_text(encoding="utf-8") if exclude_file.exists() else ""
+        entries = [
+            "# MergeOps agent runtime files",
+            "/.config/",
+            "/.local/",
+            "/.npm/",
+            "/.cache/",
+            "/node_modules/",
+            "/.venv/",
+            "*.db",
+            "*.db-wal",
+            "*.db-shm",
+            "*.sqlite",
+            "*.sqlite3",
+            "*.sqlite3-wal",
+            "*.sqlite3-shm",
+        ]
+        missing = [entry for entry in entries if entry not in existing.splitlines()]
+        if missing:
+            separator = "" if not existing or existing.endswith("\n") else "\n"
+            exclude_file.write_text(existing + separator + "\n".join(missing) + "\n", encoding="utf-8")
+        hook = git_dir / "hooks" / "pre-commit"
+        if not hook.exists():
+            hook.parent.mkdir(parents=True, exist_ok=True)
+            hook.write_text(
+                "#!/bin/sh\n"
+                "# MergeOps keeps agent/tool runtime files out of every generated commit.\n"
+                "git reset --quiet -- .config .local .npm .cache node_modules .venv \\\n"
+                "  ':(glob)**/*.db' ':(glob)**/*.db-wal' ':(glob)**/*.db-shm' \\\n"
+                "  ':(glob)**/*.sqlite' ':(glob)**/*.sqlite3' ':(glob)**/*.sqlite3-wal' ':(glob)**/*.sqlite3-shm'\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            hook.chmod(0o755)
 
     @classmethod
     def prepare_rebase(cls, workspace: "RunWorkspace", base_branch: str | None) -> bool:
@@ -813,8 +949,42 @@ class RunWorkspace:
         return sorted(path for path in result.stdout.splitlines() if path and cls.is_runtime_path(path))
 
     @classmethod
+    def strip_runtime_from_head(cls, workspace: "RunWorkspace") -> list[str]:
+        """Remove generated files from a just-created rebase commit, preserving source changes."""
+        if cls.rebase_in_progress(workspace):
+            return []
+        result = subprocess.run(
+            ["git", "diff-tree", "--no-commit-id", "--name-only", "--diff-filter=ACMRTUXB", "-r", "HEAD"],
+            cwd=workspace.path,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        changed_paths = [path for path in result.stdout.splitlines() if path]
+        runtime_paths = sorted(path for path in changed_paths if cls.is_runtime_path(path))
+        if not runtime_paths:
+            return []
+        if len(runtime_paths) == len(changed_paths):
+            # The rebase produced a commit containing only agent runtime data.
+            # Dropping this isolated commit is safer than amending it into an
+            # empty commit and cannot discard a source change.
+            cls._git(workspace.path, "reset", "--hard", "HEAD^")
+            return runtime_paths
+        subprocess.run(
+            ["git", "update-index", "--force-remove", "-z", "--stdin"],
+            cwd=workspace.path,
+            input=("\0".join(runtime_paths) + "\0").encode(),
+            capture_output=True,
+            check=True,
+            timeout=120,
+        )
+        cls._git(workspace.path, "commit", "--amend", "--no-edit", "--no-verify")
+        return runtime_paths
+
+    @classmethod
     def is_runtime_path(cls, path: str) -> bool:
-        normalized = path.lstrip("./")
+        normalized = path[2:] if path.startswith("./") else path
         return normalized.startswith(cls.RUNTIME_PATH_PREFIXES) or normalized.endswith(cls.RUNTIME_FILE_SUFFIXES)
 
     @classmethod
@@ -882,7 +1052,28 @@ class RunWorkspace:
         theirs = cls.read_snapshot(path, "3", workspace)
         result = cls.read_snapshot(path, "worktree", workspace)
         ours_hunk, theirs_hunk, result_hunk = cls._conflict_hunks(ours["text"], theirs["text"], result["text"])
-        return {"id": f"{commit_sha or 'unknown'}:{path}", "commitSha": commit_sha, "commitSubject": commit_subject, "filePath": path, "ours": ours, "theirs": theirs, "result": result, "oursHunk": SubprocessAgentAdapter._bounded(ours_hunk), "theirsHunk": SubprocessAgentAdapter._bounded(theirs_hunk), "resultHunk": SubprocessAgentAdapter._bounded(result_hunk), "classification": cls.classify_resolution(ours["text"], theirs["text"], result["text"]), "validationState": "failed" if "<<<<<<<" in result["text"] else "unknown", "agentExplanation": "Git snapshots captured by MergeOps; agent transcript is supplementary.", "createdAt": utc_now()}
+        return {"id": f"{commit_sha or 'unknown'}:{path}", "commitSha": commit_sha, "commitSubject": commit_subject, "filePath": path, "ours": ours, "theirs": theirs, "result": result, "oursHunk": SubprocessAgentAdapter._bounded(ours_hunk), "theirsHunk": SubprocessAgentAdapter._bounded(theirs_hunk), "resultHunk": SubprocessAgentAdapter._bounded(result_hunk), "sections": cls._conflict_sections(result["text"]), "classification": cls.classify_resolution(ours["text"], theirs["text"], result["text"]), "validationState": "failed" if "<<<<<<<" in result["text"] else "unknown", "agentExplanation": "Git snapshots captured by MergeOps; agent transcript is supplementary.", "createdAt": utc_now()}
+
+    @staticmethod
+    def _conflict_sections(result: str) -> list[dict[str, object]]:
+        """Preserve each marker block so a completed run remains reviewable by conflict."""
+        lines = result.splitlines(keepends=True)
+        sections: list[dict[str, object]] = []
+        start = divider = -1
+        for index, line in enumerate(lines):
+            if line.startswith("<<<<<<<"):
+                start, divider = index, -1
+            elif start >= 0 and line.startswith("======="):
+                divider = index
+            elif start >= 0 and divider >= 0 and line.startswith(">>>>>>>"):
+                sections.append({
+                    "index": len(sections) + 1,
+                    "ours": SubprocessAgentAdapter._bounded("".join(lines[start + 1:divider])),
+                    "theirs": SubprocessAgentAdapter._bounded("".join(lines[divider + 1:index])),
+                    "result": SubprocessAgentAdapter._bounded("".join(lines[start:index + 1])),
+                })
+                start, divider = -1, -1
+        return sections
 
     @classmethod
     def _conflict_hunks(cls, ours: str, theirs: str, result: str, context: int = 3) -> tuple[str, str, str]:
@@ -991,18 +1182,21 @@ class RunWorkspace:
 
 def inspect_workspace(path: Path, required_checks: list[str] | None = None, committed_base: str | None = None) -> tuple[str, str, list[dict[str, object]], str]:
     """Capture the review material produced in an isolated workspace."""
-    stat = subprocess.run(["git", "diff", "--stat"], cwd=path, capture_output=True, text=True, check=False, timeout=30)
-    diff = subprocess.run(["git", "diff", "--no-ext-diff", "--unified=3"], cwd=path, capture_output=True, text=True, check=False, timeout=30)
+    excludes = [f":(exclude){prefix}**" for prefix in RunWorkspace.RUNTIME_PATH_PREFIXES]
+    excludes.extend(f":(exclude)**/*{suffix}" for suffix in RunWorkspace.RUNTIME_FILE_SUFFIXES)
+    pathspec = ["--", ".", *excludes]
+    stat = subprocess.run(["git", "diff", "--stat", *pathspec], cwd=path, capture_output=True, text=True, errors="replace", check=False, timeout=30)
+    diff = subprocess.run(["git", "diff", "--no-ext-diff", "--unified=3", *pathspec], cwd=path, capture_output=True, text=True, errors="replace", check=False, timeout=30)
     if not diff.stdout.strip() and committed_base:
-        stat = subprocess.run(["git", "diff", "--stat", committed_base], cwd=path, capture_output=True, text=True, check=False, timeout=30)
-        diff = subprocess.run(["git", "diff", "--no-ext-diff", "--unified=3", committed_base], cwd=path, capture_output=True, text=True, check=False, timeout=30)
+        stat = subprocess.run(["git", "diff", "--stat", committed_base, *pathspec], cwd=path, capture_output=True, text=True, errors="replace", check=False, timeout=30)
+        diff = subprocess.run(["git", "diff", "--no-ext-diff", "--unified=3", committed_base, *pathspec], cwd=path, capture_output=True, text=True, errors="replace", check=False, timeout=30)
     summary = stat.stdout.strip() or "No working-tree patch was produced."
     checks = []
     for command in required_checks or ["git diff --check"]:
         check_started = utc_now()
-        args = ["git", "diff", "--check"] if command == "git diff --check" else shlex.split(command)
+        args = ["git", "diff", "--check", *pathspec] if command == "git diff --check" else shlex.split(command)
         try:
-            result = subprocess.run(args, cwd=path, capture_output=True, text=True, check=False, timeout=120)
+            result = subprocess.run(args, cwd=path, capture_output=True, text=True, errors="replace", check=False, timeout=120)
             status = "passed" if result.returncode == 0 else "failed"
             output = (result.stdout + result.stderr).strip()[:20_000]
             check_summary = "Check passed." if result.returncode == 0 else f"Check exited with code {result.returncode}."

@@ -268,6 +268,13 @@ class BoundedText(BaseModel):
     originalLength: int = 0
 
 
+class ConflictSection(BaseModel):
+    index: int
+    ours: BoundedText = Field(default_factory=BoundedText)
+    theirs: BoundedText = Field(default_factory=BoundedText)
+    result: BoundedText = Field(default_factory=BoundedText)
+
+
 class ConflictEvidence(BaseModel):
     id: str
     commitSha: str | None = None
@@ -279,6 +286,7 @@ class ConflictEvidence(BaseModel):
     oursHunk: BoundedText = Field(default_factory=BoundedText)
     theirsHunk: BoundedText = Field(default_factory=BoundedText)
     resultHunk: BoundedText = Field(default_factory=BoundedText)
+    sections: list[ConflictSection] = Field(default_factory=list)
     classification: Literal["ours", "theirs", "combined", "manual", "added", "deleted", "unknown"] = "unknown"
     validationState: Literal["passed", "failed", "unknown"] = "unknown"
     agentExplanation: str | None = None
@@ -465,7 +473,7 @@ class RecoveryInspectionRequest(BaseModel):
 
 
 class PushAgentRunRequest(BaseModel):
-    target: Literal["mergeops_branch", "pr_branch"] = "mergeops_branch"
+    target: Literal["mergeops_branch", "pr_branch"] = "pr_branch"
 
 
 class UpdatePrTagsRequest(BaseModel):
