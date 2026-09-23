@@ -59,7 +59,7 @@ function matchesQueue(pr: PullRequest, queue: QueueFilter) {
   const status = statusFor(pr);
   return queue === "all"
     || (queue === "open" && pr.state === "open")
-    || (queue === "needs_you" && pr.state === "open" && (pr.unresolvedCommentCount > 0 || pr.reviewState === "changes_requested" || pr.reviewState === "review_required"))
+    || (queue === "needs_you" && pr.state === "open" && (pr.checkState === "failing" || pr.unresolvedCommentCount > 0 || pr.reviewState === "changes_requested" || pr.reviewState === "review_required"))
     || (queue === "conflict" && status === "conflict")
     || (queue === "review" && status === "review")
     || (queue === "ready" && status === "ready")
@@ -1576,11 +1576,11 @@ function PrDrawer(props: {
             <h3>Operational state</h3>
             <div className="kv-grid">
               <div className="kv"><span>Review</span><strong>{props.pr.reviewState.replace("_", " ")}</strong></div>
-              <div className="kv"><span>Checks</span><strong className={props.pr.checkState === "failing" ? "failure-copy" : ""}>{props.pr.checkState === "failing" ? <span className="check-indicator"><CircleAlert size={15} aria-hidden="true" />{t("checks.failed")}</span> : props.pr.checkState.replace("_", " ")}</strong></div>
+              <div className="kv"><span>Checks</span>{props.pr.checkState === "failing" ? <span className="failure-copy check-indicator"><CircleAlert size={15} aria-hidden="true" />{t("checks.failed")}</span> : <strong>{props.pr.checkState.replace("_", " ")}</strong>}</div>
               <div className="kv"><span>Age</span><strong>{props.pr.ageDays} days</strong></div>
               <div className="kv"><span>Comments</span><strong>{props.pr.unresolvedCommentCount}</strong></div>
             </div>
-            {props.pr.checkState === "failing" ? <div className="ci-alert" role="alert"><CircleAlert size={18} aria-hidden="true" /><span><strong>{t("checks.failed")}</strong><small>{t("checks.failedHelp")}</small></span></div> : null}
+            {props.pr.checkState === "failing" ? <div className="ci-alert" role="alert"><CircleAlert size={18} aria-hidden="true" /><span><span>{t("checks.failed")}</span><small>{t("checks.failedHelp")}</small></span></div> : null}
             <p className="drawer-meta"><strong>{props.pr.repositoryFullName ?? props.pr.repository}</strong> · {props.pr.sourceBranch} → {props.pr.baseBranch} · {props.pr.changedFilesCount} changed files</p>
           </section>
           <details className="detail-block review-feedback" open={reviewOpen} onToggle={(event) => toggleReview(event.currentTarget.open)}>

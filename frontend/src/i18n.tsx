@@ -68,7 +68,7 @@ const strings = {
     "cockpit.inspect": "Inspect",
     "cockpit.noMatch": "No PRs match this view",
     "cockpit.clearFilters": "Clear search, switch to All repos / All members, or check the sync result in Settings.",
-    "checks.failed": "CI checks failed",
+    "checks.failed": "ci failed",
     "checks.failedHelp": "One or more required CI checks failed. Review the check results before approving or pushing.",
     "actions.subtitle": "Checkout workspaces and agent sessions across the PR queue.",
     "actions.title": "Actions",
@@ -461,7 +461,7 @@ export const LocaleContext = createContext<{ locale: Locale; setLocale: (locale:
 
 const chineseExtras: Partial<Record<TranslationKey, string>> = {
   "cockpit.agentActive": "代理处理中",
-  "checks.failed": "CI 检查失败",
+  "checks.failed": "CI 失败",
   "checks.failedHelp": "一个或多个必需的 CI 检查失败。请在批准或推送前查看检查结果。",
   "actions.retry": "重试",
   "actions.retryFresh": "使用新工作区重试",

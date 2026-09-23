@@ -198,6 +198,7 @@ def _sync_repository(
         state = _state(detail)
         mergeable = _mergeable(detail.get("mergeable"))
         review_state = "review_required" if detail.get("requested_reviewers") else "commented" if comment_count else "approved"
+        check_state = _check_state(client, repository, detail)
 
         pull_request = PullRequest(
                 id=f"{repository.owner}-{repository.name}-{number}",
@@ -215,7 +216,7 @@ def _sync_repository(
                 reviewState=review_state,
                 unresolvedCommentCount=comment_count,
                 requestedReviewers=[_login(reviewer) for reviewer in detail.get("requested_reviewers", []) if _login(reviewer)],
-                checkState="pending",
+                checkState=check_state,
                 linkedIssueIds=[],
                 changedFilesCount=int(detail.get("changed_files") or 0),
                 ageDays=_age_days(str(detail.get("created_at") or "")),
@@ -274,6 +275,41 @@ def _mergeable(value: object) -> str:
     if value is False:
         return "conflicting"
     return "unknown"
+
+
+def _check_state(client: GitHubClient, repository: RepositoryConfig, detail: dict[str, object]) -> str:
+    labels = detail.get("labels")
+    if isinstance(labels, list) and any(
+        isinstance(label, dict) and str(label.get("name") or "").casefold() == "ci-failed"
+        for label in labels
+    ):
+        return "failing"
+    head = detail.get("head")
+    sha = head.get("sha") if isinstance(head, dict) else None
+    if not sha:
+        return "not_run"
+    try:
+        response = client.get_json(
+            f"/repos/{repository.owner}/{repository.name}/commits/{sha}/check-runs",
+            {"per_page": 100},
+        )
+    except (HTTPError, URLError, TimeoutError, ValueError):
+        return "pending"
+    check_runs = response.get("check_runs") if isinstance(response, dict) else None
+    if not isinstance(check_runs, list) or not check_runs:
+        return "not_run"
+
+    failing_conclusions = {"action_required", "cancelled", "failure", "startup_failure", "stale", "timed_out"}
+    has_pending = False
+    for check_run in check_runs:
+        if not isinstance(check_run, dict):
+            continue
+        if check_run.get("status") != "completed":
+            has_pending = True
+            continue
+        if str(check_run.get("conclusion") or "").casefold() in failing_conclusions:
+            return "failing"
+    return "pending" if has_pending else "passing"
 
 
 def _age_days(created_at: str) -> int:
