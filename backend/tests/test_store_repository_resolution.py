@@ -501,9 +501,14 @@ class StoreRepositoryResolutionTest(unittest.TestCase):
             (source / "README.md").write_text("original\n", encoding="utf-8")
             self._git(source, "add", "README.md")
             self._git(source, "commit", "-m", "initial")
+            skills_root = root / "skills"
+            skill = skills_root / "my-skill"
+            (skill / "references").mkdir(parents=True)
+            (skill / "SKILL.md").write_text("---\nname: my-skill\ndescription: Test skill\n---\n", encoding="utf-8")
+            (skill / "references" / "guide.md").write_text("Skill reference\n", encoding="utf-8")
             runner = root / "runner.js"
             runner.write_text(
-                "process.stdin.resume(); process.stdin.on('end', () => { console.log(JSON.stringify({type: 'log', message: 'runner started', createdAt: '2026-01-01T00:00:00.000Z'})); console.log(JSON.stringify({type: 'final', status: 'awaiting_approval', summary: `${process.cwd()}|${process.env.MERGEOPS_NO_PUSH}|${process.env.HOME}`})); });\n",
+                "process.stdin.resume(); process.stdin.on('end', () => { const fs = require('fs'); const skill = `${process.env.HOME}/.config/opencode/skills/my-skill`; console.log(JSON.stringify({type: 'log', message: 'runner started', createdAt: '2026-01-01T00:00:00.000Z'})); console.log(JSON.stringify({type: 'final', status: 'awaiting_approval', summary: `${process.cwd()}|${process.env.MERGEOPS_NO_PUSH}|${process.env.HOME}|${fs.readFileSync(`${skill}/SKILL.md`, 'utf8').includes('name: my-skill')}|${fs.readFileSync(`${skill}/references/guide.md`, 'utf8').trim()}`})); });\n",
                 encoding="utf-8",
             )
             request = AgentRunRequest(
@@ -517,15 +522,17 @@ class StoreRepositoryResolutionTest(unittest.TestCase):
                 base_branch="main",
             )
             adapter = SubprocessAgentAdapter("opencode", runner)
-            with patch.object(RunWorkspace, "root", root / "runs"):
+            with patch.object(RunWorkspace, "root", root / "runs"), patch.object(SubprocessAgentAdapter, "skills_root", skills_root):
                 result = adapter.create_run(request)
 
             self.assertEqual(result.status, "awaiting_approval")
             self.assertIsNotNone(result.workspace_path)
             workspace_path = Path(result.workspace_path or "")
             expected_home = workspace_path.parent / ".opencode-home"
-            self.assertIn(f"{result.workspace_path}|1|{expected_home}", result.summary)
+            self.assertIn(f"{result.workspace_path}|1|{expected_home}|true|Skill reference", result.summary)
             self.assertTrue((expected_home / ".local" / "share" / "opencode" / "log").is_dir())
+            self.assertTrue((expected_home / ".config" / "opencode" / "skills" / "my-skill" / "SKILL.md").is_file())
+            self.assertFalse((workspace_path / "skills").exists())
             self.assertFalse((workspace_path / ".local").exists())
             self.assertEqual([event["type"] for event in result.events or []], ["log", "final"])
 

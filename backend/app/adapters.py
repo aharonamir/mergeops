@@ -95,6 +95,7 @@ class SubprocessAgentAdapter:
     """Runs TypeScript-first agent SDKs behind a local Node process."""
 
     rebase_no_progress_seconds = 120
+    skills_root = Path(__file__).resolve().parents[2] / "skills"
 
     def __init__(self, backend_id: str, runner_path: Path) -> None:
         self.backend_id = backend_id
@@ -463,9 +464,9 @@ class SubprocessAgentAdapter:
     def _event(event_type: str, message: str) -> dict[str, object]:
         return {"type": event_type, "message": message, "createdAt": utc_now()}
 
-    @staticmethod
-    def _prepare_opencode_profile(workspace: Path, opencode_home: Path | None = None) -> list[Path]:
-        """Stage OpenCode config/auth under a run-local home outside the checkout."""
+    @classmethod
+    def _prepare_opencode_profile(cls, workspace: Path, opencode_home: Path | None = None) -> list[Path]:
+        """Stage OpenCode config, auth, and MergeOps skills outside the checkout."""
         home = opencode_home or workspace.parent / ".opencode-home"
         (home / ".local" / "share" / "opencode" / "log").mkdir(parents=True, exist_ok=True)
         user_home = Path.home()
@@ -482,13 +483,23 @@ class SubprocessAgentAdapter:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, destination)
                 copied.append(destination)
+        if cls.skills_root.is_dir():
+            destination = home / ".config" / "opencode" / "skills"
+            if destination.exists():
+                shutil.rmtree(destination)
+            shutil.copytree(cls.skills_root, destination)
+            # Keep the run's skill snapshot for inspection after the agent exits.
+            # A later attempt refreshes it from the current MergeOps skills root.
         return copied
 
     @staticmethod
     def _cleanup_opencode_profile(files: list[Path]) -> None:
         for path in files:
             try:
-                path.unlink(missing_ok=True)
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink(missing_ok=True)
             except OSError:
                 pass
 
