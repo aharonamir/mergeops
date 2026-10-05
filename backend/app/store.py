@@ -1594,7 +1594,15 @@ class LocalJsonStore:
                 raise ValueError("Each result needs English and Simplified Chinese summary and relevance text")
             for linked in item.linkedItems:
                 linked_url = urlparse(linked.url)
-                if linked_url.hostname != host or not linked_url.path.lstrip("/").startswith(item.repository + "/"):
+                linked_path = [part for part in linked_url.path.split("/") if part]
+                if (
+                    linked_url.scheme != "https"
+                    or linked_url.hostname != host
+                    or linked_url.username is not None
+                    or linked_url.password is not None
+                    or len(linked_path) < 4
+                    or linked_path[-1] != str(linked.number)
+                ):
                     raise ValueError("A linked item is outside the selected repository or service")
             key = (backend, item.repository, item.number)
             if key in seen:
