@@ -460,6 +460,100 @@ class SubprocessAgentAdapter:
             return None
         return {"type": event["type"], "message": message, "createdAt": event.get("createdAt") if isinstance(event.get("createdAt"), str) else utc_now()}
 
+    def create_search_run(
+        self,
+        run_id: str,
+        workspace: Path,
+        search_input: dict[str, object],
+        token: str | None,
+        timeout_seconds: int,
+        on_event: Callable[[dict[str, object]], None],
+        cancel_event: threading.Event,
+        process_identity: Callable[[int, int], None] | None = None,
+    ) -> AgentRunResult:
+        """Run a search in its own scratch directory without a repository checkout."""
+        workspace.mkdir(parents=True, exist_ok=False)
+        opencode_home = workspace.parent / f".{run_id}.opencode-home"
+        self._prepare_opencode_profile(workspace, opencode_home)
+        skill = str(search_input["skill"])
+        skill_path = self.skills_root / skill / "SKILL.md"
+        if not skill_path.is_file():
+            return AgentRunResult(status="failed", summary=f"Search skill is missing: {skill}", workspace_path=str(workspace))
+        skill_dir = workspace / ".agents" / "skills" / skill
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(skill_path, skill_dir / "SKILL.md")
+        user_home = Path.home()
+        profile_copies = {
+            user_home / ".codex" / "auth.json": opencode_home / ".codex" / "auth.json",
+            user_home / ".codex" / "config.toml": opencode_home / ".codex" / "config.toml",
+            user_home / ".claude" / ".credentials.json": opencode_home / ".claude" / ".credentials.json",
+            user_home / ".claude.json": opencode_home / ".claude.json",
+        }
+        for source, destination in profile_copies.items():
+            if source.is_file():
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+        payload: dict[str, object] = {
+            "backendId": self.backend_id,
+            "repository": ", ".join(search_input.get("repositories", [])) or "configured repositories",
+            "pullRequestId": run_id,
+            "pullRequestNumber": 1,
+            "action": "search",
+            "repositoryLocalPath": str(workspace),
+            "runnerTimeoutSeconds": timeout_seconds,
+            "search": search_input,
+        }
+        path_entries = [str(Path.home() / ".opencode" / "bin"), os.environ.get("PATH", "")]
+        environment = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL", "TMPDIR", "TERM") if key in os.environ}
+        environment.update({"PATH": os.pathsep.join(entry for entry in path_entries if entry), "HOME": str(opencode_home), "MERGEOPS_RUN_ID": run_id, "MERGEOPS_SEARCH_ONLY": "1"})
+        for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "ANTHROPIC_API_KEY"):
+            if key in os.environ:
+                environment[key] = os.environ[key]
+        if self.backend_id == "anthropic":
+            environment["CLAUDE_CONFIG_DIR"] = str(opencode_home / ".claude")
+        if token:
+            environment["GH_TOKEN" if search_input.get("searchBackend") == "github" else "GITCODE_TOKEN"] = token
+        try:
+            process = subprocess.Popen(["node", str(self.runner_path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", cwd=workspace, env=environment, start_new_session=True)
+            if process_identity:
+                process_identity(process.pid, process.pid)
+            started_at = time.monotonic()
+            input_json = json.dumps(payload)
+            while True:
+                try:
+                    stdout, stderr = process.communicate(input=input_json, timeout=0.25)
+                    break
+                except subprocess.TimeoutExpired:
+                    input_json = None
+                    if cancel_event.is_set():
+                        os.killpg(process.pid, signal.SIGTERM)
+                        stdout, stderr = process.communicate(timeout=5)
+                        return AgentRunResult(status="cancelled", summary="Search cancelled.", output=stdout[-20000:], workspace_path=str(workspace))
+                    if time.monotonic() - started_at >= timeout_seconds:
+                        os.killpg(process.pid, signal.SIGTERM)
+                        stdout, stderr = process.communicate(timeout=5)
+                        return AgentRunResult(status="failed", summary=f"Search exceeded the {timeout_seconds}-second timeout.", output=stdout[-20000:], workspace_path=str(workspace))
+            events: list[dict[str, object]] = []
+            final: dict[str, object] | None = None
+            for line in stdout.splitlines():
+                parsed = self._parse_event_line(line)
+                try:
+                    raw = json.loads(line)
+                except json.JSONDecodeError:
+                    raw = None
+                if isinstance(raw, dict) and raw.get("type") == "final":
+                    final = raw
+                elif parsed:
+                    events.append(parsed)
+                    on_event(parsed)
+            if cancel_event.is_set():
+                return AgentRunResult(status="cancelled", summary="Search cancelled.", output=str(final.get("output") or "")[-20000:] if final else None, events=events, workspace_path=str(workspace))
+            if process.returncode != 0 or not final or final.get("status") == "failed":
+                return AgentRunResult(status="failed", summary=str(final.get("summary") if final else stderr.strip() or "Search agent failed."), output=str(final.get("output") or "")[-20000:] if final else None, events=events, workspace_path=str(workspace))
+            return AgentRunResult(status="completed", summary="Search agent completed.", output=str(final.get("output") or ""), backend_session_id=str(final.get("backendSessionId") or "") or None, events=events, workspace_path=str(workspace))
+        except (OSError, subprocess.SubprocessError) as exc:
+            return AgentRunResult(status="failed", summary=f"Could not start search agent: {exc}", workspace_path=str(workspace))
+
     @staticmethod
     def _event(event_type: str, message: str) -> dict[str, object]:
         return {"type": event_type, "message": message, "createdAt": utc_now()}

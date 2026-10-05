@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -11,13 +12,14 @@ from tempfile import NamedTemporaryFile
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock, Thread
 from uuid import uuid4
+from urllib.parse import urlparse
 
 from pydantic import Field
 
 from .adapters import AgentRunRequest, AgentRunResult, RunWorkspace, SubprocessAgentAdapter, adapter_registry, inspect_workspace, utc_now
 from .fixtures import agent_backends, agent_runs, github_settings, pull_requests, team_members
 from .ledger import ExecutionLedger
-from .models import ActionRecord, ActionSummary, ActivityEvent, AgentFeedback, AgentRun, AgentRunEvent, AgentRunSummary, AgentSettings, AppData, ApprovalRecord, BoundedText, CheckResult, CheckoutResult, CreatePrNoteRequest, CreateRevisionRequest, CreateTeamMemberRequest, GitHubSettings, GitHubSettingsPublic, PostReviewRepliesRequest, PrAnnotations, PrNote, PullRequest, RebaseEvidence, ReplyDraft, ReplyResult, RepositoryConfig, ReviewThread, ReviewThreadComment, ReviewThreadSnapshot, ReviewDisposition, SelectedReviewThread, TeamMember, UpdateAgentSettingsRequest, UpdateGitHubSettingsRequest, UpdatePrNoteRequest, UpdateTeamMemberRequest
+from .models import ActionRecord, ActionSummary, ActivityEvent, AgentFeedback, AgentRun, AgentRunEvent, AgentRunSummary, AgentSettings, AppData, ApprovalRecord, BoundedText, CheckResult, CheckoutResult, CreatePrNoteRequest, CreateRevisionRequest, CreateTeamMemberRequest, GitHubSettings, GitHubSettingsPublic, PostReviewRepliesRequest, PrAnnotations, PrNote, PullRequest, RebaseEvidence, ReplyDraft, ReplyResult, RepositoryConfig, ReviewThread, ReviewThreadComment, ReviewThreadSnapshot, ReviewDisposition, SearchResult, SearchRun, SearchRunRequest, SearchSettings, SearchSettingsPublic, TeamMember, UpdateAgentSettingsRequest, UpdateGitHubSettingsRequest, UpdatePrNoteRequest, UpdateSearchSettingsRequest, UpdateTeamMemberRequest
 
 
 class PersistedAppData(AppData):
@@ -26,6 +28,7 @@ class PersistedAppData(AppData):
     githubPrivate: GitHubSettings
     prAnnotations: list[PrAnnotations] = Field(default_factory=list)
     reviewThreadSnapshots: list[ReviewThreadSnapshot] = Field(default_factory=list)
+    searchSettingsPrivate: SearchSettings = Field(default_factory=SearchSettings)
 
 
 class LocalJsonStore:
@@ -85,7 +88,9 @@ class LocalJsonStore:
         lease_thread = Thread(target=renew, name=f"mergeops-lease-{run_id}", daemon=True)
         lease_thread.start()
         try:
-            if payload.get("action") == "review_patch":
+            if payload.get("jobType") == "search":
+                self.execute_search_run(run_id)
+            elif payload.get("action") == "review_patch":
                 self.execute_patch_review(run_id, str(payload["backendId"]), str(payload["parentRunId"]))
             else:
                 self.execute_agent_run(run_id, str(payload["backendId"]), str(payload["pullRequestId"]), str(payload["action"]))
@@ -139,6 +144,29 @@ class LocalJsonStore:
             data.actions = [item.model_copy(update={"status": replacement.status, "summary": replacement.summary, "events": replacement.events, "recoveryNote": replacement.recoveryNote}) if item.id == run.id else item for item in data.actions]
             self.ledger.finish(run.id, "interrupted")
             changed = True
+        for run in data.searchRuns:
+            if run.status == "queued":
+                self.ledger.ensure_queued(run.id, {"jobType": "search"}, run.createdAt)
+            elif run.status == "running":
+                job = ledger_jobs.get(run.id)
+                process_pid = int(job["process_pid"]) if job and job.get("process_pid") else None
+                verified = False
+                if process_pid:
+                    try:
+                        command_line = Path(f"/proc/{process_pid}/cmdline").read_bytes().decode(errors="ignore")
+                        environment = Path(f"/proc/{process_pid}/environ").read_bytes()
+                        verified = "agent-runner" in command_line and f"MERGEOPS_RUN_ID={run.id}".encode() in environment
+                    except OSError:
+                        verified = False
+                if verified and job:
+                    try:
+                        os.killpg(int(job.get("process_group") or process_pid), 15)
+                    except OSError:
+                        pass
+                interrupted = run.model_copy(update={"status": "interrupted", "summary": "The backend restarted during this search. Start a new search to retry.", "completedAt": utc_now(), "events": [*run.events, {"type": "interrupted", "message": "The backend restarted during this search.", "createdAt": utc_now()}]})
+                data.searchRuns = [interrupted if item.id == run.id else item for item in data.searchRuns]
+                self.ledger.finish(run.id, "interrupted")
+                changed = True
         if changed:
             self._save(data)
 
@@ -1369,6 +1397,218 @@ class LocalJsonStore:
         self._save(data)
         return settings
 
+    def update_search_settings(self, payload: UpdateSearchSettingsRequest) -> SearchSettingsPublic:
+        data = self._load()
+        next_settings = data.searchSettingsPrivate.model_dump(mode="json")
+        patch = payload.model_dump(exclude_unset=True)
+        for key in ("githubReadToken", "gitcodeReadToken"):
+            value = patch.get(key)
+            if value in (None, ""):
+                patch.pop(key, None)
+            elif value == "__clear__":
+                patch[key] = None
+        next_settings.update(patch)
+        data.searchSettingsPrivate = SearchSettings.model_validate(next_settings)
+        public = self._public_search_settings(data.searchSettingsPrivate)
+        data.searchSettings = public
+        self._save(data)
+        return public
+
+    def queue_search_run(self, backend_id: str, payload: SearchRunRequest) -> SearchRun:
+        data = self._load()
+        enabled_agent = next((item for item in data.agentBackends if item.id == backend_id and item.enabled), None)
+        if enabled_agent is None:
+            raise ValueError("Selected agent backend is unavailable")
+        settings = data.searchSettingsPrivate
+        if settings.backend == "github":
+            repositories = [f"{item.owner}/{item.name}" for item in data.githubPrivate.repositories if item.enabled]
+            token = settings.githubReadToken
+        else:
+            repositories = list(dict.fromkeys(value.strip().strip("/") for value in settings.gitcodeRepositories if value.strip()))
+            token = settings.gitcodeReadToken
+        if not token:
+            raise ValueError(f"Add a read-only {settings.backend} search token in Settings → Search")
+        selected = list(dict.fromkeys(payload.repositoryIds))
+        if any(not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", name) for name in selected):
+            raise ValueError("Repositories must use owner/name format")
+        unknown = [name for name in selected if name not in repositories]
+        if unknown:
+            raise ValueError("Search includes repositories that are not configured for the selected backend")
+        if payload.memberId:
+            selected_member = next((member for member in data.teamMembers if member.id == payload.memberId), None)
+            if selected_member is None:
+                raise ValueError("Unknown team member filter")
+            if not selected_member.githubUsername or not re.fullmatch(r"[A-Za-z0-9_-]+", selected_member.githubUsername):
+                raise ValueError("Selected member needs a valid GitHub username for author filtering")
+        run_id = f"search-{uuid4().hex[:12]}"
+        created = utc_now()
+        run = SearchRun(
+            id=run_id, backendId=backend_id, searchBackend=settings.backend, query=payload.query.strip(), kind=payload.kind,
+            repositoryIds=selected, memberId=payload.memberId, locale=payload.locale, status="queued",
+            summary="Search queued.", events=[{"type": "queued", "message": "Search queued.", "createdAt": created}], createdAt=created,
+        )
+        active = [item for item in data.searchRuns if item.status in {"queued", "running"}]
+        history = [item for item in data.searchRuns if item.status not in {"queued", "running"}][:28]
+        data.searchRuns = [run, *active, *history]
+        self._save(data)
+        self.ledger.enqueue(run_id, {"jobType": "search"}, created)
+        return run
+
+    def search_run(self, run_id: str) -> SearchRun:
+        run = next((item for item in self._load().searchRuns if item.id == run_id), None)
+        if run is None:
+            raise ValueError("Unknown search run")
+        return run
+
+    def cancel_search_run(self, run_id: str) -> SearchRun:
+        data = self._load()
+        run = next((item for item in data.searchRuns if item.id == run_id), None)
+        if run is None:
+            raise ValueError("Unknown search run")
+        if run.status not in {"queued", "running"}:
+            return run
+        self.ledger.request_cancel(run_id)
+        event = {"type": "cancellation_requested", "message": "Stopping search agent…", "createdAt": utc_now()}
+        updated = run.model_copy(update={"summary": "Stopping search agent…", "events": [*run.events, event]})
+        data.searchRuns = [updated if item.id == run_id else item for item in data.searchRuns]
+        self._cancel_events.setdefault(run_id, Event()).set()
+        self._save(data)
+        return updated
+
+    def execute_search_run(self, run_id: str) -> SearchRun:
+        data = self._load()
+        run = next((item for item in data.searchRuns if item.id == run_id), None)
+        if run is None:
+            raise ValueError("Unknown search run")
+        if self.ledger.is_cancel_requested(run_id) or self._cancel_events.setdefault(run_id, Event()).is_set():
+            return self._finish_search(run, "cancelled", "Search cancelled before launch.")
+        settings = data.searchSettingsPrivate
+        token = settings.githubReadToken if run.searchBackend == "github" else settings.gitcodeReadToken
+        if not token:
+            return self._finish_search(run, "failed", "Read-only search credentials are no longer configured.")
+        workspace = Path.home() / ".mergeops" / "search-workspace" / run.id
+        run = run.model_copy(update={"status": "running", "summary": "Preparing isolated search workspace…", "workspacePath": str(workspace), "events": [*run.events, {"type": "running", "message": "Preparing isolated search workspace…", "createdAt": utc_now()}]})
+        with self._write_lock:
+            data = self._load()
+            data.searchRuns = [run if item.id == run_id else item for item in data.searchRuns]
+            self._save(data)
+        repository_names = run.repositoryIds
+        member = next((item for item in data.teamMembers if item.id == run.memberId), None) if run.memberId else None
+        skill = f"{run.searchBackend}-{'pr' if run.kind == 'pull_requests' else 'issue'}-search"
+        input_data = {"searchBackend": run.searchBackend, "kind": run.kind, "query": run.query, "repositories": repository_names, "member": member.githubUsername if member and member.githubUsername else None, "locale": run.locale, "skill": skill}
+        adapter = adapter_registry([(item.id, item.endpoint) for item in data.agentBackends if item.enabled]).get(run.backendId)
+        if not isinstance(adapter, SubprocessAgentAdapter):
+            return self._finish_search(run, "failed", "The selected agent backend does not have a local runner.")
+        cancel_event = self._cancel_events.setdefault(run.id, Event())
+        def record_event(event: dict[str, object]) -> None:
+            with self._write_lock:
+                latest = self._load()
+                current = next((item for item in latest.searchRuns if item.id == run_id), None)
+                if current is None:
+                    return
+                event_copy = {**event, "sequence": len(current.events) + 1}
+                replacement = current.model_copy(update={"summary": str(event.get("message") or current.summary), "events": [*current.events, event_copy]})
+                latest.searchRuns = [replacement if item.id == run_id else item for item in latest.searchRuns]
+                self._save(latest)
+        try:
+            result = adapter.create_search_run(run.id, workspace, input_data, token, data.agentSettings.runnerTimeoutSeconds, record_event, cancel_event, process_identity=lambda pid, group: self.ledger.heartbeat(run.id, self._worker_owner, process_pid=pid, process_group=group))
+        except Exception as exc:
+            self._cleanup_search_workspace(run.id)
+            return self._finish_search(run, "failed", f"Search agent failed: {exc}")
+        if result.status == "cancelled":
+            finished = self._finish_search(run, "cancelled", "Search cancelled.", result.output)
+            self._cleanup_search_workspace(run.id)
+            return finished
+        if result.status != "completed" or not result.output:
+            finished = self._finish_search(run, "failed", result.summary, result.output)
+            self._cleanup_search_workspace(run.id)
+            return finished
+        safe_output = result.output.replace(token, "[redacted]") if token else result.output
+        try:
+            parsed_results, search_errors = self._normalize_search_results(safe_output, run.searchBackend, run.kind, set(repository_names), member.githubUsername if member else None)
+        except ValueError as exc:
+            finished = self._finish_search(run, "formatting_error", f"The agent completed but returned invalid search results: {exc}", safe_output)
+            self._cleanup_search_workspace(run.id)
+            return finished
+        with self._write_lock:
+            latest = self._load()
+            current = next(item for item in latest.searchRuns if item.id == run_id)
+            summary = f"Found {len(parsed_results)} result(s)." + (f" {len(search_errors)} repository error(s)." if search_errors else "")
+            completed = current.model_copy(update={"status": "completed", "summary": summary, "results": parsed_results, "errors": search_errors, "rawOutput": safe_output[-20000:], "workspacePath": None, "completedAt": utc_now(), "events": [*current.events, {"type": "completed", "message": summary, "createdAt": utc_now()}]})
+            latest.searchRuns = [completed if item.id == run_id else item for item in latest.searchRuns]
+            self._save(latest)
+        self._cleanup_search_workspace(run.id)
+        return completed
+
+    @staticmethod
+    def _cleanup_search_workspace(run_id: str) -> None:
+        root = (Path.home() / ".mergeops" / "search-workspace").resolve()
+        workspace = (root / run_id).resolve()
+        if root in workspace.parents and workspace.name.startswith("search-"):
+            shutil.rmtree(workspace, ignore_errors=True)
+        shutil.rmtree(root / f".{run_id}.opencode-home", ignore_errors=True)
+
+    def _finish_search(self, run: SearchRun, status: str, message: str, output: str | None = None) -> SearchRun:
+        with self._write_lock:
+            data = self._load()
+            current = next((item for item in data.searchRuns if item.id == run.id), run)
+            updated = current.model_copy(update={"status": status, "summary": message, "rawOutput": output[-20000:] if output else current.rawOutput, "completedAt": utc_now(), "events": [*current.events, {"type": status, "message": message, "createdAt": utc_now()}]})
+            data.searchRuns = [updated if item.id == run.id else item for item in data.searchRuns]
+            self._save(data)
+        return updated
+
+    @staticmethod
+    def _normalize_search_results(output: str, backend: str, kind: str, repositories: set[str], expected_author: str | None = None) -> tuple[list[SearchResult], list[str]]:
+        candidate = output.strip()
+        if candidate.startswith("```"):
+            candidate = candidate.strip("`").split("\n", 1)[-1]
+        start, end = candidate.find("{"), candidate.rfind("}")
+        if start < 0 or end < start:
+            raise ValueError("No JSON result object was found")
+        try:
+            payload = json.loads(candidate[start:end + 1])
+        except json.JSONDecodeError as exc:
+            raise ValueError("The result JSON could not be parsed") from exc
+        if not isinstance(payload, dict) or payload.get("schemaVersion") != 1 or not isinstance(payload.get("results"), list) or not isinstance(payload.get("errors"), list):
+            raise ValueError("Expected schemaVersion 1, results, and errors arrays")
+        expected_kind = "pull_request" if kind == "pull_requests" else "issue"
+        host = "github.com" if backend == "github" else "gitcode.com"
+        normalized: list[SearchResult] = []
+        seen: set[tuple[str, str, int]] = set()
+        errors: list[str] = []
+        for error in payload["errors"][:len(repositories)]:
+            if not isinstance(error, dict) or error.get("repository") not in repositories or not isinstance(error.get("message"), str) or not error["message"].strip():
+                raise ValueError("A repository error is missing its configured repository or message")
+            errors.append(f"{error['repository']}: {error['message'][:1000]}")
+        for raw in payload["results"][:100]:
+            try:
+                item = SearchResult.model_validate(raw)
+            except Exception as exc:
+                raise ValueError("A result is missing required fields or bilingual text") from exc
+            parsed = urlparse(item.url)
+            if item.source != backend or item.kind != expected_kind or item.repository not in repositories or parsed.hostname != host or not parsed.path.lstrip("/").startswith(item.repository + "/"):
+                raise ValueError("A result source, type, repository, or URL is outside the requested search scope")
+            if expected_author and item.author.casefold() != expected_author.casefold():
+                raise ValueError("A result did not match the selected author filter")
+            if not all(item.summary.get(locale, "").strip() for locale in ("en", "zh")) or not all(item.reason.get(locale, "").strip() for locale in ("en", "zh")):
+                raise ValueError("Each result needs English and Simplified Chinese summary and relevance text")
+            for linked in item.linkedItems:
+                linked_url = urlparse(linked.url)
+                if linked_url.hostname != host or not linked_url.path.lstrip("/").startswith(item.repository + "/"):
+                    raise ValueError("A linked item is outside the selected repository or service")
+            key = (backend, item.repository, item.number)
+            if key in seen:
+                continue
+            seen.add(key)
+            item.summary = {locale: text[:4000] for locale, text in item.summary.items()}
+            item.reason = {locale: text[:1500] for locale, text in item.reason.items()}
+            normalized.append(item)
+        return normalized, errors
+
+    @staticmethod
+    def _public_search_settings(settings: SearchSettings) -> SearchSettingsPublic:
+        return SearchSettingsPublic(backend=settings.backend, gitcodeRepositories=settings.gitcodeRepositories, githubReady=bool(settings.githubReadToken), gitcodeReady=bool(settings.gitcodeReadToken))
+
     def replace_pull_requests(self, pull_requests: list[PullRequest], synced_at: str, errors: list[str]) -> PersistedAppData:
         data = self._load()
         if pull_requests or not errors:
@@ -1529,6 +1769,8 @@ class LocalJsonStore:
             approvals=data.approvals,
             prTags={item.pullRequestId: item.tags for item in data.prAnnotations if item.tags},
             github=self._public_github(data.githubPrivate),
+            searchSettings=self._public_search_settings(data.searchSettingsPrivate),
+            searchRuns=data.searchRuns,
         )
 
     @staticmethod

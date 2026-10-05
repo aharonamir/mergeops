@@ -1,5 +1,5 @@
 export type ThemePreference = "system" | "light" | "dark";
-export type View = "cockpit" | "team" | "agents" | "activity" | "settings";
+export type View = "cockpit" | "search" | "team" | "agents" | "activity" | "settings";
 export type QueueFilter = "all" | "open" | "conflict" | "review" | "ready" | "needs_you" | "merged" | "closed";
 
 export type TeamMember = {
@@ -72,6 +72,41 @@ export type AgentBackend = {
 
 export type AgentSettings = {
   runnerTimeoutSeconds: number;
+};
+
+export type SearchSettings = { backend: "github" | "gitcode"; gitcodeRepositories: string[]; githubReady: boolean; gitcodeReady: boolean };
+export type SearchResult = {
+  source: "github" | "gitcode";
+  kind: "pull_request" | "issue";
+  repository: string;
+  number: number;
+  url: string;
+  originalTitle: string;
+  author: string;
+  state: string;
+  match: "confirmed" | "semantic";
+  summary: { en: string; zh: string };
+  reason: { en: string; zh: string };
+  linkedItems: Array<{ kind: "pull_request" | "issue"; number: number; url: string }>;
+};
+export type SearchRun = {
+  id: string;
+  backendId: AgentBackend["id"];
+  searchBackend: "github" | "gitcode";
+  query: string;
+  kind: "pull_requests" | "issues";
+  repositoryIds: string[];
+  memberId?: string | null;
+  locale: "en" | "zh";
+  status: "queued" | "running" | "completed" | "failed" | "cancelled" | "formatting_error" | "interrupted";
+  summary: string;
+  results: SearchResult[];
+  rawOutput?: string | null;
+  errors: string[];
+  events: Array<{ type: string; message: string; createdAt: string }>;
+  workspacePath?: string | null;
+  createdAt: string;
+  completedAt?: string | null;
 };
 
 export type AgentRun = {
@@ -336,6 +371,8 @@ export type AppData = {
   activity?: ActivityEvent[];
   prTags?: Record<string, string[]>;
   github?: GitHubSettings | null;
+  searchSettings: SearchSettings;
+  searchRuns: SearchRun[];
 };
 
 export type GitHubSyncResult = {

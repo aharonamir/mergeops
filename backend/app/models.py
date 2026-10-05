@@ -85,6 +85,77 @@ class AgentSettings(BaseModel):
     runnerTimeoutSeconds: int = 600
 
 
+class SearchSettings(BaseModel):
+    backend: Literal["github", "gitcode"] = "github"
+    gitcodeRepositories: list[str] = Field(default_factory=list)
+    githubReadToken: str | None = None
+    gitcodeReadToken: str | None = None
+
+
+class SearchSettingsPublic(BaseModel):
+    backend: Literal["github", "gitcode"] = "github"
+    gitcodeRepositories: list[str] = Field(default_factory=list)
+    githubReady: bool = False
+    gitcodeReady: bool = False
+
+
+class SearchLinkedItem(BaseModel):
+    kind: Literal["pull_request", "issue"]
+    number: int = Field(gt=0)
+    url: str = Field(min_length=1, max_length=2000)
+
+
+class SearchResult(BaseModel):
+    source: Literal["github", "gitcode"]
+    kind: Literal["pull_request", "issue"]
+    repository: str
+    number: int = Field(gt=0)
+    url: str = Field(min_length=1, max_length=2000)
+    originalTitle: str = Field(min_length=1, max_length=500)
+    author: str = Field(min_length=1, max_length=200)
+    state: str = Field(min_length=1, max_length=80)
+    match: Literal["confirmed", "semantic"]
+    summary: dict[Literal["en", "zh"], str]
+    reason: dict[Literal["en", "zh"], str]
+    linkedItems: list[SearchLinkedItem] = Field(default_factory=list)
+
+
+class SearchRun(BaseModel):
+    id: str
+    backendId: Literal["opencode", "codex", "anthropic"]
+    searchBackend: Literal["github", "gitcode"]
+    query: str
+    kind: Literal["pull_requests", "issues"]
+    repositoryIds: list[str]
+    memberId: str | None = None
+    locale: Literal["en", "zh"]
+    status: Literal["queued", "running", "completed", "failed", "cancelled", "formatting_error", "interrupted"]
+    summary: str
+    results: list[SearchResult] = Field(default_factory=list)
+    rawOutput: str | None = None
+    errors: list[str] = Field(default_factory=list)
+    events: list[dict[str, object]] = Field(default_factory=list)
+    workspacePath: str | None = None
+    createdAt: str
+    completedAt: str | None = None
+
+
+class SearchRunRequest(BaseModel):
+    backendId: Literal["opencode", "codex", "anthropic"]
+    query: str = Field(min_length=1, max_length=2000)
+    kind: Literal["pull_requests", "issues"] = "pull_requests"
+    repositoryIds: list[str] = Field(min_length=1, max_length=100)
+    memberId: str | None = None
+    locale: Literal["en", "zh"] = "en"
+
+
+class UpdateSearchSettingsRequest(BaseModel):
+    backend: Literal["github", "gitcode"] = "github"
+    gitcodeRepositories: list[str] = Field(default_factory=list)
+    githubReadToken: str | None = None
+    gitcodeReadToken: str | None = None
+
+
 class ApprovalRecord(BaseModel):
     id: str
     runId: str
@@ -445,6 +516,8 @@ class AppData(BaseModel):
     approvals: list[ApprovalRecord] = []
     prTags: dict[str, list[str]] = Field(default_factory=dict)
     github: GitHubSettingsPublic | None = None
+    searchSettings: SearchSettingsPublic = SearchSettingsPublic()
+    searchRuns: list[SearchRun] = Field(default_factory=list)
 
 
 class CreateAgentRunRequest(BaseModel):

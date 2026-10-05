@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import StreamingResponse
 
 from .github_sync import sync_github_pull_requests
-from .models import AgentRun, AgentSettings, AppData, CheckoutResult, CreateAgentRunRequest, CreateCheckoutRequest, CreatePatchReviewRequest, CreatePrNoteRequest, CreateRevisionRequest, CreateTeamMemberRequest, GitHubSettingsPublic, GitHubSyncResult, PostReviewRepliesRequest, PrAnnotations, PushAgentRunRequest, RecoveryInspectionRequest, SelectRebaseDecisionRequest, TeamMember, UpdateAgentSettingsRequest, UpdateGitHubSettingsRequest, UpdatePrNoteRequest, UpdatePrTagsRequest, UpdateTeamMemberRequest
+from .models import AgentRun, AgentSettings, AppData, CheckoutResult, CreateAgentRunRequest, CreateCheckoutRequest, CreatePatchReviewRequest, CreatePrNoteRequest, CreateRevisionRequest, CreateTeamMemberRequest, GitHubSettingsPublic, GitHubSyncResult, PostReviewRepliesRequest, PrAnnotations, PushAgentRunRequest, RecoveryInspectionRequest, SearchRun, SearchRunRequest, SearchSettingsPublic, SelectRebaseDecisionRequest, TeamMember, UpdateAgentSettingsRequest, UpdateGitHubSettingsRequest, UpdatePrNoteRequest, UpdatePrTagsRequest, UpdateSearchSettingsRequest, UpdateTeamMemberRequest
 from .store import store
 
 github_sync_lock = threading.Lock()
@@ -63,6 +63,30 @@ async def health() -> dict[str, str]:
 @app.get("/api/app-data")
 async def get_app_data() -> AppData:
     return await _run_blocking(store.app_data)
+
+
+@app.post("/api/search-runs")
+async def post_search_run(payload: SearchRunRequest) -> SearchRun:
+    try:
+        return await _run_blocking(store.queue_search_run, payload.backendId, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/search-runs/{run_id}")
+async def get_search_run(run_id: str) -> SearchRun:
+    try:
+        return await _run_blocking(store.search_run, run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/search-runs/{run_id}/cancel")
+async def post_search_run_cancel(run_id: str) -> SearchRun:
+    try:
+        return await _run_blocking(store.cancel_search_run, run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.get("/api/actions/{action_id}/details")
@@ -301,6 +325,11 @@ async def patch_github_settings(payload: UpdateGitHubSettingsRequest) -> GitHubS
 @app.patch("/api/settings/agent")
 async def patch_agent_settings(payload: UpdateAgentSettingsRequest) -> AgentSettings:
     return await _run_blocking(store.update_agent_settings, payload)
+
+
+@app.patch("/api/settings/search")
+async def patch_search_settings(payload: UpdateSearchSettingsRequest) -> SearchSettingsPublic:
+    return await _run_blocking(store.update_search_settings, payload)
 
 
 @app.post("/api/sync/github")

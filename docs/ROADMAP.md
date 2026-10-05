@@ -151,16 +151,22 @@ Later hardening:
 
 ### Slice 6: Bilingual Search
 
-Goal: connect existing bilingual search skills to the cockpit.
+Goal: connect the GitHub and GitCode bilingual search skills to a dedicated
+Search page in the cockpit. Queries and displayed explanations support English
+and Simplified Chinese.
 
 Deliverables:
-- Search adapter wrapper.
-- English/Hebrew query support.
-- Results panel for PRs, issues, comments, and code references.
-- Repo/member scoped search.
+- Dedicated Search navigation and scrollable, collapsible PR/issue results.
+- Persisted GitHub/GitCode service choice; GitHub is the default.
+- Isolated, read-only search runs using the configured Codex, Claude, or
+  OpenCode agent and the corresponding PR/issue skill.
+- One validated bilingual result schema across agent SDK output formats.
+- Configured repository and author scoped searches, with cancellation and
+  persisted run status.
 
 Exit criteria:
-- Search results can explain why a PR or issue is relevant in either language.
+- Search results explain relevance in English and Simplified Chinese, follow
+  the live UX language toggle, and retain verified source links.
 
 ## Confirmed Stack
 

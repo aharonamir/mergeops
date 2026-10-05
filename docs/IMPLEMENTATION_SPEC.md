@@ -394,32 +394,24 @@ The system must distinguish:
 
 ## Bilingual Search Integration
 
-The search interface should accept English and Hebrew queries and search across:
-- PR title/body
-- issues
-- comments
-- review threads
-- labels
-- repository names
-- code references, if the existing skill supports it
+The dedicated Search page accepts English and Simplified Chinese queries and
+searches PRs or issues through the selected GitHub or GitCode skill. GitHub is
+the default search service. Search jobs run in temporary isolated workspaces;
+they are read-only and do not use the PR patch approval flow.
 
-The existing bilingual search skills need a small integration wrapper.
+The configured code agent may be Codex, Claude, or OpenCode. Each SDK adapter
+extracts its own final assistant response, then a shared validator normalizes
+and validates the versioned result schema before the UI renders anything.
+Search explanations carry both English and Simplified Chinese so the UX language
+toggle can change their display without rerunning the search. A malformed
+response becomes a visible formatting error with bounded raw output available
+for diagnosis.
 
-Required wrapper contract:
-
-```ts
-interface SearchAdapter {
-  search(input: {
-    query: string
-    languages: string[]
-    scopes: Array<"prs" | "issues" | "comments" | "code">
-    repositoryIds?: string[]
-    memberIds?: string[]
-  }): Promise<SearchResult[]>
-}
-```
-
-Open question: whether the skill is exposed as a CLI command, MCP tool, HTTP service, or local library.
+Search scope comes from repositories configured for the selected service, with
+optional author filtering. Search service credentials are separate,
+read-only tokens; never pass the GitHub remediation/push credential to a search
+agent. The Settings → Search section stores the service choice and its
+credentials, while the query and scope remain on the Search page.
 
 ## Approval Policy
 
@@ -537,10 +529,11 @@ GET /api/audit-log
 
 ### Milestone 6: Bilingual Search
 
-- Wrap existing bilingual search skill.
-- Add search result panel.
-- Link results to PRs/issues/comments.
-- Add repository and member scoped search.
+- Add GitHub/GitCode search service settings and isolated persisted search runs.
+- Wrap the four existing PR/issue skills with a shared bilingual result schema.
+- Add the dedicated Search page with repository/author scope and collapsible
+  source-linked results.
+- Normalize Codex, Claude, and OpenCode responses before rendering.
 
 ## Open Decisions
 

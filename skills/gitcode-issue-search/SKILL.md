@@ -159,22 +159,15 @@ also a useful signal on its own (an issue with no linked PR is likely still unad
 
 ## Step 4 — report
 
-The final answer is always in English, regardless of the source language of any
-issue title or body — translate as needed rather than quoting Chinese text verbatim.
+When run by MergeOps, return exactly one JSON object and no markdown fences:
 
-Group by repo. For each match, give exactly:
-- **Issue ID** (number, e.g. `#42`)
-- **Headline** — the issue title, translated to English if it wasn't already
-- **Summary** — a few sentences in English of what the issue actually reports or
-  requests, drawn from its body (translated) plus the title, not just a restated headline
+```json
+{"schemaVersion":1,"results":[{"source":"gitcode","kind":"issue","repository":"owner/name","number":42,"url":"https://gitcode.com/owner/name/issues/42","originalTitle":"Source title, unchanged","author":"source-login","state":"open|closed (DONE)","match":"confirmed|semantic","summary":{"en":"Accurate English summary.","zh":"准确的简体中文摘要。"},"reason":{"en":"Why this issue matches.","zh":"此 issue 相关的原因。"},"linkedItems":[{"kind":"pull_request","number":19,"url":"https://gitcode.com/owner/name/pull/19"}]}],"errors":[]}
+```
 
-Also state the issue's status (plain state plus the richer `issue_state_detail`
-when available, e.g. "closed (DONE)"), URL, and a one-line reason it matches. When
-Step 3.5 found linked PR(s), add their link(s) too (`PR: !<N> — <url>`) — omit the
-line entirely for issues with no linked PR. Separate **confirmed** (formally
-PR-linked, from Step 2a) from **likely** (semantic match only) when Step 2a
-applied. If a repo has zero matches, say so explicitly rather than omitting it.
-
-Open the report by naming the repo(s), query variant(s), state(s), and history
-limit that were actually searched (e.g. "Searched: 'budget governance', 'budget',
-'预算治理' — open issues only, last 60 days") so the user knows the scope.
+Include only verified links and evidence. `confirmed` means a formal linked PR;
+use `semantic` for meaning-based matches. Provide both English and Simplified
+Chinese for summary and reason regardless of the current UI language. Use an
+empty `results` array when there are no matches. Include failed repositories in
+`errors` as `{repository, message}` entries, while retaining valid results from
+successful repositories. Never fabricate a match or link to make the JSON complete.

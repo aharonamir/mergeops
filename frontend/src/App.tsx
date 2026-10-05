@@ -23,8 +23,8 @@ import {
   BellRing,
   CircleAlert
 } from "lucide-react";
-import { approveAgentRun, cancelAgentRun, checkBackendHealth, clearAction, clearAllActivity, clearAllAgentRuns, continueRebaseAgentRun, createAgentRun, createCheckout, createPrNote, createTeamMember, deletePrNote, deleteTeamMember, inspectRecoveryAgentRun, loadActionDetails, loadAppData, loadPrAnnotations, loadReviewThreads, postReviewReplies, pushAgentRun, revalidateManualRun, reviseAgentRun, retryAgentRun, reviewPatch, selectRebaseDecision, subscribeToAgentEvents, syncGitHub, updateAgentSettings, updateGitHubSettings, updatePrTags, updateTeamMember } from "./api";
-import type { ActionRecord, ActivityEvent, AgentBackend, AgentRun, AgentRunEvent, AgentRunSummary, AgentSettings, AppData, ConflictEvidence, GitHubSettings, GitHubSyncResult, PrAnnotations, PullRequest, QueueFilter, ReplyDraft, RepositoryConfig, ReviewThread, ReviewThreadSnapshot, TeamMember, ThemePreference, View } from "./types";
+import { approveAgentRun, cancelAgentRun, cancelSearchRun, checkBackendHealth, clearAction, clearAllActivity, clearAllAgentRuns, continueRebaseAgentRun, createAgentRun, createCheckout, createPrNote, createSearchRun, createTeamMember, deletePrNote, deleteTeamMember, inspectRecoveryAgentRun, loadActionDetails, loadAppData, loadPrAnnotations, loadReviewThreads, postReviewReplies, pushAgentRun, revalidateManualRun, reviseAgentRun, retryAgentRun, reviewPatch, selectRebaseDecision, subscribeToAgentEvents, syncGitHub, updateAgentSettings, updateGitHubSettings, updatePrTags, updateSearchSettings, updateTeamMember } from "./api";
+import type { ActionRecord, ActivityEvent, AgentBackend, AgentRun, AgentRunEvent, AgentRunSummary, AgentSettings, AppData, ConflictEvidence, GitHubSettings, GitHubSyncResult, PrAnnotations, PullRequest, QueueFilter, ReplyDraft, RepositoryConfig, ReviewThread, ReviewThreadSnapshot, SearchRun, SearchSettings, TeamMember, ThemePreference, View } from "./types";
 import { useLocale, type TranslationKey } from "./i18n";
 
 const themeIcons = {
@@ -35,6 +35,7 @@ const themeIcons = {
 
 const views: Array<{ id: View; label: string; icon: typeof GitPullRequest }> = [
   { id: "cockpit", label: "PR Cockpit", icon: GitPullRequest },
+  { id: "search", label: "Search", icon: Search },
   { id: "team", label: "Team Workspace", icon: Users },
   { id: "agents", label: "Actions", icon: Play },
   { id: "activity", label: "Activity", icon: Activity },
@@ -177,6 +178,7 @@ export function App() {
   }, []);
 
   const hasActiveWork = actions.some((action) => ["queued", "running", "patch_ready", "checks_running", "awaiting_decision"].includes(action.status));
+  const hasActiveSearch = Boolean(data?.searchRuns.some((run) => ["queued", "running"].includes(run.status)));
 
   useEffect(() => {
     if (!hasActiveWork) return;
@@ -185,6 +187,12 @@ export function App() {
     const timer = window.setInterval(refresh, 5000);
     return () => { unsubscribe(); window.clearInterval(timer); };
   }, [hasActiveWork]);
+
+  useEffect(() => {
+    if (!hasActiveSearch) return;
+    const timer = window.setInterval(() => { void loadAppData(false).then(setData).catch(() => undefined); }, 1800);
+    return () => window.clearInterval(timer);
+  }, [hasActiveSearch]);
 
   useEffect(() => {
     const resolved = theme === "system"
@@ -309,6 +317,21 @@ export function App() {
   async function saveAgentSettings(settings: AgentSettings) {
     const updated = await updateAgentSettings(settings);
     setData((current) => current ? { ...current, agentSettings: updated } : current);
+  }
+
+  async function saveSearchSettings(settings: { backend: SearchSettings["backend"]; gitcodeRepositories: string[]; githubReadToken?: string; gitcodeReadToken?: string }) {
+    const updated = await updateSearchSettings(settings);
+    setData((current) => current ? { ...current, searchSettings: updated } : current);
+  }
+
+  async function startSearch(input: { query: string; kind: SearchRun["kind"]; repositoryIds: string[]; memberId?: string }) {
+    const run = await createSearchRun({ ...input, backendId, locale });
+    setData((current) => current ? { ...current, searchRuns: [run, ...current.searchRuns.filter((item) => item.id !== run.id)] } : current);
+  }
+
+  async function stopSearch(runId: string) {
+    const run = await cancelSearchRun(runId);
+    setData((current) => current ? { ...current, searchRuns: current.searchRuns.map((item) => item.id === run.id ? run : item) } : current);
   }
 
   async function runGitHubSync() {
@@ -505,7 +528,7 @@ export function App() {
             return (
               <button key={view.id} className={`nav-item ${activeView === view.id ? "is-active" : ""}`} onClick={() => setActiveView(view.id)}>
                 <Icon size={18} />
-                <span>{t(({ cockpit: "nav.cockpit", team: "nav.team", agents: "nav.actions", activity: "nav.activity", settings: "nav.settings" } as const)[view.id])}</span>
+              <span>{t(({ cockpit: "nav.cockpit", search: "nav.search", team: "nav.team", agents: "nav.actions", activity: "nav.activity", settings: "nav.settings" } as const)[view.id])}</span>
               </button>
             );
           })}
@@ -556,6 +579,17 @@ export function App() {
             </div>
           </header>
         )}
+        {activeView === "search" && (
+          <SearchView
+            searchSettings={data.searchSettings}
+            repositories={data.searchSettings.backend === "github" ? (data.github?.repositories ?? []).filter((item) => item.enabled).map((item) => `${item.owner}/${item.name}`) : data.searchSettings.gitcodeRepositories}
+            members={data.teamMembers}
+            runs={data.searchRuns}
+            backendId={backendId}
+            onSearch={startSearch}
+            onCancel={stopSearch}
+          />
+        )}
 
         {activeView === "cockpit" && (
           <Cockpit
@@ -590,8 +624,8 @@ export function App() {
             onThemeChange={setTheme}
             dateRange={dateRange}
             onDateRangeChange={setDateRange}
-            query={query}
-            onQueryChange={setQuery}
+            searchSettings={data.searchSettings}
+            onSaveSearchSettings={saveSearchSettings}
             members={data.teamMembers}
             onOpenTeam={() => setActiveView("team")}
             github={data.github}
@@ -1239,6 +1273,88 @@ function ActivityView({ events, message, onClearAll }: { events: ActivityEvent[]
   );
 }
 
+function SearchView(props: {
+  searchSettings: SearchSettings;
+  repositories: string[];
+  members: TeamMember[];
+  runs: SearchRun[];
+  backendId: AgentBackend["id"];
+  onSearch: (input: { query: string; kind: SearchRun["kind"]; repositoryIds: string[]; memberId?: string }) => Promise<void>;
+  onCancel: (runId: string) => Promise<void>;
+}) {
+  const { t, locale } = useLocale();
+  const [query, setQuery] = useState("");
+  const [kind, setKind] = useState<SearchRun["kind"]>("pull_requests");
+  const [selectedRepos, setSelectedRepos] = useState<string[] | null>(null);
+  const [memberId, setMemberId] = useState("all");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [clearedResultId, setClearedResultId] = useState(() => window.localStorage.getItem("mergeops.search.clearedResultId"));
+  const activeRun = props.runs.find((run) => ["queued", "running"].includes(run.status));
+  const latestRun = props.runs[0];
+  const latestCompletedRun = props.runs.find((run) => run.status === "completed");
+  const resultsRun = latestCompletedRun?.id === clearedResultId ? undefined : latestCompletedRun;
+  const hasToken = props.searchSettings.backend === "github" ? props.searchSettings.githubReady : props.searchSettings.gitcodeReady;
+  const selected = selectedRepos ?? props.repositories;
+
+  useEffect(() => { setSelectedRepos([]); }, [props.repositories.join("|")]);
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    if (!query.trim() || !selected.length) return;
+    setBusy(true);
+    setError("");
+    try {
+      await props.onSearch({ query: query.trim(), kind, repositoryIds: selected, memberId: memberId === "all" ? undefined : memberId });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("search.failed"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function clearResults() {
+    if (!latestCompletedRun) return;
+    window.localStorage.setItem("mergeops.search.clearedResultId", latestCompletedRun.id);
+    setClearedResultId(latestCompletedRun.id);
+  }
+
+  return (
+    <section className="view is-visible search-view" aria-labelledby="searchTitle">
+      <div className="view-head"><div><h1 id="searchTitle">{t("search.title")}</h1><p>{t("search.subtitle")}</p></div><span className={`search-backend-chip ${props.searchSettings.backend}`}>{props.searchSettings.backend === "github" ? "GitHub" : "GitCode"}</span></div>
+      <form className="search-form" onSubmit={submit}>
+        <label className="search-query"><Search size={19} aria-hidden="true" /><span className="sr-only">{t("search.query")}</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("search.placeholder")} /></label>
+        <button className="primary-btn" type="submit" disabled={busy || Boolean(activeRun) || !hasToken || !props.repositories.length || !query.trim()}>{busy ? t("search.starting") : t("search.submit")}</button>
+        <div className="search-filters">
+          <label className="field"><span>{t("search.scope")}</span><select value={kind} onChange={(event) => setKind(event.target.value as SearchRun["kind"])}><option value="pull_requests">{t("search.pullRequests")}</option><option value="issues">{t("search.issues")}</option></select></label>
+          <fieldset className="search-repository-filter"><legend>{t("search.repositories")}</legend><div className="search-repository-list">{props.repositories.map((repository) => {
+            const checked = selectedRepos === null || selectedRepos.includes(repository);
+            return <label className={`search-repository-option ${checked ? "is-selected" : ""}`} key={repository}><input type="checkbox" checked={checked} onChange={(event) => setSelectedRepos((current) => {
+            const base = current ?? props.repositories;
+            const next = event.target.checked ? [...base, repository] : base.filter((item) => item !== repository);
+            return next.length === props.repositories.length ? null : next;
+          })} />{repository}</label>;
+          })}</div></fieldset>
+          <label className="field"><span>{t("search.member")}</span><select value={memberId} onChange={(event) => setMemberId(event.target.value)}><option value="all">{t("search.allMembers")}</option>{props.members.filter((member) => member.githubUsername).map((member) => <option value={member.id} key={member.id}>{member.displayName}</option>)}</select></label>
+        </div>
+      </form>
+      {!hasToken ? <p className="search-notice" role="status">{t("search.missingToken")}</p> : null}
+      {!props.repositories.length ? <p className="search-notice" role="status">{t("search.noRepositories")}</p> : null}
+      {error ? <p className="search-error" role="alert">{error}</p> : null}
+      {activeRun ? <div className="search-progress" role="status" aria-live="polite"><span className="health-dot" /><div><strong>{activeRun.searchBackend === "github" ? "GitHub" : "GitCode"} · {activeRun.status === "queued" ? t("search.queued") : t("search.running")}</strong><span>{activeRun.query}</span></div><button className="secondary-btn" type="button" onClick={() => void props.onCancel(activeRun.id)}>{t("search.cancel")}</button></div> : null}
+      {resultsRun ? <div className="search-result-heading"><div><h2>{t("search.results")}</h2><p>{resultsRun.repositoryIds.join(" · ")} · {resultsRun.searchBackend === "github" ? "GitHub" : "GitCode"} · {resultsRun.query}</p></div><div className="search-result-actions"><span>{t("search.resultCount", { count: resultsRun.results.length })}</span><button className="secondary-btn search-clear-btn" type="button" onClick={clearResults}>{t("search.clearResults")}</button></div></div> : null}
+      {resultsRun?.errors.length ? <div className="search-notice" role="status"><strong>{t("search.partialResults")}</strong><ul>{resultsRun.errors.map((item) => <li key={item}>{item}</li>)}</ul></div> : null}
+      {resultsRun?.results.length ? <div className="search-results" aria-label={t("search.results")}>{resultsRun.results.map((result) => <details className="search-result" key={`${result.source}-${result.kind}-${result.repository}-${result.number}`}>
+        <summary><span className="search-result-kind">{result.kind === "pull_request" ? "PR" : "ISSUE"} #{result.number}</span><span className="search-result-title">{result.originalTitle}</span><span className="search-result-repo">{result.repository} · @{result.author}</span><span className={`status search-result-state ${result.state.toLowerCase()}`}>{result.state}</span><span className="search-result-reason">{result.reason[locale]}</span></summary>
+        <div className="search-result-body"><p>{result.summary[locale]}</p><p><strong>{t("search.whyRelevant")}</strong> {result.reason[locale]}</p>{result.match === "confirmed" ? <span className="search-confirmed">{t("search.confirmed")}</span> : null}<div className="search-result-links"><a href={result.url} target="_blank" rel="noreferrer">{t("search.openSource")}</a>{result.linkedItems.map((item) => <a key={`${item.kind}-${item.number}`} href={item.url} target="_blank" rel="noreferrer">{item.kind === "issue" ? "Issue" : "PR"} #{item.number}</a>)}</div></div>
+      </details>)}</div> : resultsRun ? <div className="empty-state compact"><strong>{t("search.empty")}</strong><span>{t("search.emptyHelp")}</span></div> : null}
+      {latestCompletedRun && !resultsRun ? <div className="empty-state compact search-cleared" role="status"><strong>{t("search.cleared")}</strong><span>{t("search.clearedHelp")}</span></div> : null}
+      {latestRun && latestRun.status !== "completed" && !["queued", "running"].includes(latestRun.status) ? <div className="search-error" role="status"><strong>{t("search.runStatus", { status: latestRun.status.replace(/_/g, " ") })}</strong><span>{latestRun.summary}</span>{latestRun.rawOutput ? <details><summary>{t("search.rawOutput")}</summary><pre>{latestRun.rawOutput}</pre></details> : null}</div> : null}
+      {!props.runs.length ? <div className="search-welcome"><Search size={24} /><strong>{t("search.promptTitle")}</strong><span>{t("search.promptBody")}</span></div> : null}
+    </section>
+  );
+}
+
 function SettingsView(props: {
   backendId: AgentBackend["id"];
   backends: AgentBackend[];
@@ -1247,8 +1363,8 @@ function SettingsView(props: {
   onThemeChange: (theme: ThemePreference) => void;
   dateRange: number | "all";
   onDateRangeChange: (dateRange: number | "all") => void;
-  query: string;
-  onQueryChange: (query: string) => void;
+  searchSettings: SearchSettings;
+  onSaveSearchSettings: (settings: { backend: SearchSettings["backend"]; gitcodeRepositories: string[]; githubReadToken?: string; gitcodeReadToken?: string }) => Promise<void>;
   members: TeamMember[];
   onOpenTeam: () => void;
   github?: GitHubSettings | null;
@@ -1264,13 +1380,19 @@ function SettingsView(props: {
   const [username, setUsername] = useState(props.github?.username ?? "");
   const [repoText, setRepoText] = useState(formatRepositories(props.github?.repositories ?? []));
   const [runnerTimeoutSeconds, setRunnerTimeoutSeconds] = useState(props.agentSettings.runnerTimeoutSeconds);
+  const [searchBackend, setSearchBackend] = useState<SearchSettings["backend"]>(props.searchSettings.backend);
+  const [gitcodeRepos, setGitcodeRepos] = useState(props.searchSettings.gitcodeRepositories.join("\n"));
+  const [githubSearchToken, setGithubSearchToken] = useState("");
+  const [gitcodeSearchToken, setGitcodeSearchToken] = useState("");
   const [status, setStatus] = useState<string>("");
 
   useEffect(() => {
     setUsername(props.github?.username ?? "");
     setRepoText(formatRepositories(props.github?.repositories ?? []));
     setRunnerTimeoutSeconds(props.agentSettings.runnerTimeoutSeconds);
-  }, [props.github, props.agentSettings]);
+    setSearchBackend(props.searchSettings.backend);
+    setGitcodeRepos(props.searchSettings.gitcodeRepositories.join("\n"));
+  }, [props.github, props.agentSettings, props.searchSettings]);
 
   async function saveGitHub(event: React.FormEvent) {
     event.preventDefault();
@@ -1296,6 +1418,19 @@ function SettingsView(props: {
       setStatus(result.errors.length ? `${result.pullRequestsImported} PR · ${result.errors.length} ${locale === "zh" ? "个错误" : "errors"}` : `${result.pullRequestsImported} PR`);
     } catch {
       setStatus(t("settings.syncFailed"));
+    }
+  }
+
+  async function saveSearch(event: React.FormEvent) {
+    event.preventDefault();
+    setStatus(t("search.settingsSaving"));
+    try {
+      await props.onSaveSearchSettings({ backend: searchBackend, gitcodeRepositories: gitcodeRepos.split(/\s+/).map((item) => item.trim()).filter(Boolean), githubReadToken: githubSearchToken.trim() || undefined, gitcodeReadToken: gitcodeSearchToken.trim() || undefined });
+      setGithubSearchToken("");
+      setGitcodeSearchToken("");
+      setStatus(t("search.settingsSaved"));
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : t("search.settingsFailed"));
     }
   }
 
@@ -1350,7 +1485,17 @@ function SettingsView(props: {
           <div className="settings-panel is-visible"><h2>{t("settings.automation")}</h2><p className="settings-intro">{t("settings.policyIntro")}</p><div className="settings-notice"><strong>{t("settings.approvalGate")}</strong><span>{t("settings.approvalGateBody")}</span></div></div>
         )}
         {activeTab === "Search" && (
-          <div className="settings-panel is-visible"><h2>{t("settings.search")}</h2><p className="settings-intro">{t("settings.searchIntro")}</p><label className="field full"><span>{t("settings.currentQuery")}</span><input value={props.query} onChange={(event) => props.onQueryChange(event.target.value)} placeholder={t("search.placeholder")} /></label><div className="settings-notice"><strong>{t("settings.searchScope")}</strong><span>{t("settings.searchScopeBody")}</span></div></div>
+          <form className="settings-panel is-visible" onSubmit={saveSearch}>
+            <h2>{t("settings.search")}</h2>
+            <p className="settings-intro">{t("search.settingsIntro")}</p>
+            <div className="settings-grid">
+              <label className="field"><span>{t("search.backend")}</span><select value={searchBackend} onChange={(event) => setSearchBackend(event.target.value as SearchSettings["backend"])}><option value="github">GitHub</option><option value="gitcode">GitCode</option></select></label>
+              <label className="field"><span>{t("search.githubCredential")}</span><input type="password" value={githubSearchToken} onChange={(event) => setGithubSearchToken(event.target.value)} placeholder={props.searchSettings.githubReady ? t("search.tokenStored") : t("search.readOnlyToken")} /><small>{props.searchSettings.githubReady ? t("search.tokenStored") : t("search.tokenMissing")}</small></label>
+              <label className="field full"><span>{t("search.gitcodeRepositories")}</span><textarea rows={3} value={gitcodeRepos} onChange={(event) => setGitcodeRepos(event.target.value)} placeholder="openJiuwen/agent-core\nopenJiuwen/jiuwenswarm" /></label>
+              <label className="field full"><span>{t("search.gitcodeCredential")}</span><input type="password" value={gitcodeSearchToken} onChange={(event) => setGitcodeSearchToken(event.target.value)} placeholder={props.searchSettings.gitcodeReady ? t("search.tokenStored") : t("search.readOnlyToken")} /><small>{props.searchSettings.gitcodeReady ? t("search.tokenStored") : t("search.tokenMissing")}</small></label>
+            </div>
+            <div className="settings-actions"><button className="primary-btn" type="submit">{t("search.saveSettings")}</button>{status ? <span className="sync-status" role="status">{status}</span> : null}</div>
+          </form>
         )}
         {activeTab === "Preferences" && (
           <div className="settings-panel is-visible"><h2>{t("settings.preferences")}</h2><div className="settings-grid"><label className="field"><span>{t("settings.theme")}</span><select value={props.theme} onChange={(event) => props.onThemeChange(event.target.value as ThemePreference)}><option value="system">{t("settings.system")}</option><option value="light">{t("settings.light")}</option><option value="dark">{t("settings.dark")}</option></select></label><label className="field"><span>{t("settings.prAge")}</span><select value={props.dateRange} onChange={(event) => props.onDateRangeChange(event.target.value === "all" ? "all" : Number(event.target.value))}><option value="30">{t("filter.lastDays", { days: 30 })}</option><option value="60">{t("filter.lastDays", { days: 60 })}</option><option value="90">{t("filter.lastDays", { days: 90 })}</option><option value="all">{t("filter.allTime")}</option></select></label></div><p className="settings-intro">{t("settings.localPrefs")}</p></div>

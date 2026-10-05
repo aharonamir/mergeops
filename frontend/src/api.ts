@@ -1,5 +1,5 @@
 import { fixtureData } from "./fixtures";
-import type { ActionRecord, AgentRun, AgentSettings, AppData, CheckoutResult, GitHubSettings, GitHubSyncResult, PrAnnotations, ReplyDraft, RepositoryConfig, ReviewThreadSnapshot, TeamMember } from "./types";
+import type { ActionRecord, AgentRun, AgentSettings, AppData, CheckoutResult, GitHubSettings, GitHubSyncResult, PrAnnotations, ReplyDraft, RepositoryConfig, ReviewThreadSnapshot, SearchRun, SearchSettings, TeamMember } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "";
 
@@ -231,6 +231,30 @@ export async function updateAgentSettings(input: AgentSettings): Promise<AgentSe
     body: JSON.stringify(input)
   });
   if (!response.ok) throw new Error(`API returned ${response.status}`);
+  return await response.json();
+}
+
+export async function createSearchRun(input: { backendId: AgentRun["backendId"]; query: string; kind: SearchRun["kind"]; repositoryIds: string[]; memberId?: string; locale: "en" | "zh" }): Promise<SearchRun> {
+  const response = await fetch(`${API_BASE}/api/search-runs`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) });
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
+  return await response.json();
+}
+
+export async function loadSearchRun(runId: string): Promise<SearchRun> {
+  const response = await fetch(`${API_BASE}/api/search-runs/${runId}`);
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
+  return await response.json();
+}
+
+export async function cancelSearchRun(runId: string): Promise<SearchRun> {
+  const response = await fetch(`${API_BASE}/api/search-runs/${runId}/cancel`, { method: "POST" });
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
+  return await response.json();
+}
+
+export async function updateSearchSettings(input: { backend: SearchSettings["backend"]; gitcodeRepositories: string[]; githubReadToken?: string; gitcodeReadToken?: string }): Promise<SearchSettings> {
+  const response = await fetch(`${API_BASE}/api/settings/search`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) });
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
   return await response.json();
 }
 

@@ -217,5 +217,7 @@ export const fixtureData: AppData = {
       }
     ],
     lastSyncedAt: null
-  }
+  },
+  searchSettings: { backend: "github", gitcodeRepositories: [], githubReady: false, gitcodeReady: false },
+  searchRuns: []
 };
