@@ -172,9 +172,9 @@ agent_backends = [
     ),
     AgentBackend(
         id="anthropic",
-        displayName="Anthropic",
-        adapterType="Anthropic agent adapter",
-        endpoint="Anthropic API / internal runner",
+        displayName="Claude Code",
+        adapterType="Claude Code CLI adapter",
+        endpoint="local claude.ai CLI runner",
         defaultModel="Claude team default",
         enabled=True,
     ),

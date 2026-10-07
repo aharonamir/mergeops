@@ -295,27 +295,118 @@ async function runCodex(input: RunnerInput) {
 }
 
 async function runAnthropic(input: RunnerInput) {
+  let child: any;
+  let childExit: Promise<number | null> | undefined;
   try {
-    emit({ type: "log", message: "Loading Claude SDK" });
-    const { query } = await dynamicImport<{ query(params: { prompt: string; options: { cwd: string; permissionMode: string } }): AsyncIterable<unknown> }>("@anthropic-ai/claude-agent-sdk");
-    let finalSummary = "Claude run completed. Review the local diff before approval.";
-    for await (const message of query({ prompt: buildPrompt(input), options: { cwd: input.repositoryLocalPath, permissionMode: "default" } })) {
-      const maybeResult = message as { type?: string; subtype?: string; result?: string };
-      if (maybeResult.type) emit({ type: "log", message: `Claude event: ${maybeResult.type}${maybeResult.subtype ? `/${maybeResult.subtype}` : ""}` });
-      if (maybeResult.type === "result" && maybeResult.subtype === "success" && typeof maybeResult.result === "string") {
-        finalSummary = maybeResult.result;
-      }
+    const permissionMode = input.action === "review_pr" || input.action === "review_patch" ? "plan" : "auto";
+    const { spawn } = await dynamicImport<{ spawn(command: string, args: string[], options: Record<string, unknown>): any }>("node:child_process");
+    const claudeBin = process.env.MERGEOPS_CLAUDE_BIN ?? "claude";
+    let settings: unknown;
+    try {
+      settings = JSON.parse(process.env.MERGEOPS_CLAUDE_SETTINGS ?? "{}");
+    } catch {
+      throw new Error("MergeOps supplied invalid Claude sandbox settings.");
     }
-    emitFinal(input.action === "search" ? "completed" : input.action === "review_patch" ? "review_ready" : "awaiting_approval", input.action === "search" ? "Search agent completed." : finalSummary, undefined, input.action === "search" ? finalSummary : undefined);
+    const settingsText = JSON.stringify(settings);
+    emit({ type: "log", message: `Starting Claude Code in ${permissionMode} mode with Bash sandbox enabled` });
+    child = spawn(claudeBin, [
+      "-p", buildPrompt(input), "--safe-mode", "--no-session-persistence",
+      "--permission-mode", permissionMode, "--permission-prompts", "none",
+      "--tools", "Bash", "--settings", settingsText,
+      "--output-format", "stream-json", "--verbose",
+    ], { cwd: input.repositoryLocalPath, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+    childExit = new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", resolve);
+    });
+    let finalText = "";
+    let sessionId: string | undefined;
+    let modeVerified = false;
+    let resultSeen = false;
+    let permissionDenied = false;
+    let stderr = "";
+    const streamErrors: string[] = [];
+    child.stderr.on("data", (chunk: unknown) => { stderr += String(chunk); });
+    let pending = "";
+    const consumeLine = (line: string) => {
+      if (!line.trim()) return;
+      let event: any;
+      try { event = JSON.parse(line); } catch { return; }
+      if (event.type === "system" && event.subtype === "init") {
+        const reportedMode = event.permissionMode ?? event.permission_mode;
+        if (reportedMode !== permissionMode) {
+          throw new Error(`Claude startup reported permission mode ${String(reportedMode ?? "missing")}; expected ${permissionMode}.`);
+        }
+        modeVerified = true;
+        sessionId = typeof event.session_id === "string" ? event.session_id : undefined;
+        const tools = Array.isArray(event.tools) ? event.tools : [];
+        if (!tools.includes("Bash") || tools.some((tool: unknown) => tool !== "Bash")) {
+          throw new Error("Claude startup exposed tools beyond the required Bash-only tool set.");
+        }
+        emit({ type: "log", message: `Claude Code startup verified: ${permissionMode} mode, Bash only` });
+      } else if (event.type === "system" && event.subtype === "permission_denied") {
+        permissionDenied = true;
+        emit({ type: "log", message: "Claude Code denied an action that required interactive approval" });
+      } else if (event.type === "system") {
+        const detail = String(event.message ?? event.error ?? event.subtype ?? "Claude system event");
+        streamErrors.push(detail);
+        emit({ type: "log", message: `Claude Code ${String(event.subtype ?? "system event")}: ${detail.slice(0, 1200)}` });
+      } else if (event.type === "assistant" && event.error) {
+        const content = Array.isArray(event.message?.content)
+          ? event.message.content.filter((block: any) => block.type === "text").map((block: any) => block.text).join(" ")
+          : "";
+        const detail = `assistant error: ${String(event.error)}${content ? ` · ${String(content).slice(0, 1200)}` : ""}`;
+        streamErrors.push(detail);
+        emit({ type: "log", message: `Claude Code ${detail}` });
+      } else if (event.type === "error") {
+        const detail = String(event.message ?? event.error ?? "Claude Code stream error");
+        streamErrors.push(detail);
+        emit({ type: "log", message: `Claude Code error: ${detail.slice(0, 1200)}` });
+      } else if (event.type === "result") {
+        resultSeen = true;
+        if (typeof event.result === "string") finalText = event.result;
+        if (typeof event.session_id === "string") sessionId = event.session_id;
+        if (Array.isArray(event.permission_denials) && event.permission_denials.length) permissionDenied = true;
+        if (event.subtype !== "success" || event.is_error === true) {
+          const detail = Array.isArray(event.errors) ? event.errors.join("; ") : "";
+          const resultDetail = typeof event.result === "string" ? event.result : "";
+          throw new Error(`Claude Code run ended with ${String(event.subtype ?? "an error")}: ${detail || resultDetail}`);
+        }
+      }
+    };
+    for await (const chunk of child.stdout) {
+      pending += String(chunk);
+      const lines = pending.split("\n");
+      pending = lines.pop() ?? "";
+      for (const line of lines) consumeLine(line);
+    }
+    if (pending) consumeLine(pending);
+    const exitCode = await childExit;
+    if (!modeVerified) throw new Error("Claude Code did not report a startup event with the requested permission mode.");
+    if (!resultSeen || exitCode !== 0) {
+      const details = [stderr.trim().slice(-2000), ...streamErrors].filter(Boolean).slice(-4).join(" | ");
+      throw new Error(`Claude Code exited with code ${String(exitCode)}${details ? `: ${details}` : ""}`);
+    }
+    if (permissionDenied) throw new Error("Claude Code needed an interactive approval; the run was stopped and its isolated workspace was retained.");
+    emitFinal(
+      input.action === "search" ? "completed" : input.action === "review_pr" || input.action === "review_patch" ? "review_ready" : "awaiting_approval",
+      input.action === "search" ? "Search agent completed." : finalText || "Claude Code completed. Review the local diff before approval.",
+      sessionId,
+      finalText ? finalText.slice(-20000) : undefined,
+    );
   } catch (error) {
-    emitFinal("failed", missingDependencySummary("Claude", error));
+    if (child && child.exitCode == null) {
+      child.kill("SIGTERM");
+      try { await childExit; } catch { /* Preserve the original runner failure. */ }
+    }
+    emitFinal("failed", runnerFailureSummary("Claude Code", error));
   }
 }
 
 function buildPrompt(input: RunnerInput) {
   if (input.action === "search" && input.search) {
     return [
-      `Find the available agent skill named ${input.search.skill} for this ${input.search.searchBackend} ${input.search.kind} search. Locate it through skill discovery and follow its instructions. Do not substitute a different backend or search type.`,
+      `Read the skill instructions at .agents/skills/${input.search.skill}/SKILL.md with Bash and follow them for this ${input.search.searchBackend} ${input.search.kind} search. Do not substitute a different backend or search type.`,
       `Search backend: ${input.search.searchBackend}. Search type: ${input.search.kind}.`,
       `Search only these repositories: ${input.search.repositories.join(", ")}. Do not ask for repository selection.`,
       `Search concept or issue reference: ${input.search.query.slice(0, 2000)}.`,

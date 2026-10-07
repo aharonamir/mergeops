@@ -67,6 +67,88 @@ class FailedWorkspaceAdapter(CapturingAdapter):
 
 
 class StoreRepositoryResolutionTest(unittest.TestCase):
+    def test_anthropic_backend_can_queue_direct_pr_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            pull_request = PullRequest(
+                id="pr-claude-review", repository="service", repositoryFullName="owner/service", number=42,
+                title="Claude review", author="dev", ownerMemberId="dev", sourceBranch="feature", baseBranch="main",
+                state="open", mergeable="mergeable", reviewState="approved", unresolvedCommentCount=0,
+                requestedReviewers=[], checkState="passing", linkedIssueIds=[], changedFilesCount=1, ageDays=1,
+                summary="Review test", searchText="review",
+            )
+            data = self._data(pull_request)
+            data.agentBackends = [AgentBackend(
+                id="anthropic", displayName="Claude Code", adapterType="Claude Code CLI adapter",
+                endpoint="local claude.ai CLI runner", defaultModel="Claude team default", enabled=True,
+            )]
+            store = LocalJsonStore(root / "mergeops.local.json")
+            store._save(data)
+
+            run = store.queue_agent_run("anthropic", pull_request.id, "review_pr")
+
+            self.assertEqual(run.backendId, "anthropic")
+            self.assertEqual(run.action, "review_pr")
+            self.assertEqual(run.status, "queued")
+
+    def test_claude_profile_is_authenticated_and_sandbox_is_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_home = root / "source-home"
+            (source_home / ".claude").mkdir(parents=True)
+            (source_home / ".claude" / ".credentials.json").write_text('{"oauthAccount":{}}', encoding="utf-8")
+            (source_home / ".claude.json").write_text('{"oauthAccount":{}}', encoding="utf-8")
+            workspace = root / "checkout"
+            workspace.mkdir()
+            profile = root / ".claude-home"
+            auth_result = subprocess.CompletedProcess([], 0, '{"loggedIn":true,"authMethod":"claude.ai"}', "")
+
+            with patch("app.adapters.Path.home", return_value=source_home), \
+                    patch("app.adapters.shutil.which", return_value="/usr/bin/claude"), \
+                    patch("app.adapters.subprocess.run", return_value=auth_result) as run:
+                _binary, settings_json, staged = SubprocessAgentAdapter._prepare_claude_profile(workspace, profile, True)
+
+            settings = json.loads(settings_json)
+            self.assertTrue(settings["sandbox"]["enabled"])
+            self.assertTrue(settings["sandbox"]["failIfUnavailable"])
+            self.assertFalse(settings["sandbox"]["allowUnsandboxedCommands"])
+            self.assertEqual(settings["sandbox"]["filesystem"]["denyWrite"], [str(workspace.resolve())])
+            self.assertEqual(len(staged), 2)
+            self.assertEqual(staged[0].stat().st_mode & 0o777, 0o600)
+            self.assertEqual(run.call_args.args[0], ["/usr/bin/claude", "auth", "status", "--json"])
+            self.assertEqual(run.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"], str(profile / ".claude"))
+
+    def test_claude_profile_rejects_non_claude_auth_and_removes_staged_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_home = root / "source-home"
+            (source_home / ".claude").mkdir(parents=True)
+            credential = source_home / ".claude" / ".credentials.json"
+            credential.write_text("credential", encoding="utf-8")
+            with patch("app.adapters.Path.home", return_value=source_home), \
+                    patch("app.adapters.shutil.which", return_value="/usr/bin/claude"), \
+                    patch("app.adapters.subprocess.run", return_value=subprocess.CompletedProcess([], 0, '{"loggedIn":true,"authMethod":"apiKey"}', "")):
+                with self.assertRaisesRegex(RuntimeError, "not authenticated with claude.ai"):
+                    SubprocessAgentAdapter._prepare_claude_profile(root / "checkout", root / ".claude-home", False)
+            self.assertFalse((root / ".claude-home" / ".claude" / ".credentials.json").exists())
+
+    def test_claude_rejects_linked_worktree_git_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "source"
+            workspace = root / "workspace"
+            source.mkdir()
+            self._git(source, "init", "-b", "main")
+            self._git(source, "config", "user.email", "test@example.com")
+            self._git(source, "config", "user.name", "MergeOps Test")
+            (source / "README.md").write_text("source\n", encoding="utf-8")
+            self._git(source, "add", "README.md")
+            self._git(source, "commit", "-m", "initial")
+            subprocess.run(["git", "worktree", "add", str(workspace)], cwd=source, check=True, capture_output=True, text=True)
+
+            with self.assertRaisesRegex(RuntimeError, "Git metadata is outside the isolated checkout"):
+                SubprocessAgentAdapter._verify_isolated_git_metadata(workspace)
+
     def test_push_request_defaults_to_pr_branch(self) -> None:
         self.assertEqual(PushAgentRunRequest().target, "pr_branch")
 

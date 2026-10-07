@@ -176,12 +176,21 @@ class SubprocessAgentAdapter:
 
         # Keep mutable agent profiles outside the git checkout. Putting HOME
         # in the checkout risks adding runtime files during rebase continuation.
-        profile_home = workspace.path.parent / (".codex-home" if self.backend_id == "codex" else ".opencode-home")
-        profile_files = (
-            self._prepare_codex_profile(profile_home, request.action in {"fix_conflicts", "rebase"})
-            if self.backend_id == "codex"
-            else self._prepare_opencode_profile(workspace.path, profile_home)
-        )
+        profile_home = workspace.path.parent / {
+            "codex": ".codex-home", "anthropic": ".claude-home"
+        }.get(self.backend_id, ".opencode-home")
+        claude_bin: str | None = None
+        claude_settings: str | None = None
+        if self.backend_id == "codex":
+            profile_files = self._prepare_codex_profile(profile_home, rebase_mode)
+        elif self.backend_id == "anthropic":
+            self._verify_isolated_git_metadata(workspace.path)
+            claude_bin, claude_settings, profile_files = self._prepare_claude_profile(
+                workspace.path, profile_home,
+                review_only=request.action in {"review_pr", "review_patch"},
+            )
+        else:
+            profile_files = self._prepare_opencode_profile(workspace.path, profile_home)
         review_baseline = self._workspace_fingerprint(workspace.path) if request.action in {"review_patch", "review_pr"} else None
         git_guard = self._prepare_git_guard(workspace.path.parent)
         payload = {
@@ -225,6 +234,10 @@ class SubprocessAgentAdapter:
                 if codex_bin is None:
                     raise RuntimeError("Codex CLI is not installed or is missing from PATH.")
                 environment["MERGEOPS_CODEX_BIN"] = codex_bin
+            elif self.backend_id == "anthropic":
+                environment["CLAUDE_CONFIG_DIR"] = str(profile_home / ".claude")
+                environment["MERGEOPS_CLAUDE_BIN"] = claude_bin or "claude"
+                environment["MERGEOPS_CLAUDE_SETTINGS"] = claude_settings or "{}"
             process = subprocess.Popen(
                 ["node", str(self.runner_path)],
                 stdin=subprocess.PIPE,
@@ -417,7 +430,12 @@ class SubprocessAgentAdapter:
                 if validation["ok"] and runner_completed and not evidence.get("stages"):
                     self._append_stage(evidence, "rebase_completed", "Agent completed the rebase lifecycle without stopping on conflicts.", on_event, workspace, validation["finalHead"])
             if not validation["ok"] or result is None:
-                failure_message = "; ".join(validation["messages"]) if not validation["ok"] else "agent runner exited without a final result"
+                failure_parts = list(validation["messages"])
+                if result is None:
+                    failure_parts.append("agent runner exited without a final result")
+                elif result.status == "failed":
+                    failure_parts.append(result.summary)
+                failure_message = "; ".join(dict.fromkeys(failure_parts))
                 self._append_stage(evidence, "rebase_failed", failure_message, on_event, workspace, validation["finalHead"])
                 failure = self._event("rebase_validation_failed", failure_message)
                 events.append(failure)
@@ -480,8 +498,8 @@ class SubprocessAgentAdapter:
     ) -> AgentRunResult:
         """Run a search in its own scratch directory without a repository checkout."""
         workspace.mkdir(parents=True, exist_ok=False)
-        opencode_home = workspace.parent / f".{run_id}.opencode-home"
-        self._prepare_opencode_profile(workspace, opencode_home)
+        profile_name = "claude" if self.backend_id == "anthropic" else "opencode"
+        profile_home = workspace.parent / f".{run_id}.{profile_name}-home"
         skill = str(search_input["skill"])
         skill_path = self.skills_root / skill / "SKILL.md"
         if not skill_path.is_file():
@@ -489,17 +507,23 @@ class SubprocessAgentAdapter:
         skill_dir = workspace / ".agents" / "skills" / skill
         skill_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(skill_path, skill_dir / "SKILL.md")
+        claude_bin: str | None = None
+        claude_settings: str | None = None
+        profile_files: list[Path] = []
+        if self.backend_id == "anthropic":
+            claude_bin, claude_settings, profile_files = self._prepare_claude_profile(workspace, profile_home, True)
+        else:
+            profile_files = self._prepare_opencode_profile(workspace, profile_home)
         user_home = Path.home()
         profile_copies = {
-            user_home / ".codex" / "auth.json": opencode_home / ".codex" / "auth.json",
-            user_home / ".codex" / "config.toml": opencode_home / ".codex" / "config.toml",
-            user_home / ".claude" / ".credentials.json": opencode_home / ".claude" / ".credentials.json",
-            user_home / ".claude.json": opencode_home / ".claude.json",
+            user_home / ".codex" / "auth.json": profile_home / ".codex" / "auth.json",
+            user_home / ".codex" / "config.toml": profile_home / ".codex" / "config.toml",
         }
-        for source, destination in profile_copies.items():
-            if source.is_file():
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, destination)
+        if self.backend_id != "anthropic":
+            for source, destination in profile_copies.items():
+                if source.is_file():
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, destination)
         payload: dict[str, object] = {
             "backendId": self.backend_id,
             "repository": ", ".join(search_input.get("repositories", [])) or "configured repositories",
@@ -512,12 +536,14 @@ class SubprocessAgentAdapter:
         }
         path_entries = [str(Path.home() / ".opencode" / "bin"), os.environ.get("PATH", "")]
         environment = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL", "TMPDIR", "TERM") if key in os.environ}
-        environment.update({"PATH": os.pathsep.join(entry for entry in path_entries if entry), "HOME": str(opencode_home), "MERGEOPS_RUN_ID": run_id, "MERGEOPS_SEARCH_ONLY": "1"})
+        environment.update({"PATH": os.pathsep.join(entry for entry in path_entries if entry), "HOME": str(profile_home), "MERGEOPS_RUN_ID": run_id, "MERGEOPS_SEARCH_ONLY": "1"})
         for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "ANTHROPIC_API_KEY"):
             if key in os.environ:
                 environment[key] = os.environ[key]
         if self.backend_id == "anthropic":
-            environment["CLAUDE_CONFIG_DIR"] = str(opencode_home / ".claude")
+            environment["CLAUDE_CONFIG_DIR"] = str(profile_home / ".claude")
+            environment["MERGEOPS_CLAUDE_BIN"] = claude_bin or "claude"
+            environment["MERGEOPS_CLAUDE_SETTINGS"] = claude_settings or "{}"
         if token:
             environment["GH_TOKEN" if search_input.get("searchBackend") == "github" else "GITCODE_TOKEN"] = token
         try:
@@ -560,6 +586,8 @@ class SubprocessAgentAdapter:
             return AgentRunResult(status="completed", summary="Search agent completed.", output=str(final.get("output") or ""), backend_session_id=str(final.get("backendSessionId") or "") or None, events=events, workspace_path=str(workspace))
         except (OSError, subprocess.SubprocessError) as exc:
             return AgentRunResult(status="failed", summary=f"Could not start search agent: {exc}", workspace_path=str(workspace))
+        finally:
+            self._cleanup_opencode_profile(profile_files)
 
     @staticmethod
     def _event(event_type: str, message: str) -> dict[str, object]:
@@ -620,6 +648,75 @@ class SubprocessAgentAdapter:
             config.chmod(0o600)
             files.append(config)
         return files
+
+    @staticmethod
+    def _verify_isolated_git_metadata(workspace: Path) -> None:
+        """Claude may run arbitrary Bash, so ensure git writes cannot reach the source repo."""
+        root = workspace.resolve()
+        for option in ("--git-dir", "--git-common-dir"):
+            value = subprocess.run(
+                ["git", "rev-parse", option], cwd=root, check=True,
+                capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+            git_path = Path(value)
+            if not git_path.is_absolute():
+                git_path = (root / git_path).resolve()
+            else:
+                git_path = git_path.resolve()
+            if git_path != root and root not in git_path.parents:
+                raise RuntimeError(f"Claude workspace Git metadata is outside the isolated checkout: {git_path}")
+
+    @staticmethod
+    def _prepare_claude_profile(workspace: Path, profile_home: Path, review_only: bool) -> tuple[str, str, list[Path]]:
+        """Create an isolated claude.ai profile and fail unless it authenticates and sandboxes."""
+        claude_bin = shutil.which("claude")
+        if claude_bin is None:
+            raise RuntimeError("Claude Code CLI is not installed or is missing from PATH.")
+        source_home = Path.home()
+        config_dir = profile_home / ".claude"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        copied: list[Path] = []
+        for source, destination in (
+            (source_home / ".claude" / ".credentials.json", config_dir / ".credentials.json"),
+            (source_home / ".claude.json", profile_home / ".claude.json"),
+        ):
+            if source.is_file():
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+                destination.chmod(0o600)
+                copied.append(destination)
+        if not copied:
+            raise RuntimeError("Claude.ai sign-in was not found. Sign in with `claude` in your terminal, then retry.")
+
+        environment = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL", "TMPDIR") if key in os.environ}
+        environment.update({"HOME": str(profile_home), "CLAUDE_CONFIG_DIR": str(config_dir)})
+        try:
+            status = subprocess.run([claude_bin, "auth", "status", "--json"], env=environment,
+                                    capture_output=True, text=True, timeout=20)
+            auth = json.loads(status.stdout)
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+            SubprocessAgentAdapter._cleanup_opencode_profile(copied)
+            raise RuntimeError(f"Could not verify Claude.ai sign-in for this run: {exc}") from exc
+        if status.returncode != 0 or not isinstance(auth, dict) or not auth.get("loggedIn") or auth.get("authMethod") != "claude.ai":
+            SubprocessAgentAdapter._cleanup_opencode_profile(copied)
+            raise RuntimeError("The isolated Claude profile is not authenticated with claude.ai. Sign in again and retry.")
+
+        sandbox = {
+            "enabled": True,
+            "failIfUnavailable": True,
+            "allowUnsandboxedCommands": False,
+            "filesystem": {
+                "denyWrite": [str(workspace.resolve())] if review_only else [],
+                "denyRead": [str(profile_home.resolve())],
+            },
+            "credentials": {
+                "files": [{"path": str(path), "mode": "deny"} for path in copied],
+                "envVars": [{"name": name, "mode": "deny"} for name in
+                            ("GH_TOKEN", "GITHUB_TOKEN", "GITCODE_TOKEN", "ANTHROPIC_API_KEY")],
+            },
+        }
+        settings_json = json.dumps({"sandbox": sandbox, "permissions": {"blockReadsOutsideWorkingDirectories": True}})
+        return claude_bin, settings_json, copied
 
     @staticmethod
     def _cleanup_opencode_profile(files: list[Path]) -> None:

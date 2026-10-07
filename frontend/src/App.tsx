@@ -1476,7 +1476,7 @@ function SettingsView(props: {
             <h2>{t("settings.integrations")}</h2>
             <div className="settings-grid">
               <label className="field"><span>{t("settings.githubAccess")}</span><input readOnly value={t("settings.contributorToken")} /></label>
-              <label className="field"><span>{t("settings.backendSdk")}</span><select value={props.backendId} onChange={(event) => props.onBackendChange(event.target.value as AgentBackend["id"])}>{props.backends.map((backend) => <option key={backend.id} value={backend.id}>{backend.displayName}</option>)}</select></label>
+              <label className="field"><span>{t("settings.backendSdk")}</span><select value={props.backendId} onChange={(event) => props.onBackendChange(event.target.value as AgentBackend["id"])}>{props.backends.map((backend) => <option key={backend.id} value={backend.id}>{backend.id === "anthropic" ? t("backend.claudeCode") : backend.displayName}</option>)}</select></label>
               <label className="field"><span>{t("settings.endpoint")}</span><input readOnly value={t("settings.localSdk")} /><small>{t("settings.localSdkHelp")}</small></label>
               <label className="field"><span>{t("settings.timeout")}</span><input type="number" min="30" max="3600" step="30" value={runnerTimeoutSeconds} onChange={(event) => setRunnerTimeoutSeconds(Number(event.target.value) || 600)} /><small>{t("settings.defaultTimeout")}</small></label>
               <label className="field"><span>{t("settings.username")}</span><input value={username} onChange={(event) => setUsername(event.target.value)} placeholder="your-github-id" /></label>
@@ -1765,7 +1765,7 @@ function PrDrawer(props: {
             {isOpen ? (
               <div className="button-row">
                 <button className="secondary-btn" onClick={props.onCheckout}><FolderGit2 size={18} /><span>Checkout</span></button>
-                {props.backend.id === "codex" ? <button className="secondary-btn" type="button" onClick={props.onStartReview}><FileSearch size={18} /><span>{t("drawer.reviewWithCodex")}</span></button> : null}
+                {props.backend.id === "codex" || props.backend.id === "anthropic" ? <button className="secondary-btn" type="button" onClick={props.onStartReview}><FileSearch size={18} /><span>{t(props.backend.id === "codex" ? "drawer.reviewWithCodex" : "drawer.reviewWithClaudeCode")}</span></button> : null}
                 {plan?.action ? <button className="primary-btn" onClick={() => status === "review" ? toggleReview(true) : props.onStartRun([])}>{status === "review" ? <FileSearch size={18} /> : <Play size={18} />}<span>{status === "review" ? t("drawer.selectReviewComments") : plan.action}</span></button> : null}
               </div>
             ) : null}

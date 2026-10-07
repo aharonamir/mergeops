@@ -371,8 +371,8 @@ class LocalJsonStore:
         )
         if backend_id not in enabled_backends:
             raise ValueError("Unknown agent backend")
-        if action == "review_pr" and backend_id != "codex":
-            raise ValueError("Direct PR review is currently available with Codex only")
+        if action == "review_pr" and backend_id not in {"codex", "anthropic"}:
+            raise ValueError("Direct PR review is currently available with Codex and Claude Code")
         selected_threads: list[SelectedReviewThread] = []
         if action == "address_review":
             if not review_thread_ids:
