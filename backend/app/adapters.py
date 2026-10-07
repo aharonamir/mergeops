@@ -174,13 +174,15 @@ class SubprocessAgentAdapter:
                     on_event(event)
                 return result
 
-        # Keep OpenCode's mutable profile outside the git checkout. OpenCode
-        # writes logs, model caches, and snapshots below HOME; placing HOME in
-        # the checkout lets a normal `git add -A` accidentally commit them
-        # during `git rebase --continue`.
-        opencode_home = workspace.path.parent / ".opencode-home"
-        opencode_profile_files = self._prepare_opencode_profile(workspace.path, opencode_home)
-        review_baseline = self._workspace_fingerprint(workspace.path) if request.action == "review_patch" else None
+        # Keep mutable agent profiles outside the git checkout. Putting HOME
+        # in the checkout risks adding runtime files during rebase continuation.
+        profile_home = workspace.path.parent / (".codex-home" if self.backend_id == "codex" else ".opencode-home")
+        profile_files = (
+            self._prepare_codex_profile(profile_home, request.action in {"fix_conflicts", "rebase"})
+            if self.backend_id == "codex"
+            else self._prepare_opencode_profile(workspace.path, profile_home)
+        )
+        review_baseline = self._workspace_fingerprint(workspace.path) if request.action in {"review_patch", "review_pr"} else None
         git_guard = self._prepare_git_guard(workspace.path.parent)
         payload = {
             "backendId": request.backend_id,
@@ -213,11 +215,16 @@ class SubprocessAgentAdapter:
             }
             environment["PATH"] = os.pathsep.join(entry for entry in path_entries if entry)
             environment.update({
-                "HOME": str(opencode_home),
+                "HOME": str(profile_home),
                 "MERGEOPS_RUN_ID": request.run_id,
                 "MERGEOPS_NO_PUSH": "1",
                 "MERGEOPS_GIT_GUARD_LOG": str(git_guard.parent / "git-guard.log"),
             })
+            if self.backend_id == "codex":
+                codex_bin = shutil.which("codex")
+                if codex_bin is None:
+                    raise RuntimeError("Codex CLI is not installed or is missing from PATH.")
+                environment["MERGEOPS_CODEX_BIN"] = codex_bin
             process = subprocess.Popen(
                 ["node", str(self.runner_path)],
                 stdin=subprocess.PIPE,
@@ -360,15 +367,15 @@ class SubprocessAgentAdapter:
                 on_event(result.events[0])
             return result
         finally:
-            self._cleanup_opencode_profile(opencode_profile_files)
+            self._cleanup_opencode_profile(profile_files)
 
         if review_baseline is not None and self._workspace_fingerprint(workspace.path) != review_baseline:
-            event = self._event("error", "Patch review changed the workspace; review-only runs must leave files untouched.")
+            event = self._event("error", "Review changed the workspace; review-only runs must leave files untouched.")
             if on_event:
                 on_event(event)
             return AgentRunResult(
                 status="failed",
-                summary="Patch review changed the workspace; review-only runs must leave files untouched.",
+                summary="Review changed the workspace; review-only runs must leave files untouched.",
                 workspace_path=str(workspace.path),
                 base_commit=workspace.base_commit,
                 events=[event],
@@ -585,6 +592,34 @@ class SubprocessAgentAdapter:
             # Keep the run's skill snapshot for inspection after the agent exits.
             # A later attempt refreshes it from the current MergeOps skills root.
         return copied
+
+    @staticmethod
+    def _prepare_codex_profile(codex_home: Path, allow_rebase_git_writes: bool = False) -> list[Path]:
+        """Copy only the local Codex sign-in into a per-run HOME."""
+        if shutil.which("codex") is None:
+            raise RuntimeError("Codex CLI is not installed or is missing from PATH.")
+        source = Path.home() / ".codex" / "auth.json"
+        if not source.is_file():
+            raise RuntimeError("Codex sign-in is missing. Run `codex login` in your terminal, then retry.")
+        destination = codex_home / ".codex" / "auth.json"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        destination.chmod(0o600)
+        files = [destination]
+        if allow_rebase_git_writes:
+            config = destination.parent / "config.toml"
+            config.write_text(
+                'default_permissions = "mergeops-rebase"\n\n'
+                '[permissions.mergeops-rebase]\n'
+                'extends = ":workspace"\n\n'
+                '[permissions.mergeops-rebase.filesystem.":workspace_roots"]\n'
+                '"." = "write"\n'
+                '".git" = "write"\n',
+                encoding="utf-8",
+            )
+            config.chmod(0o600)
+            files.append(config)
+        return files
 
     @staticmethod
     def _cleanup_opencode_profile(files: list[Path]) -> None:

@@ -115,7 +115,7 @@ export type AgentRun = {
   repository: string;
   pullRequestId: string;
   pullRequestNumber: number;
-  action: "analyze" | "rebase" | "fix_conflicts" | "address_review" | "fix_checks" | "review_patch" | "revise_with_feedback";
+  action: "analyze" | "review_pr" | "rebase" | "fix_conflicts" | "address_review" | "fix_checks" | "review_patch" | "revise_with_feedback";
   status: "queued" | "running" | "patch_ready" | "review_ready" | "checks_running" | "awaiting_decision" | "awaiting_approval" | "approved" | "pushed" | "failed" | "cancelled" | "superseded" | "interrupted" | "recovery_required";
   requester: string;
   summary: string;

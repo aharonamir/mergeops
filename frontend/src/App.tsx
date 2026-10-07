@@ -255,8 +255,8 @@ export function App() {
   const ThemeIcon = themeIcons[theme];
   const repos = ["all", ...new Set(data.pullRequests.map((pr) => pr.repository))];
 
-  async function startRun(pr: PullRequest, reviewThreadIds: string[] = []) {
-    const action = reviewThreadIds.length ? "address_review" : pr.mergeable === "conflicting" ? "fix_conflicts" : "rebase";
+  async function startRun(pr: PullRequest, reviewThreadIds: string[] = [], requestedAction?: AgentRun["action"]) {
+    const action = requestedAction ?? (reviewThreadIds.length ? "address_review" : pr.mergeable === "conflicting" ? "fix_conflicts" : "rebase");
     setCheckoutMessage("Queueing agent run...");
     try {
       const run = await createAgentRun({ backendId, pullRequestId: pr.id, action, reviewThreadIds });
@@ -646,7 +646,8 @@ export function App() {
           annotations={annotations}
           canPushPrBranch={Boolean(data.github?.hasToken && selectedPr.headRepositoryFullName)}
           onClose={() => setSelectedPr(null)}
-            onStartRun={(reviewThreadIds) => startRun(selectedPr, reviewThreadIds)}
+          onStartRun={(reviewThreadIds) => startRun(selectedPr, reviewThreadIds)}
+          onStartReview={() => startRun(selectedPr, [], "review_pr")}
           onCheckout={() => checkoutPr(selectedPr)}
             onApproveRun={approveRun}
             onPushRun={pushRun}
@@ -1547,6 +1548,7 @@ function PrDrawer(props: {
   canPushPrBranch: boolean;
   onClose: () => void;
   onStartRun: (reviewThreadIds: string[]) => void;
+  onStartReview: () => void;
   onCheckout: () => void;
   onApproveRun: (runId: string) => Promise<void>;
   onPushRun: (runId: string, target?: "mergeops_branch" | "pr_branch") => Promise<void>;
@@ -1763,6 +1765,7 @@ function PrDrawer(props: {
             {isOpen ? (
               <div className="button-row">
                 <button className="secondary-btn" onClick={props.onCheckout}><FolderGit2 size={18} /><span>Checkout</span></button>
+                {props.backend.id === "codex" ? <button className="secondary-btn" type="button" onClick={props.onStartReview}><FileSearch size={18} /><span>{t("drawer.reviewWithCodex")}</span></button> : null}
                 {plan?.action ? <button className="primary-btn" onClick={() => status === "review" ? toggleReview(true) : props.onStartRun([])}>{status === "review" ? <FileSearch size={18} /> : <Play size={18} />}<span>{status === "review" ? t("drawer.selectReviewComments") : plan.action}</span></button> : null}
               </div>
             ) : null}

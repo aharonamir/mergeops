@@ -271,7 +271,7 @@ class AgentRun(BaseModel):
     repository: str
     pullRequestId: str
     pullRequestNumber: int
-    action: Literal["analyze", "rebase", "fix_conflicts", "address_review", "fix_checks", "review_patch", "revise_with_feedback"]
+    action: Literal["analyze", "review_pr", "rebase", "fix_conflicts", "address_review", "fix_checks", "review_patch", "revise_with_feedback"]
     status: Literal[
         "queued",
         "running",
@@ -523,7 +523,7 @@ class AppData(BaseModel):
 class CreateAgentRunRequest(BaseModel):
     backendId: str
     pullRequestId: str
-    action: Literal["analyze", "rebase", "fix_conflicts", "address_review", "fix_checks", "review_patch", "revise_with_feedback"]
+    action: Literal["analyze", "review_pr", "rebase", "fix_conflicts", "address_review", "fix_checks", "review_patch", "revise_with_feedback"]
     reviewThreadIds: list[str] = Field(default_factory=list)
 
 
