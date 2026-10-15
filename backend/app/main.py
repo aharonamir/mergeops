@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import StreamingResponse
 
 from .github_sync import sync_github_pull_requests
-from .models import AgentRun, AgentSettings, AppData, CheckoutResult, CreateAgentRunRequest, CreateCheckoutRequest, CreatePatchReviewRequest, CreatePrNoteRequest, CreateRevisionRequest, CreateTeamMemberRequest, GitHubSettingsPublic, GitHubSyncResult, PostReviewRepliesRequest, PrAnnotations, PushAgentRunRequest, RecoveryInspectionRequest, SearchRun, SearchRunRequest, SearchSettingsPublic, SelectRebaseDecisionRequest, TeamMember, UpdateAgentSettingsRequest, UpdateGitHubSettingsRequest, UpdatePrNoteRequest, UpdatePrTagsRequest, UpdateSearchSettingsRequest, UpdateTeamMemberRequest
+from .models import AgentRun, AgentSettings, AppData, CheckoutResult, CreateAgentRunRequest, CreateCheckoutRequest, CreatePatchReviewRequest, CreatePrNoteRequest, CreateRevisionRequest, CreateTeamMemberRequest, GitHubSettingsPublic, GitHubSyncResult, PostReviewRepliesRequest, PrAnnotations, PushAgentRunRequest, RecoveryInspectionRequest, SearchRun, SearchRunRequest, SearchSettingsPublic, SelectRebaseDecisionRequest, TeamMember, TranslateReviewRequest, UpdateAgentSettingsRequest, UpdateGitHubSettingsRequest, UpdatePrNoteRequest, UpdatePrTagsRequest, UpdateSearchSettingsRequest, UpdateTeamMemberRequest
 from .store import store
 
 github_sync_lock = threading.Lock()
@@ -128,6 +128,14 @@ async def post_agent_run_review(run_id: str, payload: CreatePatchReviewRequest) 
     try:
         run = await _run_blocking(store.queue_patch_review, payload.backendId, run_id)
         return run
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/agent-runs/{run_id}/translate")
+async def post_agent_run_translate(run_id: str, payload: TranslateReviewRequest) -> AgentRun:
+    try:
+        return await _run_blocking(store.translate_agent_review, run_id, payload.targetLocale)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 

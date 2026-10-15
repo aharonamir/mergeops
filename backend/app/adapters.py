@@ -36,6 +36,7 @@ class AgentRunRequest:
     source_branch: str | None = None
     review_diff: str | None = None
     previous_agent_output: str | None = None
+    target_language: str | None = None
     feedback_instruction: str | None = None
     feedback_reason: str | None = None
     selected_review_threads: list[dict[str, object]] | None = None
@@ -179,7 +180,7 @@ class SubprocessAgentAdapter:
         profile_home = workspace.path.parent / {
             "codex": ".codex-home", "anthropic": ".claude-home"
         }.get(self.backend_id, ".opencode-home")
-        review_baseline = self._workspace_fingerprint(workspace.path) if request.action in {"review_patch", "review_pr"} else None
+        review_baseline = self._workspace_fingerprint(workspace.path) if request.action in {"review_patch", "review_pr", "translate_review"} else None
         claude_bin: str | None = None
         claude_settings: str | None = None
         if self.backend_id == "codex":
@@ -188,7 +189,7 @@ class SubprocessAgentAdapter:
             self._verify_isolated_git_metadata(workspace.path)
             claude_bin, claude_settings, profile_files = self._prepare_claude_profile(
                 workspace.path, profile_home,
-                review_only=request.action in {"review_pr", "review_patch"},
+                review_only=request.action in {"review_pr", "review_patch", "translate_review"},
             )
         else:
             profile_files = self._prepare_opencode_profile(workspace.path, profile_home)
@@ -209,6 +210,7 @@ class SubprocessAgentAdapter:
             "conflictFiles": [],
             "reviewDiff": request.review_diff,
             "previousAgentOutput": request.previous_agent_output,
+            "targetLanguage": request.target_language,
             "feedbackInstruction": request.feedback_instruction,
             "feedbackReason": request.feedback_reason,
             "selectedReviewThreads": request.selected_review_threads,

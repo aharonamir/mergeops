@@ -35,9 +35,10 @@ deterministic harness.
 - **Human-controlled writes:** agent work happens in a per-run isolated
   workspace. A push is a separate action that requires explicit approval;
   agents do not receive push authority.
-- **One runner for multiple agents:** select OpenCode, Codex, or Claude through
-  the same local TypeScript runner boundary. Runs persist progress and audit
-  events and can be cancelled.
+- **Multiple agent backends:** select OpenCode, Codex, or Claude Code through
+  the same local TypeScript runner boundary. Direct PR reviews are supported
+  with Codex and Claude Code. Runs persist progress and audit events and can be
+  cancelled.
 - **Bilingual search:** search issues or pull requests in English or Simplified
   Chinese using GitHub or GitCode. Search runs in a temporary isolated,
   read-only workspace and uses the matching PR or issue search skill. Results

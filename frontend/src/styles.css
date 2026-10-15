@@ -513,6 +513,49 @@ h1 {
   margin: 8px 0 0;
   white-space: pre-wrap;
 }
+
+.review-markdown {
+  display: grid;
+  gap: 12px;
+  max-width: 82ch;
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+
+.review-markdown h1,
+.review-markdown h2,
+.review-markdown h3,
+.review-markdown h4,
+.review-markdown p,
+.review-markdown ul,
+.review-markdown ol,
+.review-markdown blockquote,
+.review-markdown pre { margin: 0; }
+
+.review-markdown h1,
+.review-markdown h2 { font-size: 18px; line-height: 1.35; }
+.review-markdown h3 { font-size: 16px; line-height: 1.4; }
+.review-markdown h4 { font-size: 14px; line-height: 1.4; }
+.review-markdown ul,
+.review-markdown ol { display: grid; gap: 5px; padding-left: 22px; }
+.review-markdown li::marker { color: var(--accent); }
+.review-markdown strong { color: var(--ink); }
+.review-markdown code { padding: 1px 4px; border-radius: 3px; background: var(--surface-2); font: 12px/1.5 var(--mono); }
+.review-markdown pre { max-width: 100%; overflow: auto; padding: 10px 12px; border-radius: var(--radius); background: var(--surface-2); white-space: pre-wrap; }
+.review-markdown pre code { padding: 0; background: transparent; }
+.review-markdown blockquote { display: grid; gap: 6px; padding: 9px 12px; border-radius: var(--radius); background: var(--surface-2); color: var(--muted); }
+.review-markdown a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+.review-report-empty { margin: 0; color: var(--muted); }
+.review-report-section { border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; background: var(--surface); }
+.review-report-section .section-title { margin-bottom: 2px; }
+.review-report-display { display: grid; gap: 10px; }
+.translation-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; color: var(--muted); font-size: 12px; }
+.translation-controls .text-btn { min-height: 32px; }
+.translation-error { flex-basis: 100%; margin: 0; color: var(--red); }
+.review-panel > .review-markdown { padding-top: 8px; border-top: 1px solid var(--line); }
+
 .run-events time { display: block; margin-top: 2px; font: 11px/1.2 var(--mono); }
 
 .review-material {

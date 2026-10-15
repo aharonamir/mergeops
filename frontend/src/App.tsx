@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ElementType, type ReactNode } from "react";
 import {
   GitPullRequest,
   Activity,
@@ -23,7 +23,7 @@ import {
   BellRing,
   CircleAlert
 } from "lucide-react";
-import { approveAgentRun, cancelAgentRun, cancelSearchRun, checkBackendHealth, clearAction, clearAllActivity, clearAllAgentRuns, continueRebaseAgentRun, createAgentRun, createCheckout, createPrNote, createSearchRun, createTeamMember, deletePrNote, deleteTeamMember, inspectRecoveryAgentRun, loadActionDetails, loadAppData, loadPrAnnotations, loadReviewThreads, postReviewReplies, pushAgentRun, revalidateManualRun, reviseAgentRun, retryAgentRun, reviewPatch, selectRebaseDecision, subscribeToAgentEvents, syncGitHub, updateAgentSettings, updateGitHubSettings, updatePrTags, updateSearchSettings, updateTeamMember } from "./api";
+import { approveAgentRun, cancelAgentRun, cancelSearchRun, checkBackendHealth, clearAction, clearAllActivity, clearAllAgentRuns, continueRebaseAgentRun, createAgentRun, createCheckout, createPrNote, createSearchRun, createTeamMember, deletePrNote, deleteTeamMember, inspectRecoveryAgentRun, loadActionDetails, loadAppData, loadPrAnnotations, loadReviewThreads, postReviewReplies, pushAgentRun, revalidateManualRun, reviseAgentRun, retryAgentRun, reviewPatch, selectRebaseDecision, subscribeToAgentEvents, syncGitHub, translateAgentReview, updateAgentSettings, updateGitHubSettings, updatePrTags, updateSearchSettings, updateTeamMember } from "./api";
 import type { ActionRecord, ActivityEvent, AgentBackend, AgentRun, AgentRunEvent, AgentRunSummary, AgentSettings, AppData, ConflictEvidence, GitHubSettings, GitHubSyncResult, PrAnnotations, PullRequest, QueueFilter, ReplyDraft, RepositoryConfig, ReviewThread, ReviewThreadSnapshot, SearchRun, SearchSettings, TeamMember, ThemePreference, View } from "./types";
 import { useLocale, type TranslationKey } from "./i18n";
 
@@ -113,7 +113,7 @@ function drawerPlan(status: string) {
 }
 
 function actionFromRun(run: AgentRun): ActionRecord {
-  return { id: run.id, kind: "agent_run", repository: run.repository, pullRequestId: run.pullRequestId, pullRequestNumber: run.pullRequestNumber, action: run.action, status: run.status, summary: run.summary, rootRunId: run.rootRunId, parentRunId: run.parentRunId, supersededByRunId: run.supersededByRunId, feedback: run.feedback, agentOutput: run.agentOutput, workspacePath: run.workspacePath, baseCommit: run.baseCommit, events: run.events, patchSummary: run.patchSummary, diff: run.diff, checks: run.checks, riskSummary: run.riskSummary, approval: run.approval, pushRef: run.pushRef, diffHash: run.diffHash, pushedCommitSha: run.pushedCommitSha, selectedReviewThreads: run.selectedReviewThreads, dispositions: run.dispositions, replyDrafts: run.replyDrafts, replyResults: run.replyResults, recoveryNote: run.recoveryNote, recoveryInspected: run.recoveryInspected, createdAt: run.createdAt };
+  return { id: run.id, kind: "agent_run", repository: run.repository, pullRequestId: run.pullRequestId, pullRequestNumber: run.pullRequestNumber, action: run.action, status: run.status, summary: run.summary, rootRunId: run.rootRunId, parentRunId: run.parentRunId, supersededByRunId: run.supersededByRunId, feedback: run.feedback, agentOutput: run.agentOutput, translations: run.translations, workspacePath: run.workspacePath, baseCommit: run.baseCommit, events: run.events, patchSummary: run.patchSummary, diff: run.diff, checks: run.checks, riskSummary: run.riskSummary, approval: run.approval, pushRef: run.pushRef, diffHash: run.diffHash, pushedCommitSha: run.pushedCommitSha, selectedReviewThreads: run.selectedReviewThreads, dispositions: run.dispositions, replyDrafts: run.replyDrafts, replyResults: run.replyResults, recoveryNote: run.recoveryNote, recoveryInspected: run.recoveryInspected, createdAt: run.createdAt };
 }
 
 function actionFromSummary(run: AgentRunSummary): ActionRecord {
@@ -446,6 +446,20 @@ export function App() {
     setActivity(refreshed.activity ?? []);
   }
 
+  async function translateReview(runId: string, targetLocale: "en" | "zh") {
+    const updated = await translateAgentReview(runId, targetLocale);
+    setRuns((current) => current.map((item) => item.id === updated.id ? updated : item));
+    setActions((current) => current.map((item) => item.id === updated.id ? actionFromRun(updated) : item));
+    setDetails((current) => current && current.id === updated.id ? updated : current);
+    setDetailsAction((current) => current?.id === updated.id ? actionFromRun(updated) : current);
+    setData((current) => current ? {
+      ...current,
+      agentRuns: current.agentRuns.map((item) => item.id === updated.id ? updated : item),
+      actions: (current.actions ?? []).map((item) => item.id === updated.id ? actionFromRun(updated) : item)
+    } : current);
+    return updated.translations?.[targetLocale] ?? "";
+  }
+
   async function retryRun(runId: string) {
     const run = await retryAgentRun(runId);
     setRuns((current) => [run, ...current]);
@@ -652,6 +666,7 @@ export function App() {
             onApproveRun={approveRun}
             onPushRun={pushRun}
           onReviewRun={reviewRunPatch}
+          onTranslateReview={translateReview}
             onReviseRun={reviseRun}
             onPostReplies={async (runId, replies) => { const updated = await postReviewReplies(runId, replies); setRuns((current) => current.map((item) => item.id === updated.id ? updated : item)); setActions((current) => current.map((item) => item.id === updated.id ? actionFromRun(updated) : item)); }}
           onRetryRun={retryRun}
@@ -674,7 +689,7 @@ export function App() {
         />
       )}
       {diffAction ? <DiffDialog action={diffAction} onClose={() => setDiffAction(null)} onReviewPatch={reviewRunPatch} /> : null}
-      {detailsAction ? <RunDetailsDrawer action={detailsAction} details={details} loading={detailsLoading} onClose={() => { setDetailsAction(null); setDetails(null); }} onShowDiff={setDiffAction} onChooseRebaseDecision={chooseRebaseDecision} onRetryRun={retryRun} onContinueRebase={continueRebase} onFixManually={fixManually} onInspectRecovery={inspectRecovery} /> : null}
+      {detailsAction ? <RunDetailsDrawer action={detailsAction} details={details} loading={detailsLoading} onClose={() => { setDetailsAction(null); setDetails(null); }} onShowDiff={setDiffAction} onChooseRebaseDecision={chooseRebaseDecision} onRetryRun={retryRun} onContinueRebase={continueRebase} onFixManually={fixManually} onInspectRecovery={inspectRecovery} onTranslateReview={translateReview} /> : null}
     </div>
   );
 }
@@ -1101,12 +1116,13 @@ function ActionsView({ actions, onClear, onClearAll, message, onStop, onApprove,
   );
 }
 
-function RunDetailsDrawer({ action, details, loading, onClose, onShowDiff, onChooseRebaseDecision, onRetryRun, onContinueRebase, onFixManually, onInspectRecovery }: { action: ActionRecord; details: AgentRun | ActionRecord | null; loading: boolean; onClose: () => void; onShowDiff: (action: ActionRecord) => void; onChooseRebaseDecision: (runId: string, optionId: "drop_base_sync_merge" | "manual") => Promise<void>; onRetryRun: (runId: string) => Promise<void>; onContinueRebase: (runId: string) => Promise<void>; onFixManually: (runId: string) => Promise<void>; onInspectRecovery: (runId: string) => Promise<void> }) {
+function RunDetailsDrawer({ action, details, loading, onClose, onShowDiff, onChooseRebaseDecision, onRetryRun, onContinueRebase, onFixManually, onInspectRecovery, onTranslateReview }: { action: ActionRecord; details: AgentRun | ActionRecord | null; loading: boolean; onClose: () => void; onShowDiff: (action: ActionRecord) => void; onChooseRebaseDecision: (runId: string, optionId: "drop_base_sync_merge" | "manual") => Promise<void>; onRetryRun: (runId: string) => Promise<void>; onContinueRebase: (runId: string) => Promise<void>; onFixManually: (runId: string) => Promise<void>; onInspectRecovery: (runId: string) => Promise<void>; onTranslateReview: (runId: string, targetLocale: "en" | "zh") => Promise<string> }) {
   const { t } = useLocale();
   const run = details && "backendId" in details ? details : null;
   const evidence = run?.rebaseEvidence;
   const detailAction: ActionRecord = run ? actionFromRun(run) : action;
   const transcript = evidence?.transcript.text || run?.agentOutput;
+  const isReviewRun = run?.action === "review_pr" || run?.action === "review_patch";
   const events = details?.events ?? [];
   return (
     <div className="drawer-layer" role="presentation">
@@ -1115,6 +1131,7 @@ function RunDetailsDrawer({ action, details, loading, onClose, onShowDiff, onCho
         {loading ? <div className="drawer-loading">Loading evidence…</div> : !run ? (details ? <div className="run-details-body"><section className="detail-overview"><span className="status agent detail-status">{details.status.replace(/_/g, " ")}</span><p>{details.summary}</p><div className="detail-facts"><span>Workspace <strong>{details.workspacePath ?? "not created"}</strong></span><span>Base commit <strong>{details.baseCommit?.slice(0, 12) ?? "unknown"}</strong></span><span>Events <strong>{events.length}</strong></span></div></section><RunEventsSection events={events} /><p className="empty-state">This action has no agent-owned rebase evidence.</p></div> : <div className="drawer-loading">Details are unavailable for this run.</div>) : <div className="run-details-body">
           <section className="detail-overview"><span className={`status agent detail-status ${run.status === "failed" ? "is-failed" : ""}`}>{run.status.replace(/_/g, " ")}</span><p>{run.summary}</p>{run.status === "recovery_required" || run.status === "interrupted" ? <p className="failure-copy">{run.recoveryNote ?? "Inspect the retained workspace before reuse."}</p> : null}<div className="detail-facts"><span>Base commit <strong>{run.baseCommit?.slice(0, 12) ?? "unknown"}</strong></span><span>Workspace <strong>{run.workspacePath ?? "not created"}</strong></span><span>Checks <strong>{run.checks?.filter((check) => check.status === "passed").length ?? 0}/{run.checks?.length ?? 0} passed</strong></span></div>{run.status === "recovery_required" && !run.recoveryInspected ? <button className="secondary-btn" type="button" onClick={() => void onInspectRecovery(run.id)}>{t("actions.confirmRecovery")}</button> : null}{run.status === "failed" && ["fix_conflicts", "rebase"].includes(run.action) && run.rebaseEvidence ? <button className="secondary-btn" type="button" onClick={() => void onContinueRebase(run.id)}>{t("actions.continueRebase")}</button> : null}{run.status === "failed" && ["fix_conflicts", "rebase"].includes(run.action) ? <button className="secondary-btn" type="button" onClick={() => void onFixManually(run.id)}>{t("actions.fixedManually")}</button> : null}{["failed", "interrupted"].includes(run.status) || (run.status === "recovery_required" && run.recoveryInspected) ? <button className="secondary-btn" type="button" onClick={() => void onRetryRun(run.id)}>{t("actions.retryFresh")}</button> : null}</section>
           {run.feedback ? <section className="detail-section"><div className="section-title"><h3>Human feedback</h3><span>{run.feedback.reason ?? "uncategorized"}</span></div><p>{run.feedback.instruction}</p>{run.parentRunId ? <p className="drawer-meta">Revision of {run.parentRunId}</p> : null}</section> : null}
+          {isReviewRun ? <section className="detail-section review-report-section"><div className="section-title"><h3>{t("drawer.reviewReport")}</h3></div>{run.agentOutput?.trim() ? <ReviewReportDisplay runId={run.id} source={run.agentOutput} translations={run.translations} onTranslate={onTranslateReview} /> : <p className="review-report-empty">{["queued", "running"].includes(run.status) ? t("drawer.reviewPending") : run.summary}</p>}</section> : null}
           <RunEventsSection events={events} />
           {evidence?.plan ? <section className="detail-section"><div className="section-title"><h3>Rebase strategy</h3><span>{evidence.plan.strategy.replace(/_/g, " ")}</span></div><p>{evidence.plan.summary}</p><code>{evidence.plan.command}</code></section> : null}
           {evidence?.decision ? <section className="detail-section"><div className="section-title"><h3>Rebase decision</h3><span>{evidence.decision.selectedOption ? "selected" : "required"}</span></div><p>{evidence.decision.question}</p>{!evidence.decision.selectedOption ? <div className="decision-options">{evidence.decision.options.map((option) => <button className={option.recommended ? "primary-btn" : "secondary-btn"} type="button" key={option.id} onClick={() => void onChooseRebaseDecision(run.id, option.id)}><span>{option.label}</span><small>{option.description}</small></button>)}</div> : null}</section> : null}
@@ -1125,11 +1142,134 @@ function RunDetailsDrawer({ action, details, loading, onClose, onShowDiff, onCho
             {evidence.blockedCommands.length ? <section className="detail-section"><div className="section-title"><h3>Blocked commands</h3></div><p className="blocked-note">{evidence.blockedCommands.map((command) => `git ${command}`).join(" · ")}</p></section> : null}
           </> : null}
           <section className="detail-section"><div className="section-title"><h3>Patch, checks, risk, and approval</h3>{detailAction.diff ? <button className="secondary-btn" type="button" onClick={() => onShowDiff(detailAction)}><GitCompare size={15} /> Show patch</button> : null}</div>{run.patchSummary ? <p>{run.patchSummary}</p> : null}{run.riskSummary ? <p className="risk-copy">Risk: {run.riskSummary}</p> : null}{run.approval ? <p>Approved by <strong>{run.approval.reviewer}</strong> on {new Date(run.approval.createdAt).toLocaleString()}.</p> : <p className="drawer-meta">No approval recorded.</p>}{run.pushRef ? <p>Pushed to <code>{run.pushRef}</code>.</p> : null}<div className="check-list">{run.checks?.map((check) => <div className="check-row" key={check.name}><span className={`check-result ${check.status}`}>{check.status}</span><strong>{check.name}</strong><span>{check.summary}</span></div>)}</div></section>
-          {transcript ? <section className="detail-section"><details className="agent-output"><summary>Raw agent transcript (technical)</summary><p className="drawer-meta">Use the run events and timestamps above for the readable execution history. The transcript is retained for audit and troubleshooting.</p><pre>{transcript}</pre>{evidence?.transcript.truncated ? <small>Transcript truncated · {evidence.transcript.originalLength.toLocaleString()} chars</small> : null}</details></section> : null}
+          {transcript ? <section className="detail-section"><details className="agent-output"><summary>{t("drawer.rawAgentTranscript")}</summary><p className="drawer-meta">{t("drawer.transcriptHelp")}</p><pre>{transcript}</pre>{evidence?.transcript.truncated ? <small>Transcript truncated · {evidence.transcript.originalLength.toLocaleString()} chars</small> : null}</details></section> : null}
         </div>}
       </aside><button className="drawer-scrim" type="button" aria-label="Close run details" onClick={onClose} />
     </div>
   );
+}
+
+function ReviewMarkdown({ source }: { source: string }) {
+  const lines = source.replace(/\r\n?/g, "\n").split("\n");
+  const blocks: ReactNode[] = [];
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) { index += 1; continue; }
+    const fence = line.match(/^\s*```(.*)$/);
+    if (fence) {
+      const code: string[] = [];
+      index += 1;
+      while (index < lines.length && !/^\s*```/.test(lines[index])) code.push(lines[index++]);
+      if (index < lines.length) index += 1;
+      blocks.push(<pre key={`code-${index}`}><code>{code.join("\n")}</code></pre>);
+      continue;
+    }
+    const heading = line.match(/^\s*(#{1,4})\s+(.+)$/);
+    if (heading) {
+      const level = Math.min(4, heading[1].length);
+      const Heading = `h${level}` as ElementType;
+      blocks.push(<Heading key={`heading-${index}`}>{renderReviewInline(heading[2])}</Heading>);
+      index += 1;
+      continue;
+    }
+    const listItem = line.match(/^\s*(?:[-*+]\s+|\d+[.)]\s+)/);
+    if (listItem) {
+      const list = parseReviewList(lines, index);
+      blocks.push(list.element);
+      index = list.nextIndex;
+      continue;
+    }
+    if (/^\s*>\s?/.test(line)) {
+      const quote: string[] = [];
+      while (index < lines.length && /^\s*>\s?/.test(lines[index])) quote.push(lines[index++].replace(/^\s*>\s?/, ""));
+      blocks.push(<blockquote key={`quote-${index}`}>{quote.map((part, partIndex) => <p key={partIndex}>{renderReviewInline(part)}</p>)}</blockquote>);
+      continue;
+    }
+    const paragraph = [line];
+    index += 1;
+    while (index < lines.length && lines[index].trim() && !/^\s*(?:#{1,4}\s|```|[-*+]\s+|\d+[.)]\s+|>\s?)/.test(lines[index])) paragraph.push(lines[index++]);
+    blocks.push(<p key={`paragraph-${index}`}>{renderReviewInline(paragraph.join(" "))}</p>);
+  }
+  return <div className="review-markdown">{blocks}</div>;
+}
+
+function ReviewReportDisplay({ runId, source, translations, onTranslate }: { runId: string; source: string; translations?: Record<string, string>; onTranslate: (runId: string, targetLocale: "en" | "zh") => Promise<string> }) {
+  const { locale, t } = useLocale();
+  const [translating, setTranslating] = useState(false);
+  const [showOriginal, setShowOriginal] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => { setShowOriginal(false); setError(""); }, [runId, locale]);
+  const translation = locale === "en" ? translations?.en : undefined;
+  const needsTranslation = locale === "en" && /[\u3400-\u4dbf\u4e00-\u9fff]/.test(source);
+
+  async function requestTranslation() {
+    setTranslating(true);
+    setError("");
+    try {
+      await onTranslate(runId, "en");
+      setShowOriginal(false);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("drawer.translationFailed"));
+    } finally {
+      setTranslating(false);
+    }
+  }
+
+  return <div className="review-report-display">
+    {needsTranslation ? <div className="translation-controls">
+      {translation ? <><span>{t("drawer.machineTranslated")}</span><button className="text-btn" type="button" onClick={() => setShowOriginal((value) => !value)}>{showOriginal ? t("drawer.showTranslation") : t("drawer.showOriginal")}</button></> : <button className="text-btn" type="button" disabled={translating} onClick={() => void requestTranslation()}>{translating ? t("drawer.translationLoading") : t("drawer.translateToEnglish")}</button>}
+      {error ? <p className="translation-error" role="alert">{error}</p> : null}
+    </div> : null}
+    <ReviewMarkdown source={translation && !showOriginal ? translation : source} />
+  </div>;
+}
+
+function parseReviewList(lines: string[], startIndex: number): { element: ReactNode; nextIndex: number } {
+  const first = lines[startIndex].match(/^(\s*)([-*+]|\d+[.)])\s+(.+)$/)!;
+  const baseIndent = first[1].length;
+  const ordered = /^\d/.test(first[2]);
+  const items: Array<{ text: string; nested: ReactNode[] }> = [];
+  let index = startIndex;
+  while (index < lines.length) {
+    const current = lines[index].match(/^(\s*)([-*+]|\d+[.)])\s+(.+)$/);
+    if (!current) break;
+    const indent = current[1].length;
+    if (indent < baseIndent) break;
+    if (indent > baseIndent) {
+      if (!items.length) break;
+      const nested = parseReviewList(lines, index);
+      items[items.length - 1].nested.push(nested.element);
+      index = nested.nextIndex;
+      continue;
+    }
+    if (/^\d/.test(current[2]) !== ordered) break;
+    items.push({ text: current[3], nested: [] });
+    index += 1;
+  }
+  const List = ordered ? "ol" : "ul";
+  return {
+    element: <List key={`list-${startIndex}`}>{items.map((item, itemIndex) => <li key={itemIndex}>{renderReviewInline(item.text)}{item.nested}</li>)}</List>,
+    nextIndex: index
+  };
+}
+
+function renderReviewInline(text: string): ReactNode[] {
+  const tokenPattern = /(`[^`]+`|\[[^\]]+\]\([^)]+\)|\*\*[^*]+\*\*|__[^_]+__|\*[^*]+\*|_[^_]+_)/g;
+  return text.split(tokenPattern).filter(Boolean).map((token, index) => {
+    if (token.startsWith("`") && token.endsWith("`")) return <code key={index}>{token.slice(1, -1)}</code>;
+    if ((token.startsWith("**") && token.endsWith("**")) || (token.startsWith("__") && token.endsWith("__"))) return <strong key={index}>{token.slice(2, -2)}</strong>;
+    if ((token.startsWith("*") && token.endsWith("*")) || (token.startsWith("_") && token.endsWith("_"))) return <em key={index}>{token.slice(1, -1)}</em>;
+    const link = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+    if (link) {
+      try {
+        const url = new URL(link[2], "https://mergeops.invalid");
+        if (url.protocol === "http:" || url.protocol === "https:") return <a key={index} href={url.href} target="_blank" rel="noreferrer">{link[1]}</a>;
+      } catch { /* Keep unsafe or malformed links as plain text. */ }
+      return <span key={index}>{link[1]}</span>;
+    }
+    return <span key={index}>{token}</span>;
+  });
 }
 
 function RunEventsSection({ events }: { events: AgentRunEvent[] }) {
@@ -1553,6 +1693,7 @@ function PrDrawer(props: {
   onApproveRun: (runId: string) => Promise<void>;
   onPushRun: (runId: string, target?: "mergeops_branch" | "pr_branch") => Promise<void>;
   onReviewRun: (runId: string) => Promise<void>;
+  onTranslateReview: (runId: string, targetLocale: "en" | "zh") => Promise<string>;
   onReviseRun: (runId: string, instruction: string, reason?: string) => Promise<void>;
   onPostReplies: (runId: string, replies: ReplyDraft[]) => Promise<void>;
   onRetryRun: (runId: string) => Promise<void>;
@@ -1592,6 +1733,7 @@ function PrDrawer(props: {
   const selectAllRef = useRef<HTMLInputElement>(null);
   const annotations = props.annotations ?? { pullRequestId: props.pr.id, tags: [], notes: [] };
   const canRevise = isOpen && !!props.run?.workspacePath && ["patch_ready", "approved", "review_ready"].includes(props.run.status);
+  const isReviewRun = props.run?.action === "review_pr" || props.run?.action === "review_patch";
   const unresolvedThreads = reviewThreads?.threads.filter((thread) => !thread.isResolved && !thread.isOutdated) ?? [];
   const validSelectedIds = selectedThreadIds.filter((id) => unresolvedThreads.some((thread) => thread.id === id));
   const allSelected = unresolvedThreads.length > 0 && validSelectedIds.length === unresolvedThreads.length;
@@ -1784,8 +1926,8 @@ function PrDrawer(props: {
           </section>
           {props.run ? (
             <section className="detail-block review-panel">
-              <div className="review-panel-head"><h3>Approval review</h3><span className={`status ${props.run.status === "failed" ? "is-failed" : "agent"}`}>{props.run.status.replace("_", " ")}</span></div>
-              {props.run.patchSummary ? <p>{props.run.patchSummary}{props.run.riskSummary ? ` Risk: ${props.run.riskSummary}` : ""}</p> : props.run.status === "failed" ? <p className="failure-copy">{props.run.summary}</p> : <p>Patch material is still being prepared.</p>}
+              <div className="review-panel-head"><h3>{isReviewRun ? t("drawer.reviewReport") : "Approval review"}</h3><span className={`status ${props.run.status === "failed" ? "is-failed" : "agent"}`}>{props.run.status.replace("_", " ")}</span></div>
+              {isReviewRun ? props.run.agentOutput?.trim() ? <ReviewReportDisplay runId={props.run.id} source={props.run.agentOutput} translations={props.run.translations} onTranslate={props.onTranslateReview} /> : <p className="review-report-empty">{["queued", "running"].includes(props.run.status) ? t("drawer.reviewPending") : props.run.summary}</p> : props.run.patchSummary ? <p>{props.run.patchSummary}{props.run.riskSummary ? ` Risk: ${props.run.riskSummary}` : ""}</p> : props.run.status === "failed" ? <p className="failure-copy">{props.run.summary}</p> : <p>Patch material is still being prepared.</p>}
               {props.run.checks?.map((check) => <div className="check-row" key={check.name}><span>{check.name}</span><strong className={check.status}>{check.status}</strong></div>)}
               {props.run.diff ? <details className="diff-details"><summary>View patch diff</summary><pre>{props.run.diff}</pre></details> : null}
               <div className="button-row">

@@ -100,6 +100,16 @@ export async function reviewPatch(runId: string, backendId: string): Promise<Age
   return await response.json();
 }
 
+export async function translateAgentReview(runId: string, targetLocale: "en" | "zh"): Promise<AgentRun> {
+  const response = await fetch(`${API_BASE}/api/agent-runs/${runId}/translate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ targetLocale })
+  });
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
+  return await response.json();
+}
+
 export async function approveAgentRun(runId: string): Promise<AgentRun> {
   const response = await fetch(`${API_BASE}/api/agent-runs/${runId}/approve`, { method: "POST" });
   if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `API returned ${response.status}`);
