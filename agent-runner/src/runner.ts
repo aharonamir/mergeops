@@ -298,7 +298,9 @@ async function runAnthropic(input: RunnerInput) {
   let child: any;
   let childExit: Promise<number | null> | undefined;
   try {
-    const permissionMode = input.action === "review_pr" || input.action === "review_patch" ? "plan" : "auto";
+    // Review workspaces are read-only in the sandbox. Plan mode can require
+    // interactive approval for Bash, which blocks headless reviews.
+    const permissionMode = "auto";
     const { spawn } = await dynamicImport<{ spawn(command: string, args: string[], options: Record<string, unknown>): any }>("node:child_process");
     const claudeBin = process.env.MERGEOPS_CLAUDE_BIN ?? "claude";
     let settings: unknown;
@@ -386,6 +388,9 @@ async function runAnthropic(input: RunnerInput) {
     if (!resultSeen || exitCode !== 0) {
       const details = [stderr.trim().slice(-2000), ...streamErrors].filter(Boolean).slice(-4).join(" | ");
       throw new Error(`Claude Code exited with code ${String(exitCode)}${details ? `: ${details}` : ""}`);
+    }
+    if (/bwrap: Can't create (?:file|directory) at .*: Read-only file system|apply-seccomp: write \/proc\/self\/(?:setgroups|uid_map|gid_map).*Permission denied/.test(finalText)) {
+      throw new Error("Claude Code's sandbox could not start a shell command; the requested task was not completed.");
     }
     if (permissionDenied) throw new Error("Claude Code needed an interactive approval; the run was stopped and its isolated workspace was retained.");
     emitFinal(

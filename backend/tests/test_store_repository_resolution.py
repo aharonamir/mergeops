@@ -91,19 +91,19 @@ class StoreRepositoryResolutionTest(unittest.TestCase):
             self.assertEqual(run.action, "review_pr")
             self.assertEqual(run.status, "queued")
 
-    def test_claude_profile_is_authenticated_and_sandbox_is_fail_closed(self) -> None:
+    def test_claude_uses_user_profile_and_sandbox_blocks_credential_reads(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             source_home = root / "source-home"
             (source_home / ".claude").mkdir(parents=True)
             (source_home / ".claude" / ".credentials.json").write_text('{"oauthAccount":{}}', encoding="utf-8")
-            (source_home / ".claude.json").write_text('{"oauthAccount":{}}', encoding="utf-8")
             workspace = root / "checkout"
             workspace.mkdir()
             profile = root / ".claude-home"
             auth_result = subprocess.CompletedProcess([], 0, '{"loggedIn":true,"authMethod":"claude.ai"}', "")
 
             with patch("app.adapters.Path.home", return_value=source_home), \
+                    patch.dict("app.adapters.os.environ", {"CLAUDE_CONFIG_DIR": str(source_home / ".claude")}), \
                     patch("app.adapters.shutil.which", return_value="/usr/bin/claude"), \
                     patch("app.adapters.subprocess.run", return_value=auth_result) as run:
                 _binary, settings_json, staged = SubprocessAgentAdapter._prepare_claude_profile(workspace, profile, True)
@@ -113,12 +113,21 @@ class StoreRepositoryResolutionTest(unittest.TestCase):
             self.assertTrue(settings["sandbox"]["failIfUnavailable"])
             self.assertFalse(settings["sandbox"]["allowUnsandboxedCommands"])
             self.assertEqual(settings["sandbox"]["filesystem"]["denyWrite"], [str(workspace.resolve())])
-            self.assertEqual(len(staged), 2)
-            self.assertEqual(staged[0].stat().st_mode & 0o777, 0o600)
+            self.assertEqual(settings["sandbox"]["filesystem"]["denyRead"][0], str((source_home / ".claude").resolve()))
+            self.assertEqual(settings["sandbox"]["credentials"]["files"], [{"path": str(source_home / ".claude" / ".credentials.json"), "mode": "deny"}])
+            self.assertIn(workspace / ".gitconfig", staged)
+            self.assertIn(workspace / ".gitmodules", staged)
+            self.assertIn(workspace / ".bash_profile", staged)
+            self.assertTrue((workspace / ".gitconfig").is_file())
+            self.assertTrue((workspace / ".gitmodules").is_file())
+            SubprocessAgentAdapter._cleanup_claude_sandbox_placeholders(staged)
+            self.assertFalse((workspace / ".gitconfig").exists())
+            self.assertFalse((workspace / ".gitmodules").exists())
+            self.assertFalse((profile / ".claude" / ".credentials.json").exists())
             self.assertEqual(run.call_args.args[0], ["/usr/bin/claude", "auth", "status", "--json"])
-            self.assertEqual(run.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"], str(profile / ".claude"))
+            self.assertEqual(run.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"], str((source_home / ".claude").resolve()))
 
-    def test_claude_profile_rejects_non_claude_auth_and_removes_staged_credentials(self) -> None:
+    def test_claude_profile_rejects_non_claude_auth(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             source_home = root / "source-home"
@@ -130,7 +139,6 @@ class StoreRepositoryResolutionTest(unittest.TestCase):
                     patch("app.adapters.subprocess.run", return_value=subprocess.CompletedProcess([], 0, '{"loggedIn":true,"authMethod":"apiKey"}', "")):
                 with self.assertRaisesRegex(RuntimeError, "not authenticated with claude.ai"):
                     SubprocessAgentAdapter._prepare_claude_profile(root / "checkout", root / ".claude-home", False)
-            self.assertFalse((root / ".claude-home" / ".claude" / ".credentials.json").exists())
 
     def test_claude_rejects_linked_worktree_git_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

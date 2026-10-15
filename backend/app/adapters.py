@@ -179,6 +179,7 @@ class SubprocessAgentAdapter:
         profile_home = workspace.path.parent / {
             "codex": ".codex-home", "anthropic": ".claude-home"
         }.get(self.backend_id, ".opencode-home")
+        review_baseline = self._workspace_fingerprint(workspace.path) if request.action in {"review_patch", "review_pr"} else None
         claude_bin: str | None = None
         claude_settings: str | None = None
         if self.backend_id == "codex":
@@ -191,7 +192,6 @@ class SubprocessAgentAdapter:
             )
         else:
             profile_files = self._prepare_opencode_profile(workspace.path, profile_home)
-        review_baseline = self._workspace_fingerprint(workspace.path) if request.action in {"review_patch", "review_pr"} else None
         git_guard = self._prepare_git_guard(workspace.path.parent)
         payload = {
             "backendId": request.backend_id,
@@ -235,7 +235,7 @@ class SubprocessAgentAdapter:
                     raise RuntimeError("Codex CLI is not installed or is missing from PATH.")
                 environment["MERGEOPS_CODEX_BIN"] = codex_bin
             elif self.backend_id == "anthropic":
-                environment["CLAUDE_CONFIG_DIR"] = str(profile_home / ".claude")
+                environment["CLAUDE_CONFIG_DIR"] = str(self._claude_config_dir())
                 environment["MERGEOPS_CLAUDE_BIN"] = claude_bin or "claude"
                 environment["MERGEOPS_CLAUDE_SETTINGS"] = claude_settings or "{}"
             process = subprocess.Popen(
@@ -380,7 +380,10 @@ class SubprocessAgentAdapter:
                 on_event(result.events[0])
             return result
         finally:
-            self._cleanup_opencode_profile(profile_files)
+            if self.backend_id == "anthropic":
+                self._cleanup_claude_sandbox_placeholders(profile_files)
+            else:
+                self._cleanup_opencode_profile(profile_files)
 
         if review_baseline is not None and self._workspace_fingerprint(workspace.path) != review_baseline:
             event = self._event("error", "Review changed the workspace; review-only runs must leave files untouched.")
@@ -541,7 +544,7 @@ class SubprocessAgentAdapter:
             if key in os.environ:
                 environment[key] = os.environ[key]
         if self.backend_id == "anthropic":
-            environment["CLAUDE_CONFIG_DIR"] = str(profile_home / ".claude")
+            environment["CLAUDE_CONFIG_DIR"] = str(self._claude_config_dir())
             environment["MERGEOPS_CLAUDE_BIN"] = claude_bin or "claude"
             environment["MERGEOPS_CLAUDE_SETTINGS"] = claude_settings or "{}"
         if token:
@@ -587,7 +590,10 @@ class SubprocessAgentAdapter:
         except (OSError, subprocess.SubprocessError) as exc:
             return AgentRunResult(status="failed", summary=f"Could not start search agent: {exc}", workspace_path=str(workspace))
         finally:
-            self._cleanup_opencode_profile(profile_files)
+            if self.backend_id == "anthropic":
+                self._cleanup_claude_sandbox_placeholders(profile_files)
+            else:
+                self._cleanup_opencode_profile(profile_files)
 
     @staticmethod
     def _event(event_type: str, message: str) -> dict[str, object]:
@@ -667,26 +673,19 @@ class SubprocessAgentAdapter:
                 raise RuntimeError(f"Claude workspace Git metadata is outside the isolated checkout: {git_path}")
 
     @staticmethod
+    def _claude_config_dir() -> Path:
+        configured = os.environ.get("CLAUDE_CONFIG_DIR")
+        return Path(configured or (Path.home() / ".claude")).expanduser().resolve()
+
+    @staticmethod
     def _prepare_claude_profile(workspace: Path, profile_home: Path, review_only: bool) -> tuple[str, str, list[Path]]:
-        """Create an isolated claude.ai profile and fail unless it authenticates and sandboxes."""
+        """Use the user's persistent Claude profile and protect it from sandboxed Bash."""
         claude_bin = shutil.which("claude")
         if claude_bin is None:
             raise RuntimeError("Claude Code CLI is not installed or is missing from PATH.")
-        source_home = Path.home()
-        config_dir = profile_home / ".claude"
-        config_dir.mkdir(parents=True, exist_ok=True)
-        copied: list[Path] = []
-        for source, destination in (
-            (source_home / ".claude" / ".credentials.json", config_dir / ".credentials.json"),
-            (source_home / ".claude.json", profile_home / ".claude.json"),
-        ):
-            if source.is_file():
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, destination)
-                destination.chmod(0o600)
-                copied.append(destination)
-        if not copied:
-            raise RuntimeError("Claude.ai sign-in was not found. Sign in with `claude` in your terminal, then retry.")
+        config_dir = SubprocessAgentAdapter._claude_config_dir()
+        credential_file = config_dir / ".credentials.json"
+        profile_home.mkdir(parents=True, exist_ok=True)
 
         environment = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL", "TMPDIR") if key in os.environ}
         environment.update({"HOME": str(profile_home), "CLAUDE_CONFIG_DIR": str(config_dir)})
@@ -695,28 +694,69 @@ class SubprocessAgentAdapter:
                                     capture_output=True, text=True, timeout=20)
             auth = json.loads(status.stdout)
         except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
-            SubprocessAgentAdapter._cleanup_opencode_profile(copied)
             raise RuntimeError(f"Could not verify Claude.ai sign-in for this run: {exc}") from exc
         if status.returncode != 0 or not isinstance(auth, dict) or not auth.get("loggedIn") or auth.get("authMethod") != "claude.ai":
-            SubprocessAgentAdapter._cleanup_opencode_profile(copied)
-            raise RuntimeError("The isolated Claude profile is not authenticated with claude.ai. Sign in again and retry.")
+            raise RuntimeError(
+                f"Claude Code is not authenticated with claude.ai in {config_dir}. "
+                "Run `claude auth login` and retry."
+            )
+
+        # Claude's Linux sandbox creates read-only mounts for protected paths
+        # in the working directory. Bubblewrap fails if a mountpoint is absent
+        # while review mode denies writes to the whole checkout.
+        staged = SubprocessAgentAdapter._prepare_claude_sandbox_placeholders(workspace) if review_only else []
 
         sandbox = {
             "enabled": True,
             "failIfUnavailable": True,
             "allowUnsandboxedCommands": False,
+            # The nested seccomp helper fails on this host; this disables Unix-socket filtering.
+            "network": {"allowAllUnixSockets": True},
             "filesystem": {
                 "denyWrite": [str(workspace.resolve())] if review_only else [],
-                "denyRead": [str(profile_home.resolve())],
+                "denyRead": [str(config_dir), str((profile_home / ".claude.json").resolve())],
             },
             "credentials": {
-                "files": [{"path": str(path), "mode": "deny"} for path in copied],
+                "files": [{"path": str(credential_file), "mode": "deny"}],
                 "envVars": [{"name": name, "mode": "deny"} for name in
                             ("GH_TOKEN", "GITHUB_TOKEN", "GITCODE_TOKEN", "ANTHROPIC_API_KEY")],
             },
         }
         settings_json = json.dumps({"sandbox": sandbox, "permissions": {"blockReadsOutsideWorkingDirectories": True}})
-        return claude_bin, settings_json, copied
+        return claude_bin, settings_json, staged
+
+    @staticmethod
+    def _prepare_claude_sandbox_placeholders(workspace: Path) -> list[Path]:
+        protected_paths = (
+            ".gitconfig", ".gitmodules", ".bashrc", ".bash_profile", ".bash_login", ".profile",
+            ".zshrc", ".zprofile", ".zshenv", ".ripgreprc", ".mcp.json",
+            ".vscode", ".idea", ".claude/settings.json", ".claude/settings.local.json",
+            ".claude/settings.user.json", ".claude/CLAUDE.md", ".claude/scheduled_tasks.json",
+            ".claude/skills", ".claude/agents", ".claude/commands", ".claude/hooks", ".claude/workflows",
+        )
+        created: list[Path] = []
+        for relative in protected_paths:
+            path = workspace / relative
+            if path.exists() or path.is_symlink():
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.suffix or (path.name.startswith(".") and path.name not in {".vscode", ".idea"}):
+                path.touch()
+            else:
+                path.mkdir()
+            created.append(path)
+        return created
+
+    @staticmethod
+    def _cleanup_claude_sandbox_placeholders(paths: list[Path]) -> None:
+        for path in reversed(paths):
+            try:
+                if path.is_dir() and not path.is_symlink():
+                    path.rmdir()
+                elif path.is_file() and path.stat().st_size == 0:
+                    path.unlink()
+            except OSError:
+                pass
 
     @staticmethod
     def _cleanup_opencode_profile(files: list[Path]) -> None:
