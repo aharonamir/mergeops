@@ -650,7 +650,8 @@ class SubprocessAgentAdapter:
                 'extends = ":workspace"\n\n'
                 '[permissions.mergeops-rebase.filesystem.":workspace_roots"]\n'
                 '"." = "write"\n'
-                '".git" = "write"\n',
+                '".git" = "write"\n'
+                '".agents" = "write"\n',
                 encoding="utf-8",
             )
             config.chmod(0o600)
