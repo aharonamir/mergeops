@@ -1,8 +1,10 @@
 # MergeOps Agent Runner
 
-Local Node/TypeScript boundary for TypeScript-first coding agent SDKs.
+Local Node/TypeScript boundary for coding agent processes.
 
-FastAPI sends one JSON payload on stdin and reads newline-delimited JSON events from stdout. This keeps OpenCode, Codex, and Claude SDK dependencies out of the Python process while preserving the MergeOps approval gate.
+FastAPI sends one JSON payload on stdin and reads newline-delimited JSON events from stdout. This keeps the OpenCode and Codex SDKs, and the Claude Code CLI, out of the Python process while preserving the MergeOps approval gate.
+
+Claude Code support uses the installed `claude` CLI and the user's local authenticated profile. Direct PR reviews are available with Codex and Claude Code.
 
 ## Build
 

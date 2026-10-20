@@ -124,6 +124,7 @@ export type AgentRun = {
   supersededByRunId?: string | null;
   feedback?: AgentFeedback | null;
   agentOutput?: string | null;
+  translations?: Record<string, string>;
   backendSessionId?: string | null;
   workspacePath?: string | null;
   baseCommit?: string | null;
@@ -317,6 +318,7 @@ export type ActionRecord = {
   supersededByRunId?: string | null;
   feedback?: AgentFeedback | null;
   agentOutput?: string | null;
+  translations?: Record<string, string>;
   workspacePath?: string | null;
   baseCommit?: string | null;
   events?: AgentRunEvent[];

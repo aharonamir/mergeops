@@ -295,6 +295,7 @@ class AgentRun(BaseModel):
     supersededByRunId: str | None = None
     feedback: AgentFeedback | None = None
     agentOutput: str | None = None
+    translations: dict[str, str] = Field(default_factory=dict)
     backendSessionId: str | None = None
     workspacePath: str | None = None
     baseCommit: str | None = None
@@ -423,6 +424,7 @@ class ActionRecord(BaseModel):
     supersededByRunId: str | None = None
     feedback: AgentFeedback | None = None
     agentOutput: str | None = None
+    translations: dict[str, str] = Field(default_factory=dict)
     workspacePath: str | None = None
     baseCommit: str | None = None
     events: list[AgentRunEvent] = Field(default_factory=list)
@@ -529,6 +531,10 @@ class CreateAgentRunRequest(BaseModel):
 
 class CreatePatchReviewRequest(BaseModel):
     backendId: str
+
+
+class TranslateReviewRequest(BaseModel):
+    targetLocale: Literal["en", "zh"]
 
 
 class CreateRevisionRequest(BaseModel):

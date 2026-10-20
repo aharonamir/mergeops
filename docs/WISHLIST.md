@@ -8,6 +8,26 @@ Ideas and product improvements to consider for future implementation. Items are 
 
    Make the PR Cockpit Age column sort by the actual PR age/date value, with a clear ascending/descending order and consistent handling for missing dates.
 
+## Agent integrations
+
+1. **Narrow the Claude Code sandbox workaround**
+
+   On this host, Claude's sandboxed Bash failed while creating a nested user
+   namespace (`apply-seccomp` writing `/proc/self/setgroups`). The current
+   `sandbox.network.allowAllUnixSockets` setting lets isolated reviews run, but
+   disables Unix-socket filtering and can expose host services. Track the
+   upstream [sandbox-runtime issue](https://github.com/anthropics/sandbox-runtime/issues/498)
+   and [Claude Code issue](https://github.com/anthropics/claude-code/issues/81799),
+   then replace this workaround with a narrower verified fix. The custom
+   `/etc/apparmor.d/bwrap` profile was removed and the stock profile restored.
+
+2. **Finish the original Claude Code PR #6056 validation if still needed**
+
+   A persisted read-only review of PR #6168 reached `review_ready` and left its
+   checkout clean; the user reports that conflict fixing works. The original
+   plan targeted PR #6056, so its review and rebase evidence remain to be
+   checked separately before any push.
+
 ## Researched feature opportunities
 
 The order below reflects the current local implementation. Scheduling remains

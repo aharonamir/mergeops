@@ -371,8 +371,8 @@ class LocalJsonStore:
         )
         if backend_id not in enabled_backends:
             raise ValueError("Unknown agent backend")
-        if action == "review_pr" and backend_id != "codex":
-            raise ValueError("Direct PR review is currently available with Codex only")
+        if action == "review_pr" and backend_id not in {"codex", "anthropic"}:
+            raise ValueError("Direct PR review is currently available with Codex and Claude Code")
         selected_threads: list[SelectedReviewThread] = []
         if action == "address_review":
             if not review_thread_ids:
@@ -1165,6 +1165,57 @@ class LocalJsonStore:
             data.agentRuns = [updated if item.id == run_id else item for item in data.agentRuns]
             data.actions = [item.model_copy(update={"events": updated.events}) if item.id == run_id else item for item in data.actions]
             self._save(data)
+
+    def translate_agent_review(self, run_id: str, target_locale: str) -> AgentRun:
+        if target_locale not in {"en", "zh"}:
+            raise ValueError("Unsupported review translation language")
+        data = self._load()
+        run = next((item for item in data.agentRuns if item.id == run_id), None)
+        if run is None or run.action not in {"review_pr", "review_patch"}:
+            raise ValueError("This run has no translatable review report")
+        if not run.agentOutput or not run.agentOutput.strip():
+            raise ValueError("The review report is not available yet")
+        if target_locale in run.translations:
+            return run
+        if not run.workspacePath:
+            raise ValueError("The isolated review workspace is unavailable for translation")
+        enabled_backends = [(backend.id, backend.endpoint) for backend in data.agentBackends if backend.enabled]
+        adapter = adapter_registry(enabled_backends).get(run.backendId)
+        if adapter is None:
+            raise ValueError("The agent backend used for this review is no longer enabled")
+
+        target_language = "English" if target_locale == "en" else "Simplified Chinese"
+        try:
+            result = adapter.create_run(AgentRunRequest(
+                run_id=f"{run.id}-translation-{uuid4().hex[:8]}",
+                pull_request_id=run.pullRequestId,
+                repository=run.repository,
+                pull_request_number=run.pullRequestNumber,
+                action="translate_review",
+                backend_id=run.backendId,
+                existing_workspace_path=run.workspacePath,
+                previous_agent_output=run.agentOutput,
+                target_language=target_language,
+                runner_timeout_seconds=data.agentSettings.runnerTimeoutSeconds,
+            ))
+        except Exception as exc:
+            raise ValueError(f"Could not translate the review report: {exc}") from exc
+        if result.status != "completed" or not result.output or not result.output.strip():
+            raise ValueError(result.summary or "The agent did not return a translated review report")
+
+        with self._write_lock:
+            current_data = self._load()
+            current = next((item for item in current_data.agentRuns if item.id == run_id), None)
+            if current is None:
+                raise ValueError("Review run no longer exists")
+            if target_locale in current.translations:
+                return current
+            translations = {**current.translations, target_locale: result.output.strip()}
+            updated = current.model_copy(update={"translations": translations})
+            current_data.agentRuns = [updated if item.id == run_id else item for item in current_data.agentRuns]
+            current_data.actions = [item.model_copy(update={"translations": translations}) if item.id == run_id else item for item in current_data.actions]
+            self._save(current_data)
+            return updated
 
     def action_details(self, action_id: str) -> AgentRun | ActionRecord:
         data = self._load()
