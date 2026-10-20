@@ -131,15 +131,12 @@ async function runOpenCodeCli(input: RunnerInput) {
       "opencode",
       [
         "run",
+        "--standalone",
         "--auto",
         "--model",
-        "deepseek/deepseek-v4-flash",
-        "--variant",
-        "minimal",
+        "deepseek/deepseek-v4-pro",
         "--format",
         "json",
-        "--dir",
-        input.repositoryLocalPath,
         buildPrompt(input),
       ],
       {
@@ -157,7 +154,8 @@ async function runOpenCodeCli(input: RunnerInput) {
       child.once("close", (code: number | null, signal: string | null) => resolve({ code, signal }));
     });
     if (result.code !== 0) {
-      throw new Error(stderr.trim() || `CLI exited with code ${result.code ?? "unknown"}${result.signal ? ` (${result.signal})` : ""}`);
+      const details = stderr.trim() || stdout.trim().slice(-4000);
+      throw new Error(details || `CLI exited with code ${result.code ?? "unknown"}${result.signal ? ` (${result.signal})` : ""}`);
     }
     emit({ type: "log", message: "OpenCode CLI completed" });
     emitFinal(
